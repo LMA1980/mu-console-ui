@@ -1,0 +1,55 @@
+[package]
+name = "mu-console-ui"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/LMA1980/mu-console-ui"
+authors = ["LMA1980"]
+description = "Avionics terminal web frontend for MuConsole (WireframeSkin, HTML accessibility shell, WASM bootstrap)"
+license = "AGPL-3.0-only"
+
+[lib]
+name = "mu_console_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mu-console-ui"
+path = "src/main.rs"
+
+[dependencies]
+mu-console-protocol = { path = "../mu-console-protocol", version = "0.1.0" }
+mu-console-theme = { path = "../mu-console-theme", version = "0.1.0" }
+mu-console-layout = { path = "../mu-console-layout", version = "0.1.0" }
+
+[dev-dependencies]
+mu-console-data = { path = "../mu-console-data", version = "0.1.0" }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+roxmltree = "0.20"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "console",
+    "CustomEvent",
+    "CustomEventInit",
+    "Document",
+    "Element",
+    "Event",
+    "EventListener",
+    "EventTarget",
+    "HashChangeEvent",
+    "History",
+    "HtmlElement",
+    "HtmlInputElement",
+    "KeyboardEvent",
+    "Location",
+    "MessageEvent",
+    "MouseEvent",
+    "Performance",
+    "Storage",
+    "WheelEvent",
+    "Window",
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+] }

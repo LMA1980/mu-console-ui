@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#120b07" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <base href="/" />
+    <title>MuConsole • Unified CI/CD Console</title>
+    <link rel="stylesheet" href="/tokens.css" />
+    <style>
+      @font-face {
+        font-family: MuCRT;
+        font-weight: 400;
+        font-display: block;
+        src: url("/fonts/HurmitNerdFontMono-Regular.woff2") format("woff2");
+      }
+      @font-face {
+        font-family: MuCRT;
+        font-weight: 700;
+        font-display: block;
+        src: url("/fonts/HurmitNerdFontMono-Bold.woff2") format("woff2");
+      }
+      @font-face {
+        font-family: MuEtch;
+        font-display: swap;
+        src: url("/fonts/HeavyDataNerdFont-Regular.woff2") format("woff2");
+      }
+    </style>
+  </head>
+  <body>
+    <script type="module">
+      import init from '/muconsole-ui.js';
+      init('/muconsole-ui_bg.wasm').catch(err => {
+        console.error("Failed to initialize MuConsole WASM:", err);
+        const container = document.createElement('div');
+        container.style.cssText = 'padding: 24px; font: 16px monospace; color: #ff3b30; background: #120b07;';
+        const heading = document.createElement('h2');
+        heading.textContent = 'MuConsole Initialization Error';
+        const pre = document.createElement('pre');
+        pre.textContent = String(err);
+        container.appendChild(heading);
+        container.appendChild(pre);
+        document.body.appendChild(container);
+      });
+    </script>
+  </body>
+</html>

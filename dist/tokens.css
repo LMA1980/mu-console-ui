@@ -1,0 +1,14 @@
+:root{color-scheme:dark;--font-crt:"MuCRT",monospace;--mat-wood:#120b07;--mat-wood-grain:#402616;--mat-wood-figure:#331f12;--mat-wood-pores:#050302;--mat-tungsten-top:#2b2d31;--mat-tungsten-bottom:#17181b;--mat-bevel-light:#5a5e65;--mat-bevel-dark:#0c0d0f;--mat-dark-slate:#0e1116;--accent-neon-cyan:#00f0ff;--color-green-glow:#4dff7a;--ink-etch-face:#9499a1;--ink-etch-recess:#0b0c0e;--ink-etch-lip:#545961;--ink-emboss-face:#6a6f77;--ink-emboss-lip:#b4b9c1;--ink-emboss-shadow:#050506;--mat-punch:#050505;--crt-ci-lit:#4dff7a;--crt-ci-dim:#1f6b34;--crt-cd-lit:#ffb43a;--crt-cd-dim:#6b4a12;--lcd-backlight-top:#b6cc4a;--lcd-backlight-bottom:#8ea42a;--lcd-pixel:#1c2608;--mat-switch-legend:#e6e3d8;--mat-switch-collar:#b3121c;--lamp-red:#ff3b30;--lamp-green:#2fe060;--lamp-amber:#ffb43a;--lamp-ok:#3ddc6a;--lamp-caution:#ffb43a;--lamp-warning:#ff3b3b;--lamp-off:#1d1f22;}
+html,body{margin:0;padding:0;height:100vh;overflow:hidden;height:100dvh;background:var(--mat-wood)}
+#muconsole-shell{display:flex;flex-direction:column;height:100vh;height:100dvh;overflow:hidden;margin:0;padding:0}
+#muconsole-header{display:flex;flex-direction:row;align-items:center;justify-content:flex-start;height:48px;background:var(--mat-dark-slate);border-bottom:1px solid var(--accent-neon-cyan);gap:12px;padding:0 16px;box-sizing:border-box;flex-shrink:0}
+.skip-link{position:absolute;top:-9999px;left:-9999px}
+.skip-link:focus{top:8px;left:8px;z-index:1000;padding:8px 12px;background:var(--accent-neon-cyan);color:#000;font-family:var(--font-crt);text-decoration:none;border-radius:2px;font-weight:700}
+#muconsole-filter{font-family:var(--font-crt);font-size:16px;color:var(--accent-neon-cyan);background:rgba(0,0,0,0.45);border:1px solid var(--accent-neon-cyan);border-radius:3px;padding:4px 10px;outline:none;box-sizing:border-box}
+#muconsole-filter::placeholder{color:var(--accent-neon-cyan);opacity:0.5}
+#muconsole-filter:focus{border-color:var(--accent-neon-cyan);box-shadow:0 0 4px var(--accent-neon-cyan)}
+#muconsole-aria-polite,#muconsole-aria-assertive{font-family:var(--font-crt);font-size:12px;color:var(--color-green-glow);padding:2px 8px;border-radius:2px;background:rgba(0,0,0,0.35);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-sizing:border-box}
+#muconsole-dashboard{flex:1 1 auto;overflow:hidden;position:relative;display:flex}
+#muconsole-dashboard>svg{width:100%;height:100%;display:block}
+#muconsole-auth-link{margin-left:auto;font-family:var(--font-crt);font-size:13px;color:var(--accent-neon-cyan);text-decoration:none;border:1px solid var(--accent-neon-cyan);padding:4px 10px;border-radius:3px;background:rgba(0,0,0,0.45);white-space:nowrap;box-sizing:border-box}
+#muconsole-auth-link:hover,#muconsole-auth-link:focus{background:var(--accent-neon-cyan);color:#000}
