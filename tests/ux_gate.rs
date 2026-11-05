@@ -716,9 +716,9 @@ fn u7_font_toggle_dyslexic_reflow_phone_touch_targets_html_shell_and_skin_parity
         let wrap = |svg: &str, w: u32, h: u32| -> String {
             format!(
                 "<!doctype html><html><head><meta charset=\"utf-8\"><style>\
-                 @font-face{{font-family:'Hurmit Nerd Font Mono';src:url('file:///Users/lma1980/repository/MuConsole/dist/fonts/HurmitNerdFontMono-Regular.woff2') format('woff2');}}\
-                 @font-face{{font-family:'MuCRT';src:url('file:///Users/lma1980/repository/MuConsole/dist/fonts/HurmitNerdFontMono-Regular.woff2') format('woff2');}}\
-                 @font-face{{font-family:'OpenDyslexicM Nerd Font Mono';src:url('file:///Users/lma1980/repository/MuConsole/dist/fonts/OpenDyslexicMNerdFontMono-Regular.woff2') format('woff2');}}\
+                 @font-face{{font-family:'Hurmit Nerd Font Mono';src:url('file:///Users/lma1980/repository/mu-console/dist/fonts/HurmitNerdFontMono-Regular.woff2') format('woff2');}}\
+                 @font-face{{font-family:'MuCRT';src:url('file:///Users/lma1980/repository/mu-console/dist/fonts/HurmitNerdFontMono-Regular.woff2') format('woff2');}}\
+                 @font-face{{font-family:'OpenDyslexicM Nerd Font Mono';src:url('file:///Users/lma1980/repository/mu-console/dist/fonts/OpenDyslexicMNerdFontMono-Regular.woff2') format('woff2');}}\
                  html,body{{margin:0;padding:0;width:{w}px;height:{h}px;overflow:hidden;background:#0e1116;}}\
                  </style></head><body>{svg}</body></html>"
             )

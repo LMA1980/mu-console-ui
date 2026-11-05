@@ -17,8 +17,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 MDFORMAT="mdformat"
-if ! command -v "${MDFORMAT}" >/dev/null 2>&1 && [[ -x /Users/lma1980/repository/MuConsole/.venv/bin/mdformat ]]; then
-  MDFORMAT="/Users/lma1980/repository/MuConsole/.venv/bin/mdformat"
+if ! command -v "${MDFORMAT}" >/dev/null 2>&1 && [[ -x /Users/lma1980/repository/mu-console/.venv/bin/mdformat ]]; then
+  MDFORMAT="/Users/lma1980/repository/mu-console/.venv/bin/mdformat"
 fi
 
 FILES=()
