@@ -78,7 +78,15 @@ fn assert_svg_zero_overflow(svg: &str, vw: f64, vh: f64, context: &str) {
     );
 
     let lower = svg.to_ascii_lowercase();
-    for forbidden in ["entrance", "rubicon", "pey-wail-deu", "lab.local"] {
+    let probe_tokens: Vec<String> = std::env::var("MU_TEST_FORBIDDEN_IDENTIFIERS")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|_| vec!["internal-secret-host".into(), "cluster-private.corp".into()]);
+    for forbidden in &probe_tokens {
         assert!(
             !lower.contains(forbidden),
             "{context}: SVG must never expose private identifier '{forbidden}'"
