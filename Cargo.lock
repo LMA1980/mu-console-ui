@@ -85,7 +85,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "mu-console-data"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-console-data.git#99ef160419cf594430a647e9189ed106b0133fe5"
+source = "git+https://github.com/LMA1980/mu-console-data.git#45fc5d47327a625df277dfee4d33a6b502c07dda"
 dependencies = [
  "js-sys",
  "mu-console-protocol",
