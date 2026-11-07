@@ -1423,3 +1423,108 @@ fn u16_tokens_css_distribution_drift_and_synchronization() {
         "dist/tokens.css missing #muconsole-dashboard"
     );
 }
+
+#[test]
+fn u17_interactive_scorecards_breadcrumbs_filters_trace_selection_and_pagination() {
+    use mu_console_protocol::{format_job_id, RegistryPackage};
+
+    // 1. Packed ActionRunner job IDs format as 6-hex-char SHA prefixes while small IDs stay decimal.
+    assert_eq!(format_job_id(29_612_437_286_333_911), "62add7");
+    assert_eq!(format_job_id(104), "104");
+
+    // 2. Clicking scorecard CI body row opens Trainway for that repo; clicking CD row opens Gate.
+    let mut st = state_for_scenario(
+        Scenario::NewBranch,
+        SubView::Ci(CiSubView::Scorecards),
+        CrtFont::Hurmit,
+    );
+    let cmds = st.on_dom_action(
+        "data-control-id",
+        "c4-open-trainway:fixture/engine",
+        false,
+        1_000,
+    );
+    assert_eq!(st.route.repo, Some(RepoId::new("fixture", "engine")));
+    assert_eq!(st.route.subview, SubView::Ci(CiSubView::Trainway));
+    assert!(!cmds.is_empty());
+
+    // Clicking `[QUEUE & LOGS ↗]` on Trainway opens CI Queue & Logs.
+    let cmds_logs = st.on_dom_action("data-control-id", "c5-open-logs", false, 1_100);
+    assert_eq!(st.route.subview, SubView::Ci(CiSubView::QueueLogs));
+    assert!(!cmds_logs.is_empty());
+
+    // Clicking breadcrumb `c2-repo` returns to CI Scorecards.
+    let cmds_crumb = st.on_dom_action("data-control-id", "c2-repo", false, 1_200);
+    assert_eq!(st.route.subview, SubView::Ci(CiSubView::Scorecards));
+    assert!(!cmds_crumb.is_empty());
+
+    // Clicking scorecard CD body row opens CD Integration Gate.
+    let cmds_gate = st.on_dom_action(
+        "data-control-id",
+        "c4-open-gate:fixture/superproject",
+        false,
+        1_300,
+    );
+    assert_eq!(st.route.repo, Some(RepoId::new("fixture", "superproject")));
+    assert_eq!(st.route.area, Area::Cd);
+    assert_eq!(st.route.subview, SubView::Cd(CdSubView::IntegrationGate));
+    assert!(!cmds_gate.is_empty());
+
+    // 3. Registry > Packages header filter selector + multi-page pagination with clickable ◀ / ▶.
+    st.select_subview(SubView::Registry(RegistrySubView::Packages));
+    let mut extra_pkgs = Vec::new();
+    for i in 0..45 {
+        extra_pkgs.push(RegistryPackage {
+            ecosystem: mu_console_protocol::PackageEcosystem::Cargo,
+            name: format!("mu-extra-crate-{i:02}"),
+            latest_version: "0.2.0".into(),
+            versions_count: 2,
+            deps_count: 4,
+            sha256_prefix: format!("a1b2c3d4e5{i:02}"),
+            tainted: false,
+            taint_reason: None,
+            yanked: false,
+            versions: vec!["0.2.0".into(), "0.1.0".into()],
+        });
+    }
+    let mut vm = st.client.view().cloned().expect("view present");
+    vm.registry.packages.extend(extra_pkgs);
+    let snap_bytes = Engine::encode_event(&DataEvent::Snapshot(vm)).expect("encode snapshot");
+    st.on_worker_frame(&snap_bytes);
+
+    let svg_pkg_p1 = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_pkg_p1.contains("PAGE 1/"));
+    assert!(svg_pkg_p1.contains("reg-packages-screen:next"));
+    assert_svg_zero_overflow(&svg_pkg_p1, 1512.0, 860.0, "u17_reg_packages_p1");
+
+    st.on_dom_action("data-control-id", "reg-packages-screen:next", false, 1_400);
+    assert_eq!(st.subview_page, 1);
+    let svg_pkg_p2 = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_pkg_p2.contains("PAGE 2/"));
+    assert_svg_zero_overflow(&svg_pkg_p2, 1512.0, 860.0, "u17_reg_packages_p2");
+
+    // Filtering by NUGET resets page to 0 and filters the catalog.
+    st.on_dom_action("data-control-id", "reg-pkg-filter:NUGET", false, 1_500);
+    assert_eq!(st.subview_page, 0);
+    assert_eq!(
+        st.reg_ecosystem_filter,
+        Some(mu_console_protocol::PackageEcosystem::NuGet)
+    );
+
+    // 4. Observe > PurePath trace selection in-place (`select-trace:*`).
+    st.select_subview(SubView::Observe(ObserveSubView::PurePath));
+    let cmds_tr = st.on_dom_action("data-control-id", "select-trace:tr-cd-0042", false, 1_600);
+    assert_eq!(st.selected_trace_id.as_deref(), Some("tr-cd-0042"));
+    assert_eq!(st.route.trace_id.as_deref(), Some("tr-cd-0042"));
+    assert!(!cmds_tr.is_empty());
+}

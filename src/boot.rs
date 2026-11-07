@@ -182,8 +182,10 @@ fn repaint(st: &ConsoleState) {
 }
 
 fn find_action_attribute(target: &Element) -> Option<(&'static str, String)> {
-    const ATTRS: [&str; 13] = [
+    const ATTRS: [&str; 15] = [
         "data-trace-id",
+        "data-select-trace",
+        "data-page-step",
         "data-cd-gate",
         "data-area",
         "data-subview",
@@ -460,16 +462,25 @@ pub fn start() {
                     .ok()
                     .flatten()
                     .is_some();
-                if !in_top_bar {
+                let in_screen = target
+                    .closest("[data-cols][data-rows]")
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if !in_top_bar && !in_screen {
                     return;
                 }
                 ev.prevent_default();
                 let delta = if ev.delta_y() > 0.0 { 1 } else { -1 };
                 let mut st = state_for_wheel.borrow_mut();
-                if ev.shift_key() {
-                    st.rotate_inner(delta, now_ms());
+                if in_top_bar {
+                    if ev.shift_key() {
+                        st.rotate_inner(delta, now_ms());
+                    } else {
+                        st.rotate_outer(delta, now_ms());
+                    }
                 } else {
-                    st.rotate_outer(delta, now_ms());
+                    st.step_active_page(delta);
                 }
                 sync_browser_state(&st);
                 repaint(&st);
@@ -505,6 +516,7 @@ pub fn start() {
             if !cmds.is_empty() {
                 send_all(&worker_for_tick, &cmds);
                 sync_browser_state(&st);
+                repaint(&st);
             }
         });
         let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(

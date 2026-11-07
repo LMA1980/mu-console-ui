@@ -8,10 +8,10 @@ use mu_console_layout::{
     scorecard_cards, solve, Breakpoint, Card, Frames, Panel as LayoutPanel, SafeArea, Viewport,
 };
 use mu_console_protocol::{
-    sanitize_public_log, Area, AuthState, CanaryBundleState, CdSubView, CiSubView, ConnState,
-    CrtFont, FleetSubView, GateOutcome, GateTest, LogSeverity, ObserveSubView, PackageEcosystem,
-    PrState, RegistrySubView, RepoScore, RepoStatus, RepoTopology, SidingPhase, SmartscapeLayer,
-    StageState, SubView, TestState,
+    format_job_id, sanitize_public_log, Area, AuthState, CanaryBundleState, CdSubView, CiSubView,
+    ConnState, CrtFont, FleetSubView, GateOutcome, GateTest, LogSeverity, ObserveSubView,
+    PackageEcosystem, PrState, RegistrySubView, RepoScore, RepoStatus, RepoTopology, SidingPhase,
+    SmartscapeLayer, StageState, SubView, TestState,
 };
 use mu_console_theme::instruments::switch::SwitchAction;
 use mu_console_theme::instruments::Rect;
@@ -51,6 +51,33 @@ fn clamp_rect(rect: Rect, bounds: Rect) -> Rect {
     let w = rect.w.min((bounds.right() - x).max(0.0)).max(0.0);
     let h = rect.h.min((bounds.bottom() - y).max(0.0)).max(0.0);
     Rect::new(x, y, w, h)
+}
+
+/// Paginate `body` rows while keeping `headers` pinned at the top of each page.
+/// When all rows fit within `grid_rows`, returns `(all_rows, 0, 1)`.
+fn paginate_with_headers<T: Clone>(
+    headers: Vec<T>,
+    body: Vec<T>,
+    grid_rows: usize,
+    requested_page: u32,
+) -> (Vec<T>, u32, u32) {
+    let max_r = grid_rows.max(1);
+    if headers.len() + body.len() <= max_r {
+        let mut all = headers;
+        all.extend(body);
+        return (all, 0, 1);
+    }
+    let avail = max_r.saturating_sub(headers.len()).max(1);
+    let total_pages = u32::try_from(body.len().div_ceil(avail).max(1)).unwrap_or(1);
+    let page = requested_page.min(total_pages.saturating_sub(1));
+    let start = (page as usize) * avail;
+    let end = (start + avail).min(body.len());
+    let mut out = headers;
+    if let Some(slice) = body.get(start..end) {
+        out.extend_from_slice(slice);
+    }
+    out.truncate(max_r);
+    (out, page, total_pages)
 }
 
 /// Render the full MuConsole SVG document for `viewport`, `safe`, `state`, and `skin`.
@@ -770,7 +797,17 @@ fn render_ci_scorecards(
                     aria_label: Some(&title),
                 },
             );
-            render_twin_scorecard(skin, w, r, idx, card_slot, frames.canvas, font.family);
+            let is_selected_repo = state.route.repo.as_ref() == Some(&r.id);
+            render_twin_scorecard(
+                skin,
+                w,
+                r,
+                idx,
+                card_slot,
+                frames.canvas,
+                font.family,
+                is_selected_repo,
+            );
         } else {
             skin.panel(
                 w,
@@ -786,7 +823,7 @@ fn render_ci_scorecards(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_twin_scorecard(
     skin: &dyn Skin,
     w: &mut SvgWriter,
@@ -795,6 +832,7 @@ fn render_twin_scorecard(
     card: &Card,
     canvas: Rect,
     font_family: &str,
+    is_selected_repo: bool,
 ) {
     let left_rect = clamp_rect(card.ci_crt, canvas);
     let right_rect = clamp_rect(card.cd_crt, canvas);
@@ -819,11 +857,10 @@ fn render_twin_scorecard(
         (repo.coverage_bp / 100).min(99),
         f64::from(repo.bench_delta_bp) / 100.0
     );
-    let l3 = format!(
-        "SUB {} #{}",
-        repo.submodules.len(),
-        repo.latest_job_id.unwrap_or(0)
-    );
+    let job_tag = repo
+        .latest_job_id
+        .map_or_else(|| "0".to_owned(), format_job_id);
+    let l3 = format!("SUB {} #{job_tag}", repo.submodules.len());
     let l4 = match repo.status {
         RepoStatus::Passing => "TRND: ▅▆▆▇▇██".to_owned(),
         RepoStatus::Running => "TRND: ▄▅▆▆▇▆▊".to_owned(),
@@ -831,6 +868,8 @@ fn render_twin_scorecard(
         RepoStatus::Unknown => "TRND: ───────".to_owned(),
     };
     let sel_cid = format!("c4-card-select:{}/{}", repo.id.owner, repo.id.repo);
+    let open_tw_cid = format!("c4-open-trainway:{}/{}", repo.id.owner, repo.id.repo);
+    let open_gate_cid = format!("c4-open-gate:{}/{}", repo.id.owner, repo.id.repo);
     let left_lines = [
         ScreenRow {
             text: &l0,
@@ -838,14 +877,14 @@ fn render_twin_scorecard(
             signal: None,
             critical: false,
             control_id: Some(&sel_cid),
-            selected: false,
+            selected: is_selected_repo,
         },
         ScreenRow {
             text: &l1,
             tone: left_tone,
             signal: None,
             critical: false,
-            control_id: None,
+            control_id: Some(&open_tw_cid),
             selected: false,
         },
         ScreenRow {
@@ -853,7 +892,7 @@ fn render_twin_scorecard(
             tone: left_tone,
             signal: None,
             critical: false,
-            control_id: None,
+            control_id: Some(&open_tw_cid),
             selected: false,
         },
         ScreenRow {
@@ -861,7 +900,7 @@ fn render_twin_scorecard(
             tone: SemanticTone::Neutral,
             signal: None,
             critical: false,
-            control_id: None,
+            control_id: Some(&open_tw_cid),
             selected: false,
         },
         ScreenRow {
@@ -869,7 +908,7 @@ fn render_twin_scorecard(
             tone: left_tone,
             signal: None,
             critical: false,
-            control_id: None,
+            control_id: Some(&open_tw_cid),
             selected: false,
         },
     ];
@@ -928,7 +967,7 @@ fn render_twin_scorecard(
             tone: cd_tone,
             signal: None,
             critical: false,
-            control_id: None,
+            control_id: Some(&open_gate_cid),
             selected: false,
         },
         ScreenRow {
@@ -936,7 +975,7 @@ fn render_twin_scorecard(
             tone: cd_tone,
             signal: None,
             critical: false,
-            control_id: None,
+            control_id: Some(&open_gate_cid),
             selected: false,
         },
         ScreenRow {
@@ -944,7 +983,7 @@ fn render_twin_scorecard(
             tone: cd_tone,
             signal: None,
             critical: false,
-            control_id: None,
+            control_id: Some(&open_gate_cid),
             selected: false,
         },
         ScreenRow {
@@ -952,7 +991,7 @@ fn render_twin_scorecard(
             tone: cd_tone,
             signal: None,
             critical: false,
-            control_id: None,
+            control_id: Some(&open_gate_cid),
             selected: false,
         },
         ScreenRow {
@@ -960,7 +999,7 @@ fn render_twin_scorecard(
             tone: SemanticTone::Neutral,
             signal: None,
             critical: false,
-            control_id: None,
+            control_id: Some(&open_gate_cid),
             selected: false,
         },
     ];
@@ -1125,24 +1164,56 @@ fn render_c5_trainway(
         },
     );
 
+    if rect.w >= 640.0 {
+        let logs_w = 118.0_f64.min((stop_rect.x - rect.x - 16.0).max(64.0));
+        let logs_rect = clamp_rect(
+            Rect::new(
+                (stop_rect.x - logs_w - 4.0).max(rect.x),
+                hdr_y,
+                logs_w,
+                hdr_h,
+            ),
+            rect,
+        );
+        skin.readout(
+            w,
+            &Readout {
+                control_id: "c5-open-logs",
+                label: "",
+                value: "QUEUE & LOGS ↗",
+                rect: logs_rect,
+                tone: SemanticTone::Info,
+                interactive: true,
+            },
+        );
+    }
+
     let max_sidings = match frames.breakpoint {
         Breakpoint::Wide | Breakpoint::Medium => 6,
         Breakpoint::CompactLandscape => 3,
         Breakpoint::Phone => 2,
     };
 
-    let mut row_strings: Vec<(String, SemanticTone, Option<SignalGlyph>, Option<String>)> =
-        Vec::new();
+    type TrainwayRow = (
+        String,
+        SemanticTone,
+        Option<SignalGlyph>,
+        Option<String>,
+        bool,
+    );
+    let mut row_strings: Vec<TrainwayRow> = Vec::new();
     let mut station_labels: Vec<&str> = Vec::new();
     let mut track_signals: Vec<Vec<(u32, SignalGlyph, SemanticTone)>> = Vec::new();
     type TrackMeta = (String, u32, u32, bool, bool, Option<String>, bool);
     let mut track_refs: Vec<TrackMeta> = Vec::new();
+    let mut total_yard_pages = 1_u32;
 
     if let Some(t) = topo {
         for s in &t.stations {
             station_labels.push(s.label.as_str());
         }
         let layout = allocate_lanes(t, &state.trainway_lanes, max_sidings, state.yard_page);
+        total_yard_pages = layout.total_pages.max(1);
         let sub_count = view
             .and_then(|v| {
                 v.repos
@@ -1165,6 +1236,7 @@ fn render_c5_trainway(
             SemanticTone::Info,
             None,
             Some("trace:tr-ci-1234".into()),
+            false,
         ));
 
         if let Some(mt) = layout.main_train.as_ref() {
@@ -1180,14 +1252,17 @@ fn render_c5_trainway(
             };
             let node_str = mt.node_id.as_deref().unwrap_or("QUEUE");
             let stage_idx = (mt.stage as usize + 1).min(mt.stage_states.len().max(1));
+            let job_tag = format_job_id(mt.job_id);
             let line = format!(
-                "L0 {:<14} [{}] {} · STAGE {}/{}",
+                "L0 {:<14} #{:<6} [{}] {} · STAGE {}/{}",
                 mt.ref_name,
+                job_tag,
                 node_str,
                 if mt.node_lost { "NODE LOST" } else { "TRUNK" },
                 stage_idx,
                 mt.stage_states.len()
             );
+            let is_sel = state.route.branch.as_deref() == Some(mt.ref_name.as_str());
             row_strings.push((
                 line,
                 if mt.node_lost {
@@ -1197,6 +1272,7 @@ fn render_c5_trainway(
                 },
                 Some(glyph),
                 Some(format!("c5-track-{}", mt.ref_name)),
+                is_sel,
             ));
             track_signals.push(sigs);
             track_refs.push((
@@ -1225,7 +1301,8 @@ fn render_c5_trainway(
                 lost = tr.node_lost;
                 failed = tr.failed();
                 let st_idx = (tr.stage as usize + 1).min(tr.stage_states.len().max(1));
-                stage_progress = format!(" · STAGE {st_idx}/{}", tr.stage_states.len());
+                let job_tag = format_job_id(tr.job_id);
+                stage_progress = format!(" #{job_tag} · STAGE {st_idx}/{}", tr.stage_states.len());
             }
             let fading = matches!(al.branch.phase, SidingPhase::Fading { .. });
             let under_construction = al.branch.phase == SidingPhase::UnderConstruction;
@@ -1249,11 +1326,13 @@ fn render_c5_trainway(
                 "L{} {:<14} {:?} [{}] {phase_tag}{stage_progress}",
                 al.lane, al.branch.ref_name, al.branch.pr_state, node_str
             );
+            let is_sel = state.route.branch.as_deref() == Some(al.branch.ref_name.as_str());
             row_strings.push((
                 line,
                 tone,
                 Some(glyph),
                 Some(format!("c5-track-{}", al.branch.ref_name)),
+                is_sel,
             ));
             track_signals.push(sigs);
             track_refs.push((
@@ -1279,6 +1358,7 @@ fn render_c5_trainway(
                 SemanticTone::Warn,
                 Some(SignalGlyph::BlockPending),
                 Some("c5-yard-pager".into()),
+                false,
             ));
         }
 
@@ -1288,7 +1368,7 @@ fn render_c5_trainway(
             } else {
                 format!("ALL {sub_count} SUBMODULES SYNCED")
             };
-            let sub_line = format!("INTERCHANGE ⇄ {bump}");
+            let sub_line = format!("INTERCHANGE ⇄ {bump} (CLICK TO STEP SUBMODULE)");
             row_strings.push((
                 sub_line,
                 if t.submodule_bump_pending {
@@ -1298,6 +1378,7 @@ fn render_c5_trainway(
                 },
                 None,
                 Some("c5-submodule-interchange".into()),
+                false,
             ));
         }
     } else {
@@ -1306,12 +1387,13 @@ fn render_c5_trainway(
             SemanticTone::Neutral,
             None,
             None,
+            false,
         ));
     }
 
     if row_strings
         .iter()
-        .all(|(_, _, _, cid)| cid.as_deref() != Some("c5-submodule-interchange"))
+        .all(|(_, _, _, cid, _)| cid.as_deref() != Some("c5-submodule-interchange"))
     {
         if let Some(v) = view {
             if let Some(parent) = v
@@ -1329,6 +1411,7 @@ fn render_c5_trainway(
                         SemanticTone::Info,
                         None,
                         Some("c5-submodule-interchange".into()),
+                        false,
                     ));
                 }
             }
@@ -1337,13 +1420,13 @@ fn render_c5_trainway(
 
     let screen_rows: Vec<ScreenRow<'_>> = row_strings
         .iter()
-        .map(|(txt, tone, sig, cid)| ScreenRow {
+        .map(|(txt, tone, sig, cid, sel)| ScreenRow {
             text: txt.as_str(),
             tone: *tone,
             signal: *sig,
             critical: false,
             control_id: cid.as_deref(),
-            selected: false,
+            selected: *sel,
         })
         .collect();
 
@@ -1378,8 +1461,8 @@ fn render_c5_trainway(
             lines: &screen_rows,
             stations: &station_labels,
             tracks: &screen_tracks,
-            page: state.yard_page,
-            total_pages: 1,
+            page: state.yard_page.min(total_yard_pages.saturating_sub(1)),
+            total_pages: total_yard_pages,
         },
     );
 }
@@ -1408,14 +1491,15 @@ fn render_ci_queue_logs(
         },
     );
 
-    let mut rows: Vec<(String, SemanticTone, Option<SignalGlyph>, Option<String>)> = Vec::new();
-    rows.push((
+    type QueueRow = (String, SemanticTone, Option<SignalGlyph>, Option<String>);
+    let headers: Vec<QueueRow> = vec![(
         "INVARIANT: max_slots = 1 per worker :: thread budgets: node-a=2, node-b=6, worker-riscv64=6"
             .into(),
         SemanticTone::Info,
         None,
         None,
-    ));
+    )];
+    let mut body: Vec<QueueRow> = Vec::new();
 
     if let Some(v) = state.client.view() {
         if let Some(topo) = v.topology.as_ref() {
@@ -1431,10 +1515,11 @@ fn render_ci_queue_logs(
                 } else {
                     (SignalGlyph::BlockRunning, SemanticTone::Pass)
                 };
-                rows.push((
+                let job_tag = format_job_id(tr.job_id);
+                body.push((
                     format!(
-                        "JOB #{:<6} REF {:<18} STAGE {:<8} NODE {:<15} [TRACE ↗ tr-ci-1234]",
-                        tr.job_id,
+                        "JOB #{:<8} REF {:<18} STAGE {:<8} NODE {:<15} [TRACE ↗ tr-ci-1234]",
+                        job_tag,
                         tr.ref_name,
                         st_label,
                         tr.node_id.as_deref().unwrap_or("QUEUED")
@@ -1443,14 +1528,39 @@ fn render_ci_queue_logs(
                     Some(sig),
                     Some("trace:tr-ci-1234".into()),
                 ));
+                if !topo.stations.is_empty() && !tr.stage_states.is_empty() {
+                    let breakdown: Vec<String> = topo
+                        .stations
+                        .iter()
+                        .zip(tr.stage_states.iter())
+                        .map(|(st, state_enum)| {
+                            let (glyph, _) = stage_glyph_and_tone(*state_enum);
+                            format!("{} {}", st.label, glyph.symbol())
+                        })
+                        .collect();
+                    body.push((
+                        format!("  └─ PIPELINE: {}", breakdown.join(" · ")),
+                        SemanticTone::Info,
+                        None,
+                        Some(format!("c5-track-{}", tr.ref_name)),
+                    ));
+                }
             }
         }
-        rows.push((
+        body.push((
             "── SANITIZED STAGE LOG STREAM (PUBLIC PRIVACY BOUNDARY ENFORCED) ──".into(),
             SemanticTone::Info,
             None,
             None,
         ));
+        if v.observe.logs.is_empty() {
+            body.push((
+                "  (no stage log events in active buffer — pipeline status shown above)".into(),
+                SemanticTone::Neutral,
+                None,
+                None,
+            ));
+        }
         for log in &v.observe.logs {
             let tone = match log.severity {
                 LogSeverity::Error => SemanticTone::Fail,
@@ -1458,7 +1568,7 @@ fn render_ci_queue_logs(
                 LogSeverity::Info => SemanticTone::Neutral,
             };
             let clean = sanitize_public_log(&log.message);
-            rows.push((
+            body.push((
                 format!(
                     "[{}] {:<16} {} [TRACE ↗ {}]",
                     log.severity.label(),
@@ -1472,7 +1582,7 @@ fn render_ci_queue_logs(
             ));
         }
     } else {
-        rows.push((
+        body.push((
             "AWAITING CI QUEUE & LOG STREAM…".into(),
             SemanticTone::Neutral,
             None,
@@ -1480,6 +1590,8 @@ fn render_ci_queue_logs(
         ));
     }
 
+    let (rows, page, total_pages) =
+        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, cid)| ScreenRow {
@@ -1506,8 +1618,8 @@ fn render_ci_queue_logs(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
@@ -1852,17 +1964,20 @@ fn render_cd_deployments_slots(
         },
     );
 
-    let mut rows: Vec<(String, SemanticTone, Option<SignalGlyph>, Option<String>)> = Vec::new();
-    rows.push((
+    type CdRow = (String, SemanticTone, Option<SignalGlyph>, Option<String>);
+    let headers: Vec<CdRow> = vec![(
         "BLUE/GREEN SLOT MATRIX :: ACTIVE TRAFFIC vs CANDIDATE STAGING".into(),
         SemanticTone::Info,
         None,
         None,
-    ));
+    )];
+    let mut body: Vec<CdRow> = Vec::new();
 
     if let Some(v) = state.client.view() {
+        let mut any_cd = false;
         for r in &v.repos {
             if let Some(cd) = r.cd.as_ref() {
+                any_cd = true;
                 let (sig, tone) = match cd.outcome {
                     GateOutcome::Promoted => (SignalGlyph::BlockPassed, SemanticTone::Pass),
                     GateOutcome::Pending => (SignalGlyph::BlockRunning, SemanticTone::Warn),
@@ -1870,7 +1985,7 @@ fn render_cd_deployments_slots(
                         (SignalGlyph::BlockFailed, SemanticTone::Fail)
                     }
                 };
-                rows.push((
+                body.push((
                     format!(
                         "{:<24} DEPLOY {:<10} ACTIVE:{:?} STAGED:{:?} IT {}/{} {:?} [TRACE ↗ tr-cd-0042]",
                         format!("{}/{}", r.id.owner, r.id.repo),
@@ -1887,8 +2002,28 @@ fn render_cd_deployments_slots(
                 ));
             }
         }
+        if !any_cd {
+            body.push((
+                "NO ACTIVE BLUE/GREEN SLOT DEPLOYMENTS ACROSS REPOSITORIES (CONFIGURE .muconde/ TO ENABLE CD)"
+                    .into(),
+                SemanticTone::Neutral,
+                None,
+                None,
+            ));
+            for r in &v.repos {
+                body.push((
+                    format!(
+                        "{:<24} SLOT: NONE :: GATE: IDLE :: CLICK TO SELECT REPOSITORY",
+                        format!("{}/{}", r.id.owner, r.id.repo)
+                    ),
+                    SemanticTone::Neutral,
+                    Some(SignalGlyph::BlockPending),
+                    Some(format!("c4-card-select:{}/{}", r.id.owner, r.id.repo)),
+                ));
+            }
+        }
         if !v.history.is_empty() {
-            rows.push((
+            body.push((
                 "── RECENT DEPLOYMENT LEDGER ──".into(),
                 SemanticTone::Info,
                 None,
@@ -1900,7 +2035,7 @@ fn render_cd_deployments_slots(
                     GateOutcome::Pending => SemanticTone::Warn,
                     GateOutcome::RolledBack | GateOutcome::Tainted => SemanticTone::Fail,
                 };
-                rows.push((
+                body.push((
                     format!(
                         "DEPLOY {:<12} DIGEST {:<18} IT {}/{} OUTCOME {:?} [CD GATE ↗]",
                         h.deployment_id, h.artifact_digest, h.it_passed, h.it_total, h.outcome
@@ -1912,7 +2047,7 @@ fn render_cd_deployments_slots(
             }
         }
     } else {
-        rows.push((
+        body.push((
             "AWAITING CD DEPLOYMENTS STREAM…".into(),
             SemanticTone::Neutral,
             None,
@@ -1920,6 +2055,8 @@ fn render_cd_deployments_slots(
         ));
     }
 
+    let (rows, page, total_pages) =
+        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, cid)| ScreenRow {
@@ -1946,8 +2083,8 @@ fn render_cd_deployments_slots(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
@@ -1976,16 +2113,25 @@ fn render_cd_active_leases(
         },
     );
 
-    let mut rows: Vec<(String, SemanticTone, Option<SignalGlyph>, Option<String>)> = Vec::new();
-    rows.push((
+    type LeaseRow = (String, SemanticTone, Option<SignalGlyph>, Option<String>);
+    let headers: Vec<LeaseRow> = vec![(
         "LEASE ID    DEPLOY      SERVICE            TARGET NODE      SLOTS   TTL REM   STATE"
             .into(),
         SemanticTone::Info,
         None,
         None,
-    ));
+    )];
+    let mut body: Vec<LeaseRow> = Vec::new();
 
     if let Some(v) = state.client.view() {
+        if v.leases.is_empty() {
+            body.push((
+                "NO ACTIVE TTL DEPLOYMENT LEASES (0 STAGED CANDIDATES HOLDING SLOT LOCKS)".into(),
+                SemanticTone::Neutral,
+                None,
+                None,
+            ));
+        }
         for l in &v.leases {
             let tone = if l.promoted {
                 SemanticTone::Pass
@@ -1994,7 +2140,7 @@ fn render_cd_active_leases(
             } else {
                 SemanticTone::Info
             };
-            rows.push((
+            body.push((
                 format!(
                     "{:<11} {:<11} {:<18} {:<16} {:?}->{:?}   {:>5}s    {} [CD GATE ↗]",
                     l.lease_id,
@@ -2016,7 +2162,7 @@ fn render_cd_active_leases(
             ));
         }
     } else {
-        rows.push((
+        body.push((
             "AWAITING ACTIVE LEASES STREAM…".into(),
             SemanticTone::Neutral,
             None,
@@ -2024,6 +2170,8 @@ fn render_cd_active_leases(
         ));
     }
 
+    let (rows, page, total_pages) =
+        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, cid)| ScreenRow {
@@ -2050,13 +2198,14 @@ fn render_cd_active_leases(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
 
 /// Render `REG > Packages`: Multi-Registry Package Browser (`Cargo`, `NuGet`, `Maven`) + expandable version drawer.
+#[allow(clippy::too_many_lines)]
 fn render_reg_packages(
     skin: &dyn Skin,
     w: &mut SvgWriter,
@@ -2080,6 +2229,67 @@ fn render_reg_packages(
         },
     );
 
+    let active_eco = state
+        .reg_ecosystem_filter
+        .map_or("ALL", PackageEcosystem::label);
+    let hdr_y = rect.y + 4.0;
+    let hdr_h = ((screen_rect.y - rect.y) - 8.0).clamp(16.0, 24.0);
+    let flt_w = 248.0_f64.min(rect.w * 0.48);
+    let flt_rect = clamp_rect(
+        Rect::new(
+            (rect.right() - flt_w - 6.0).max(rect.x),
+            hdr_y,
+            flt_w,
+            hdr_h,
+        ),
+        rect,
+    );
+    let eco_opts = [
+        SelectorOption {
+            id: "ALL",
+            label: "ALL",
+            badge: None,
+            tone: SemanticTone::Info,
+        },
+        SelectorOption {
+            id: "CARGO",
+            label: "CARGO",
+            badge: None,
+            tone: SemanticTone::Pass,
+        },
+        SelectorOption {
+            id: "NUGET",
+            label: "NUGET",
+            badge: None,
+            tone: SemanticTone::Info,
+        },
+        SelectorOption {
+            id: "MAVEN",
+            label: "MAVEN",
+            badge: None,
+            tone: SemanticTone::Info,
+        },
+    ];
+    let selected_eco = match state.reg_ecosystem_filter {
+        None => 0,
+        Some(PackageEcosystem::Cargo) => 1,
+        Some(PackageEcosystem::NuGet) => 2,
+        Some(PackageEcosystem::Maven) => 3,
+    };
+    skin.selector(
+        w,
+        &Selector {
+            control_id: "reg-pkg-filter",
+            label: "Package Ecosystem Filter",
+            rect: flt_rect,
+            action: SwitchAction::Maintained,
+            options: &eco_opts,
+            selected: selected_eco,
+            pulled: false,
+            horizontal: true,
+        },
+    );
+
     type OwnedRow = (
         String,
         SemanticTone,
@@ -2087,43 +2297,26 @@ fn render_reg_packages(
         Option<String>,
         bool,
     );
-    let mut rows: Vec<OwnedRow> = Vec::new();
-    let active_eco = state
-        .reg_ecosystem_filter
-        .map_or("ALL", PackageEcosystem::label);
-    rows.push((
-        format!("FILTER ECOSYSTEM [ACTIVE: {active_eco}] :: CLICK PILL BELOW TO FILTER"),
-        SemanticTone::Info,
-        None,
-        None,
-        false,
-    ));
-    for pill in ["ALL", "CARGO", "NUGET", "MAVEN"] {
-        let is_sel = active_eco == pill;
-        rows.push((
+    let headers: Vec<OwnedRow> = vec![
+        (
             format!(
-                "  PILL [{pill}] {}",
-                if is_sel { "● ACTIVE" } else { "○ SELECT" }
+                "FILTER ECOSYSTEM [ACTIVE: {active_eco}] :: CLICK HEADER TAB TO FILTER OR ROW TO INSPECT"
             ),
-            if is_sel {
-                SemanticTone::Pass
-            } else {
-                SemanticTone::Info
-            },
+            SemanticTone::Info,
             None,
-            Some(format!("eco:{pill}")),
-            is_sel,
-        ));
-    }
-
-    rows.push((
-        "ECOSYSTEM  PACKAGE NAME                       LATEST     VERS  DEPS  SHA256         STATUS"
-            .into(),
-        SemanticTone::Info,
-        None,
-        None,
-        false,
-    ));
+            None,
+            false,
+        ),
+        (
+            "ECOSYSTEM  PACKAGE NAME                       LATEST     VERS  DEPS  SHA256         STATUS"
+                .into(),
+            SemanticTone::Info,
+            None,
+            None,
+            false,
+        ),
+    ];
+    let mut body: Vec<OwnedRow> = Vec::new();
 
     if let Some(v) = state.client.view() {
         for pkg in &v.registry.packages {
@@ -2140,7 +2333,7 @@ fn render_reg_packages(
             } else {
                 (SemanticTone::Pass, "VERIFIED ■")
             };
-            rows.push((
+            body.push((
                 format!(
                     "{:<9}  {:<33}  {:<9}  {:>4}  {:>4}  {:<13}  {status_str}",
                     pkg.ecosystem.label(),
@@ -2160,7 +2353,7 @@ fn render_reg_packages(
                 selected,
             ));
             if selected {
-                rows.push((
+                body.push((
                     format!(
                         "  └─ VERSION HISTORY [{}]: {} :: TAINT: {}",
                         pkg.name,
@@ -2176,6 +2369,8 @@ fn render_reg_packages(
         }
     }
 
+    let (rows, page, total_pages) =
+        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, cid, sel)| ScreenRow {
@@ -2202,8 +2397,8 @@ fn render_reg_packages(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
@@ -2232,14 +2427,15 @@ fn render_reg_canaries(
         },
     );
 
-    let mut rows: Vec<(String, SemanticTone, Option<SignalGlyph>, Option<String>)> = Vec::new();
-    rows.push((
+    type CanaryRow = (String, SemanticTone, Option<SignalGlyph>, Option<String>);
+    let headers: Vec<CanaryRow> = vec![(
         "BUNDLE    REPO                     SERVICE           DIGEST               STATE        LINKS"
             .into(),
         SemanticTone::Info,
         None,
         None,
-    ));
+    )];
+    let mut body: Vec<CanaryRow> = Vec::new();
 
     if let Some(v) = state.client.view() {
         for c in &v.registry.canaries {
@@ -2250,7 +2446,7 @@ fn render_reg_canaries(
                     (SignalGlyph::BlockFailed, SemanticTone::Fail)
                 }
             };
-            rows.push((
+            body.push((
                 format!(
                     "{:<8}  {:<23}  {:<16}  {:<19}  {:<11}  [TRACE ↗ {}]",
                     c.bundle_id,
@@ -2265,7 +2461,7 @@ fn render_reg_canaries(
                 Some(format!("trace:{}", c.trace_id)),
             ));
             if let Some(reason) = c.taint_reason.as_ref() {
-                rows.push((
+                body.push((
                     format!(
                         "  └─ TAINT REASON: {} · DEPLOY {} [CD GATE ↗]",
                         reason, c.deployment_id
@@ -2278,6 +2474,8 @@ fn render_reg_canaries(
         }
     }
 
+    let (rows, page, total_pages) =
+        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, cid)| ScreenRow {
@@ -2304,8 +2502,8 @@ fn render_reg_canaries(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
@@ -2428,14 +2626,14 @@ fn render_obs_smartscape(
         Option<String>,
         bool,
     );
-    let mut rows: Vec<OwnedRow> = Vec::new();
+    let mut body: Vec<OwnedRow> = Vec::new();
     if let Some(v) = state.client.view() {
         for layer in [
             SmartscapeLayer::Service,
             SmartscapeLayer::Process,
             SmartscapeLayer::Host,
         ] {
-            rows.push((
+            body.push((
                 format!("── LAYER: {} ──", layer.label()),
                 SemanticTone::Info,
                 None,
@@ -2454,7 +2652,7 @@ fn render_obs_smartscape(
                 } else {
                     SemanticTone::Pass
                 };
-                rows.push((
+                body.push((
                     format!(
                         "  [{:<28}] {:<28} RPS {:>5.1}  ERR {:>4.2}%  p95 {:>3}ms",
                         n.id,
@@ -2480,7 +2678,7 @@ fn render_obs_smartscape(
                         .filter(|e| e.from_id == n.id || e.to_id == n.id)
                         .map(|e| format!("{} -> {} ({})", e.from_id, e.to_id, e.protocol))
                         .collect();
-                    rows.push((
+                    body.push((
                         format!(
                             "    └─ ENTITY DRAWER [{}]: {} · [TRACE ↗ tr-ci-1234]",
                             n.id,
@@ -2496,6 +2694,8 @@ fn render_obs_smartscape(
         }
     }
 
+    let (rows, page, total_pages) =
+        paginate_with_headers(Vec::new(), body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, cid, sel)| ScreenRow {
@@ -2522,8 +2722,8 @@ fn render_obs_smartscape(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
@@ -2553,6 +2753,52 @@ fn render_obs_purepath(
         },
     );
 
+    let hdr_y = rect.y + 4.0;
+    let hdr_h = ((screen_rect.y - rect.y) - 8.0).clamp(16.0, 24.0);
+    let flt_w = 340.0_f64.min(rect.w * 0.56);
+    let flt_rect = clamp_rect(
+        Rect::new(
+            (rect.right() - flt_w - 6.0).max(rect.x),
+            hdr_y,
+            flt_w,
+            hdr_h,
+        ),
+        rect,
+    );
+    let pp_pills = ["ALL", "ERRORS", "SLOW P99", "CI", "CD", "REGISTRY"];
+    let selected_pp = pp_pills
+        .iter()
+        .position(|p| state.purepath_filter.eq_ignore_ascii_case(p))
+        .unwrap_or(0);
+    let pp_opts: Vec<SelectorOption<'_>> = pp_pills
+        .iter()
+        .map(|&p| SelectorOption {
+            id: p,
+            label: p,
+            badge: None,
+            tone: if p == "ERRORS" {
+                SemanticTone::Fail
+            } else if p == "SLOW P99" {
+                SemanticTone::Warn
+            } else {
+                SemanticTone::Info
+            },
+        })
+        .collect();
+    skin.selector(
+        w,
+        &Selector {
+            control_id: "obs-pp-filter",
+            label: "PurePath Trace Filter",
+            rect: flt_rect,
+            action: SwitchAction::Maintained,
+            options: &pp_opts,
+            selected: selected_pp,
+            pulled: false,
+            horizontal: true,
+        },
+    );
+
     type OwnedCritRow = (
         String,
         SemanticTone,
@@ -2561,26 +2807,18 @@ fn render_obs_purepath(
         Option<String>,
         bool,
     );
-    let mut rows: Vec<OwnedCritRow> = Vec::new();
-
-    for pill in ["ALL", "ERRORS", "SLOW P99", "CI", "CD", "REGISTRY"] {
-        let is_sel = state.purepath_filter.eq_ignore_ascii_case(pill);
-        rows.push((
-            format!(
-                "FILTER PILL [{pill}] {}",
-                if is_sel { "● ACTIVE" } else { "○" }
-            ),
-            if is_sel {
-                SemanticTone::Pass
-            } else {
-                SemanticTone::Info
-            },
-            None,
-            false,
-            Some(format!("ppfilter:{pill}")),
-            is_sel,
-        ));
-    }
+    let headers: Vec<OwnedCritRow> = vec![(
+        format!(
+            "PUREPATH FILTER [ACTIVE: {}] :: CLICK TRACE ROW TO INSPECT 3-PANE WATERFALL",
+            state.purepath_filter
+        ),
+        SemanticTone::Info,
+        None,
+        false,
+        None,
+        false,
+    )];
+    let mut body: Vec<OwnedCritRow> = Vec::new();
 
     if let Some(v) = state.client.view() {
         let filtered_traces: Vec<_> = v
@@ -2611,7 +2849,7 @@ fn render_obs_purepath(
             } else {
                 SemanticTone::Pass
             };
-            rows.push((
+            body.push((
                 format!(
                     "TRACE {:<16} [{}] {} :: {} ({}ms){}",
                     tr.trace_id,
@@ -2628,13 +2866,13 @@ fn render_obs_purepath(
                     SignalGlyph::BlockPassed
                 }),
                 tr.error,
-                Some(format!("trace:{}", tr.trace_id)),
+                Some(format!("select-trace:{}", tr.trace_id)),
                 is_active,
             ));
         }
 
         if let Some(tr) = active_trace {
-            rows.push((
+            body.push((
                 format!(
                     "── PANE 1: SPAN TREE WATERFALL [{}] ({}ms total) ──",
                     tr.trace_id, tr.duration_ms
@@ -2645,6 +2883,17 @@ fn render_obs_purepath(
                 None,
                 false,
             ));
+            if tr.spans.is_empty() {
+                body.push((
+                    "  (spans loading or summary-only trace — click trace row above to fetch detail)"
+                        .into(),
+                    SemanticTone::Neutral,
+                    None,
+                    false,
+                    Some(format!("select-trace:{}", tr.trace_id)),
+                    false,
+                ));
+            }
             for sp in &tr.spans {
                 let crit_tag = if sp.critical_path { "★CRIT" } else { "     " };
                 let sel_sp = state.selected_span_id.as_deref() == Some(sp.span_id.as_str());
@@ -2655,7 +2904,7 @@ fn render_obs_purepath(
                 } else {
                     SemanticTone::Pass
                 };
-                rows.push((
+                body.push((
                     format!(
                         "  {crit_tag} {:<11} {:<20} {:<32} +{:>4}ms dur:{:>4}ms self:{:>4}ms [{}]",
                         sp.span_id,
@@ -2678,7 +2927,7 @@ fn render_obs_purepath(
                 ));
             }
 
-            rows.push((
+            body.push((
                 format!("── PANE 2: CORRELATED OTEL LOGS [trace={}] ──", tr.trace_id),
                 SemanticTone::Info,
                 None,
@@ -2686,8 +2935,10 @@ fn render_obs_purepath(
                 None,
                 false,
             ));
+            let mut any_corr_log = false;
             for log in v.observe.logs.iter().filter(|l| l.trace_id == tr.trace_id) {
-                rows.push((
+                any_corr_log = true;
+                body.push((
                     format!(
                         "  [{}] {} (span={}): {}",
                         log.severity.label(),
@@ -2706,8 +2957,18 @@ fn render_obs_purepath(
                     false,
                 ));
             }
+            if !any_corr_log {
+                body.push((
+                    "  (no correlated OTel logs recorded for this trace)".into(),
+                    SemanticTone::Neutral,
+                    None,
+                    false,
+                    None,
+                    false,
+                ));
+            }
 
-            rows.push((
+            body.push((
                 "── PANE 3: HOST & PROCESS HARDWARE CONTEXT (K3 X100 vs A100) ──".into(),
                 SemanticTone::Info,
                 None,
@@ -2716,7 +2977,7 @@ fn render_obs_purepath(
                 false,
             ));
             for sp in &tr.spans {
-                rows.push((
+                body.push((
                     format!(
                         "  HOST CONTEXT [{}]: {} :: max_slots=1 :: RLIMIT_MEMLOCK<=28GiB",
                         sp.service, sp.hardware_class
@@ -2731,6 +2992,8 @@ fn render_obs_purepath(
         }
     }
 
+    let (rows, page, total_pages) =
+        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, crit, cid, sel)| ScreenRow {
@@ -2757,8 +3020,8 @@ fn render_obs_purepath(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
@@ -2787,7 +3050,8 @@ fn render_obs_problems_slos(
         },
     );
 
-    let mut rows: Vec<(String, SemanticTone, Option<SignalGlyph>, Option<String>)> = Vec::new();
+    type ProblemRow = (String, SemanticTone, Option<SignalGlyph>, Option<String>);
+    let mut body: Vec<ProblemRow> = Vec::new();
     if let Some(v) = state.client.view() {
         for p in &v.observe.problems {
             let tone = if p.severity == "ERROR" {
@@ -2795,7 +3059,7 @@ fn render_obs_problems_slos(
             } else {
                 SemanticTone::Warn
             };
-            rows.push((
+            body.push((
                 format!(
                     "[{}] {:<18} BURN {:>4.2}x :: {} [TRACE ↗ {}]",
                     p.problem_id,
@@ -2808,7 +3072,7 @@ fn render_obs_problems_slos(
                 Some(SignalGlyph::BlockFailed),
                 Some(format!("trace:{}", p.root_cause_trace_id)),
             ));
-            rows.push((
+            body.push((
                 format!(
                     "  └─ IMPACTED: {} · ROOT CAUSE TRACE: {} (CLICK TO INSPECT WATERFALL)",
                     p.impacted_entity, p.root_cause_trace_id
@@ -2820,6 +3084,8 @@ fn render_obs_problems_slos(
         }
     }
 
+    let (rows, page, total_pages) =
+        paginate_with_headers(Vec::new(), body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, cid)| ScreenRow {
@@ -2846,13 +3112,14 @@ fn render_obs_problems_slos(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
 
 /// Render `OBS > Logs`: Sanitized OTel log stream with severity pills and `[TRACE ↗]` links.
+#[allow(clippy::too_many_lines)]
 fn render_obs_logs(
     skin: &dyn Skin,
     w: &mut SvgWriter,
@@ -2876,24 +3143,73 @@ fn render_obs_logs(
         },
     );
 
-    let mut rows: Vec<(String, SemanticTone, Option<String>, bool)> = Vec::new();
     let active_sev = state.log_severity_filter.map_or("ALL", LogSeverity::label);
-    for pill in ["ALL", "ERROR", "WARN", "INFO"] {
-        let is_sel = active_sev == pill;
-        rows.push((
-            format!(
-                "SEVERITY PILL [{pill}] {}",
-                if is_sel { "● ACTIVE" } else { "○" }
-            ),
-            if is_sel {
-                SemanticTone::Pass
-            } else {
-                SemanticTone::Info
-            },
-            Some(format!("logsev:{pill}")),
-            is_sel,
-        ));
-    }
+    let hdr_y = rect.y + 4.0;
+    let hdr_h = ((screen_rect.y - rect.y) - 8.0).clamp(16.0, 24.0);
+    let flt_w = 248.0_f64.min(rect.w * 0.48);
+    let flt_rect = clamp_rect(
+        Rect::new(
+            (rect.right() - flt_w - 6.0).max(rect.x),
+            hdr_y,
+            flt_w,
+            hdr_h,
+        ),
+        rect,
+    );
+    let sev_opts = [
+        SelectorOption {
+            id: "ALL",
+            label: "ALL",
+            badge: None,
+            tone: SemanticTone::Info,
+        },
+        SelectorOption {
+            id: "ERROR",
+            label: "ERROR",
+            badge: None,
+            tone: SemanticTone::Fail,
+        },
+        SelectorOption {
+            id: "WARN",
+            label: "WARN",
+            badge: None,
+            tone: SemanticTone::Warn,
+        },
+        SelectorOption {
+            id: "INFO",
+            label: "INFO",
+            badge: None,
+            tone: SemanticTone::Pass,
+        },
+    ];
+    let selected_sev = match state.log_severity_filter {
+        None => 0,
+        Some(LogSeverity::Error) => 1,
+        Some(LogSeverity::Warn) => 2,
+        Some(LogSeverity::Info) => 3,
+    };
+    skin.selector(
+        w,
+        &Selector {
+            control_id: "obs-log-filter",
+            label: "OTel Log Severity Filter",
+            rect: flt_rect,
+            action: SwitchAction::Maintained,
+            options: &sev_opts,
+            selected: selected_sev,
+            pulled: false,
+            horizontal: true,
+        },
+    );
+
+    type LogRow = (String, SemanticTone, Option<String>, bool);
+    let headers: Vec<LogRow> = vec![(
+        format!("OTEL LOG STREAM [SEVERITY: {active_sev}] :: PUBLIC PRIVACY BOUNDARY ENFORCED"),
+        SemanticTone::Info,
+        None,
+        false,
+    )];
+    let mut body: Vec<LogRow> = Vec::new();
 
     if let Some(v) = state.client.view() {
         for log in &v.observe.logs {
@@ -2907,7 +3223,7 @@ fn render_obs_logs(
                 LogSeverity::Warn => SemanticTone::Warn,
                 LogSeverity::Info => SemanticTone::Neutral,
             };
-            rows.push((
+            body.push((
                 format!(
                     "[{}] {:<18} {} [TRACE ↗ {}]",
                     log.severity.label(),
@@ -2922,6 +3238,8 @@ fn render_obs_logs(
         }
     }
 
+    let (rows, page, total_pages) =
+        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, cid, sel)| ScreenRow {
@@ -2948,8 +3266,8 @@ fn render_obs_logs(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
@@ -3187,12 +3505,12 @@ fn render_fleet_worker_nodes(
         },
     );
 
-    let mut lines_owned: Vec<(String, SemanticTone)> = Vec::new();
-    lines_owned.push((
+    let headers: Vec<(String, SemanticTone)> = vec![(
         "INVARIANT: max_slots=1 per node :: thread budgets bounded via CARGO_BUILD_JOBS / RAYON_NUM_THREADS"
             .into(),
         SemanticTone::Info,
-    ));
+    )];
+    let mut body: Vec<(String, SemanticTone)> = Vec::new();
     if let Some(v) = state.client.view() {
         for n in &v.nodes {
             let tone = if n.online {
@@ -3200,7 +3518,7 @@ fn render_fleet_worker_nodes(
             } else {
                 SemanticTone::Fail
             };
-            lines_owned.push((
+            body.push((
                 format!(
                     "NODE {:<16} STATUS: {}  SLOTS: 1/1  KVM: /dev/kvm READY",
                     n.id.to_ascii_uppercase(),
@@ -3211,10 +3529,11 @@ fn render_fleet_worker_nodes(
         }
         if let Some(topo) = v.topology.as_ref() {
             for tr in &topo.trains {
-                lines_owned.push((
+                let job_tag = format_job_id(tr.job_id);
+                body.push((
                     format!(
-                        "TRAIN #{} {:<14} STAGE {}  NODE {}",
-                        tr.job_id,
+                        "TRAIN #{:<8} {:<18} STAGE {}  NODE {}",
+                        job_tag,
                         tr.ref_name,
                         tr.stage,
                         tr.node_id.as_deref().unwrap_or("QUEUED")
@@ -3228,9 +3547,11 @@ fn render_fleet_worker_nodes(
             }
         }
     } else {
-        lines_owned.push(("AWAITING FLEET TELEMETRY…".into(), SemanticTone::Neutral));
+        body.push(("AWAITING FLEET TELEMETRY…".into(), SemanticTone::Neutral));
     }
 
+    let (lines_owned, page, total_pages) =
+        paginate_with_headers(headers, body, panel.grid.rows, state.fleet_page);
     let rows: Vec<ScreenRow<'_>> = lines_owned
         .iter()
         .map(|(txt, tone)| ScreenRow {
@@ -3257,8 +3578,8 @@ fn render_fleet_worker_nodes(
             lines: &rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
