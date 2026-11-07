@@ -209,6 +209,8 @@ pub struct ConsoleState {
     pub log_page: u32,
     /// Fleet telemetry page cursor.
     pub fleet_page: u32,
+    /// Active sub-view CRT page cursor (`QueueLogs`, `DeploymentsSlots`, `ActiveLeases`, `Reg*`, `Obs*`).
+    pub subview_page: u32,
     /// `REG > Packages` ecosystem filter (`None` = `ALL`).
     pub reg_ecosystem_filter: Option<PackageEcosystem>,
     /// `REG > Packages` selected package name for the version/dependency drawer.
@@ -274,6 +276,7 @@ impl ConsoleState {
             selected_test_idx: 0,
             log_page: 0,
             fleet_page: 0,
+            subview_page: 0,
             reg_ecosystem_filter: None,
             selected_package: None,
             selected_entity_id: None,
@@ -601,6 +604,7 @@ impl ConsoleState {
         if self.route.subview.area() != area {
             self.route.subview = SubView::default_for(area);
         }
+        self.subview_page = 0;
         self.aria_polite = format!(
             "Area {} :: {}",
             area_label(area),
@@ -613,6 +617,7 @@ impl ConsoleState {
     pub fn select_subview(&mut self, subview: SubView) -> Vec<UiCommand> {
         self.route.area = subview.area();
         self.route.subview = subview;
+        self.subview_page = 0;
         self.aria_polite = format!(
             "Sub-view {} :: {}",
             area_label(self.route.area),
@@ -631,6 +636,7 @@ impl ConsoleState {
         self.route.trace_id = Some(trace_id.to_owned());
         self.selected_trace_id = Some(trace_id.to_owned());
         self.selected_span_id = None;
+        self.subview_page = 0;
         self.aria_polite = format!("Opened PurePath trace {trace_id}");
         vec![
             UiCommand::Subscribe(self.route.clone()),
@@ -642,7 +648,13 @@ impl ConsoleState {
     pub fn open_cd_gate(&mut self, deployment_id: Option<&str>) -> Vec<UiCommand> {
         self.route.area = Area::Cd;
         self.route.subview = SubView::Cd(CdSubView::IntegrationGate);
+        self.subview_page = 0;
         if let Some(dep) = deployment_id {
+            if let Some(v) = self.client.view() {
+                if let Some(pos) = v.history.iter().position(|h| h.deployment_id == dep) {
+                    self.selected_history_idx = pos + 1;
+                }
+            }
             self.aria_polite = format!("Opened CD Integration Gate for {dep}");
         } else {
             self.aria_polite = "Opened CD Integration Gate".into();
@@ -664,6 +676,34 @@ impl ConsoleState {
         UiCommand::Page {
             panel: PanelId::Carousel,
             cursor: self.carousel_page,
+        }
+    }
+
+    /// Step the active screen's pagination cursor by `delta`.
+    pub fn step_active_page(&mut self, delta: isize) {
+        let step = |cur: u32| -> u32 {
+            if delta >= 0 {
+                cur.wrapping_add(1)
+            } else {
+                cur.saturating_sub(1)
+            }
+        };
+        match self.route.subview {
+            SubView::Ci(CiSubView::Scorecards) => {
+                let _ = self.step_carousel(if delta >= 0 { 1 } else { -1 }, 3);
+            }
+            SubView::Ci(CiSubView::Trainway) => {
+                self.yard_page = step(self.yard_page);
+            }
+            SubView::Cd(CdSubView::IntegrationGate) => {
+                self.log_page = step(self.log_page);
+            }
+            SubView::Fleet(_) => {
+                self.fleet_page = step(self.fleet_page);
+            }
+            _ => {
+                self.subview_page = step(self.subview_page);
+            }
         }
     }
 
@@ -741,6 +781,11 @@ impl ConsoleState {
                 "sub-next" => self.rotate_inner(1, now_ms),
                 _ => {}
             },
+            "data-page-step" => match attr_val {
+                "prev" => self.step_active_page(-1),
+                "next" => self.step_active_page(1),
+                _ => {}
+            },
             "data-dyslexia-toggle" => {
                 return vec![self.toggle_font()];
             }
@@ -769,6 +814,7 @@ impl ConsoleState {
                     "MAVEN" => Some(PackageEcosystem::Maven),
                     _ => None,
                 };
+                self.subview_page = 0;
                 self.route.filter = self.reg_ecosystem_filter.map(|e| e.label().to_owned());
                 self.aria_polite = format!("Filtered packages by {attr_val}");
             }
@@ -788,6 +834,7 @@ impl ConsoleState {
             }
             "data-purepath-filter" => {
                 self.purepath_filter = attr_val.to_ascii_uppercase();
+                self.subview_page = 0;
                 self.route.filter = if self.purepath_filter == "ALL" {
                     None
                 } else {
@@ -799,6 +846,8 @@ impl ConsoleState {
                 self.selected_trace_id = Some(attr_val.to_owned());
                 self.route.trace_id = Some(attr_val.to_owned());
                 self.selected_span_id = None;
+                self.subview_page = 0;
+                return vec![UiCommand::Subscribe(self.route.clone())];
             }
             "data-span-id" => {
                 self.selected_span_id = Some(attr_val.to_owned());
@@ -810,6 +859,7 @@ impl ConsoleState {
                     "INFO" => Some(LogSeverity::Info),
                     _ => None,
                 };
+                self.subview_page = 0;
                 self.route.filter = self.log_severity_filter.map(|s| s.label().to_owned());
             }
             "data-control-id" => return self.on_control_id(attr_val, shift, now_ms),
@@ -818,6 +868,7 @@ impl ConsoleState {
         Vec::new()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn on_control_id(&mut self, id: &str, shift: bool, now_ms: u64) -> Vec<UiCommand> {
         if let Some(area_slug) = id
             .strip_prefix("c1-area-rail:")
@@ -833,19 +884,141 @@ impl ConsoleState {
                 return self.select_subview(sv);
             }
         }
+        if let Some(eco) = id
+            .strip_prefix("reg-pkg-filter:")
+            .or_else(|| id.strip_prefix("eco:"))
+        {
+            return self.on_dom_action("data-ecosystem", eco, shift, now_ms);
+        }
+        if let Some(pp) = id
+            .strip_prefix("obs-pp-filter:")
+            .or_else(|| id.strip_prefix("ppfilter:"))
+        {
+            return self.on_dom_action("data-purepath-filter", pp, shift, now_ms);
+        }
+        if let Some(sev) = id
+            .strip_prefix("obs-log-filter:")
+            .or_else(|| id.strip_prefix("logsev:"))
+        {
+            return self.on_dom_action("data-log-severity", sev, shift, now_ms);
+        }
         if let Some(repo_str) = id.strip_prefix("c4-card-select:") {
             if let Some((owner, repo)) = repo_str.split_once('/') {
                 let rid = RepoId::new(owner, repo);
                 self.route.repo = Some(rid.clone());
                 self.route.submodule = None;
                 self.sync_rotary_from_route();
+                self.aria_polite = format!("Selected repository {owner}/{repo}");
                 return vec![UiCommand::SelectRepo {
                     repo: rid,
                     submodule: None,
                 }];
             }
         }
+        if let Some(repo_str) = id.strip_prefix("c4-open-trainway:") {
+            if let Some((owner, repo)) = repo_str.split_once('/') {
+                let rid = RepoId::new(owner, repo);
+                self.route.repo = Some(rid.clone());
+                self.route.submodule = None;
+                self.sync_rotary_from_route();
+                let mut cmds = vec![UiCommand::SelectRepo {
+                    repo: rid,
+                    submodule: None,
+                }];
+                cmds.extend(self.select_subview(SubView::Ci(CiSubView::Trainway)));
+                return cmds;
+            }
+        }
+        if let Some(repo_str) = id.strip_prefix("c4-open-gate:") {
+            if let Some((owner, repo)) = repo_str.split_once('/') {
+                let rid = RepoId::new(owner, repo);
+                self.route.repo = Some(rid.clone());
+                self.route.submodule = None;
+                self.sync_rotary_from_route();
+                let mut cmds = vec![UiCommand::SelectRepo {
+                    repo: rid,
+                    submodule: None,
+                }];
+                cmds.extend(self.open_cd_gate(None));
+                return cmds;
+            }
+        }
+        if let Some(branch_ref) = id.strip_prefix("c5-track-") {
+            self.route.branch = Some(branch_ref.to_owned());
+            self.aria_polite = format!("Selected branch {branch_ref}");
+            return vec![UiCommand::Subscribe(self.route.clone())];
+        }
+        if let Some(job_str) = id.strip_prefix("c5-job-select:") {
+            if let Ok(job_id) = job_str.parse::<u64>() {
+                self.route.job = Some(job_id);
+                return self.select_subview(SubView::Ci(CiSubView::QueueLogs));
+            }
+        }
+        if let Some(sub_path) = id.strip_prefix("c5-sub-select:") {
+            self.route.submodule = Some(SubmoduleId {
+                path: sub_path.to_owned(),
+            });
+            self.sync_rotary_from_route();
+            self.aria_polite = format!("Selected submodule {sub_path}");
+            return vec![UiCommand::Subscribe(self.route.clone())];
+        }
+        if let Some(test_idx_str) = id.strip_prefix("c6-test-") {
+            if let Ok(idx) = test_idx_str.parse::<usize>() {
+                self.selected_test_idx = idx;
+                self.log_page = 0;
+                self.aria_polite = format!("Selected gate test #{idx}");
+                return Vec::new();
+            }
+        }
+        if let Some(tid) = id.strip_prefix("select-trace:") {
+            return self.on_dom_action("data-select-trace", tid, shift, now_ms);
+        }
+        if let Some(tid) = id.strip_prefix("trace:") {
+            return self.open_trace(tid);
+        }
+        if let Some(dep) = id.strip_prefix("gate:") {
+            return self.open_cd_gate(Some(dep));
+        }
+        if let Some(pkg) = id.strip_prefix("pkg:") {
+            return self.on_dom_action("data-package", pkg, shift, now_ms);
+        }
+        if let Some(ent) = id.strip_prefix("entity:") {
+            return self.on_dom_action("data-entity-id", ent, shift, now_ms);
+        }
+        if let Some(sp) = id.strip_prefix("span:") {
+            return self.on_dom_action("data-span-id", sp, shift, now_ms);
+        }
         match id {
+            "c2-area" => self.select_subview(SubView::default_for(self.route.area)),
+            "c2-subview" => {
+                let next = self.route.subview.step(1);
+                self.select_subview(next)
+            }
+            "c2-repo" => {
+                self.route.submodule = None;
+                self.route.branch = None;
+                self.route.job = None;
+                self.sync_rotary_from_route();
+                self.select_subview(SubView::Ci(CiSubView::Scorecards))
+            }
+            "c2-submodule" => {
+                self.route.submodule = None;
+                self.sync_rotary_from_route();
+                self.aria_polite = "Returned to parent repository".into();
+                vec![UiCommand::Subscribe(self.route.clone())]
+            }
+            "c2-branch" => {
+                self.route.branch = None;
+                self.select_subview(SubView::Ci(CiSubView::Trainway))
+            }
+            "c2-job" => {
+                self.route.job = None;
+                self.select_subview(SubView::Ci(CiSubView::QueueLogs))
+            }
+            "c2-trace" => {
+                self.route.trace_id = None;
+                self.select_subview(SubView::Observe(ObserveSubView::PurePath))
+            }
             "c2-font-switch" | "c2-font-switch:hurmit" | "c2-font-switch:dyslexic" => {
                 vec![self.toggle_font()]
             }
@@ -861,7 +1034,7 @@ impl ConsoleState {
                 self.rotate_inner(-1, now_ms);
                 Vec::new()
             }
-            "c2-sub-next" | "c3-rotary:inner-next" => {
+            "c2-sub-next" | "c3-rotary:inner-next" | "c5-submodule-interchange" => {
                 self.rotate_inner(1, now_ms);
                 Vec::new()
             }
@@ -875,6 +1048,7 @@ impl ConsoleState {
                 self.trainway_live = !self.trainway_live;
                 Vec::new()
             }
+            "c5-open-logs" => self.select_subview(SubView::Ci(CiSubView::QueueLogs)),
             "c5-yard-pager" => {
                 self.yard_page = self.yard_page.wrapping_add(1);
                 Vec::new()
@@ -894,7 +1068,12 @@ impl ConsoleState {
                 self.log_page = self.log_page.wrapping_add(1);
                 Vec::new()
             }
-            "c2-auth-status" => {
+            "c6-history-strip" => {
+                let total = self.client.view().map_or(1, |v| v.history.len() + 1).max(1);
+                self.selected_history_idx = (self.selected_history_idx + 1) % total;
+                Vec::new()
+            }
+            "c2-auth-status" | "c6-log-auth-gate" => {
                 let href = match self.auth() {
                     AuthState::Anonymous => self.sign_in_href(),
                     _ => self.sign_out_href(),
@@ -902,6 +1081,14 @@ impl ConsoleState {
                 self.pending_navigation = Some(href.clone());
                 self.aria_polite = format!("Navigating to {href}");
                 vec![UiCommand::Navigate { href }]
+            }
+            other if other.ends_with(":prev") => {
+                self.step_active_page(-1);
+                Vec::new()
+            }
+            other if other.ends_with(":next") => {
+                self.step_active_page(1);
+                Vec::new()
             }
             _ => Vec::new(),
         }
