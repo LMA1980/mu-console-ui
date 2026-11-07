@@ -3564,18 +3564,33 @@ fn render_obs_logs(
                 LogSeverity::Warn => SemanticTone::Warn,
                 LogSeverity::Info => SemanticTone::Neutral,
             };
-            body.push((
-                format!(
-                    "[{}] {:<18} {} [TRACE ↗ {}]",
-                    log.severity.label(),
-                    log.service,
-                    sanitize_public_log(&log.message),
-                    log.trace_id
-                ),
-                tone,
-                Some(format!("trace:{}", log.trace_id)),
-                false,
-            ));
+            let has_trace = !log.trace_id.is_empty() && !log.trace_id.chars().all(|c| c == '0');
+            if has_trace {
+                body.push((
+                    format!(
+                        "[{}] {:<18} {} [TRACE ↗ {}]",
+                        log.severity.label(),
+                        log.service,
+                        sanitize_public_log(&log.message),
+                        log.trace_id
+                    ),
+                    tone,
+                    Some(format!("trace:{}", log.trace_id)),
+                    false,
+                ));
+            } else {
+                body.push((
+                    format!(
+                        "[{}] {:<18} {}",
+                        log.severity.label(),
+                        log.service,
+                        sanitize_public_log(&log.message)
+                    ),
+                    tone,
+                    None,
+                    false,
+                ));
+            }
         }
     }
 
