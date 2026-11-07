@@ -264,6 +264,8 @@ pub struct ConsoleState {
     pub selected_trace_id: Option<String>,
     /// `OBS > PurePath` selected span ID.
     pub selected_span_id: Option<String>,
+    /// `FLT > Worker Nodes` selected worker node ID for the stage drill-down drawer.
+    pub selected_node_id: Option<String>,
     /// `OBS > Logs` severity filter (`None` = `ALL`).
     pub log_severity_filter: Option<LogSeverity>,
     /// Polite `aria-live` announcement text.
@@ -325,6 +327,7 @@ impl ConsoleState {
             purepath_filter: "ALL".into(),
             selected_trace_id: None,
             selected_span_id: None,
+            selected_node_id: None,
             log_severity_filter: None,
             aria_polite: String::new(),
             aria_assertive: String::new(),
@@ -1066,11 +1069,48 @@ impl ConsoleState {
             self.aria_polite = format!("Selected branch {branch_ref}");
             return vec![UiCommand::Subscribe(self.route.clone())];
         }
-        if let Some(job_str) = id.strip_prefix("c5-job-select:") {
+        if let Some(job_str) = id
+            .strip_prefix("c5-job-select:")
+            .or_else(|| id.strip_prefix("ci-job-open:"))
+        {
             if let Ok(job_id) = job_str.parse::<u64>() {
                 self.route.job = Some(job_id);
-                return self.select_subview(SubView::Ci(CiSubView::QueueLogs));
+                let mut cmds = self.select_subview(SubView::Ci(CiSubView::QueueLogs));
+                cmds.push(UiCommand::SelectJob { job_id });
+                return cmds;
             }
+        }
+        if let Some(job_str) = id.strip_prefix("ci-job:") {
+            if let Ok(job_id) = job_str.parse::<u64>() {
+                self.route.job = Some(job_id);
+                self.aria_polite = format!("Selected CI job #{job_id}");
+                return vec![UiCommand::SelectJob { job_id }];
+            }
+        }
+        if let Some(job_str) = id.strip_prefix("ci-job-resume:") {
+            if let Ok(job_id) = job_str.parse::<u64>() {
+                if self.is_operator() {
+                    self.aria_assertive = format!("Resuming CI job #{job_id}");
+                    return vec![UiCommand::ResumeJob { job_id }];
+                }
+                self.aria_assertive = "Operator session required to resume CI jobs".into();
+                return Vec::new();
+            }
+        }
+        if let Some(job_str) = id.strip_prefix("ci-job-restart:") {
+            if let Ok(job_id) = job_str.parse::<u64>() {
+                if self.is_operator() {
+                    self.aria_assertive = format!("Restarting CI job #{job_id}");
+                    return vec![UiCommand::RestartJob { job_id }];
+                }
+                self.aria_assertive = "Operator session required to restart CI jobs".into();
+                return Vec::new();
+            }
+        }
+        if let Some(node_id) = id.strip_prefix("flt-node:") {
+            self.selected_node_id = Some(node_id.to_owned());
+            self.aria_polite = format!("Selected worker node {node_id}");
+            return Vec::new();
         }
         if let Some(sub_path) = id.strip_prefix("c5-sub-select:") {
             self.route.submodule = Some(SubmoduleId {

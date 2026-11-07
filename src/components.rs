@@ -1484,6 +1484,7 @@ fn render_c5_trainway(
 }
 
 /// Render `CI > Queue & Job Logs`: Active CI queue, worker slot occupancy (`max_slots = 1`), and sanitized logs.
+#[allow(clippy::too_many_lines)]
 fn render_ci_queue_logs(
     skin: &dyn Skin,
     w: &mut SvgWriter,
@@ -1518,6 +1519,135 @@ fn render_ci_queue_logs(
     let mut body: Vec<QueueRow> = Vec::new();
 
     if let Some(v) = state.client.view() {
+        if !v.ci_jobs.is_empty() {
+            body.push((
+                "── INTERACTIVE CI JOB QUEUE & STAGE DRILL-DOWN (CLICK JOB TO INSPECT / RESUME / RESTART) ──"
+                    .into(),
+                SemanticTone::Info,
+                None,
+                None,
+            ));
+            let active_job = state
+                .route
+                .job
+                .and_then(|id| v.ci_jobs.iter().find(|j| j.job_id == id))
+                .or_else(|| v.ci_jobs.first());
+            for job in &v.ci_jobs {
+                let is_sel = active_job.is_some_and(|a| a.job_id == job.job_id);
+                let (sig, tone) = match job.queue_state.as_str() {
+                    "Failed" => (SignalGlyph::BlockFailed, SemanticTone::Fail),
+                    "Active" => (SignalGlyph::BlockRunning, SemanticTone::Warn),
+                    "Queued" => (SignalGlyph::BlockPending, SemanticTone::Warn),
+                    _ => (SignalGlyph::BlockPassed, SemanticTone::Pass),
+                };
+                body.push((
+                    format!(
+                        "{}{:<23} {}/{} @{:<14} [{:<6}] SCORE:{} COV:{:.1}% TESTS:{}/{} {:>3}s",
+                        if is_sel { "▶ " } else { "  " },
+                        job.job_id_str,
+                        job.repo.owner,
+                        job.repo.repo,
+                        job.ref_name,
+                        job.queue_state.to_ascii_uppercase(),
+                        job.quality_score,
+                        f64::from(job.coverage_bp) / 100.0,
+                        job.tests_passed,
+                        job.tests_total,
+                        job.elapsed_secs
+                    ),
+                    tone,
+                    Some(sig),
+                    Some(format!("ci-job:{}", job.job_id)),
+                ));
+            }
+            if let Some(sel_job) = active_job {
+                body.push((
+                    format!(
+                        "── SELECTED JOB DRILL-DOWN [{}] ({}/{} @{}) ──",
+                        sel_job.job_id_str, sel_job.repo.owner, sel_job.repo.repo, sel_job.ref_name
+                    ),
+                    SemanticTone::Info,
+                    None,
+                    None,
+                ));
+                let action_tone = if state.is_operator() {
+                    SemanticTone::Pass
+                } else {
+                    SemanticTone::Warn
+                };
+                body.push((
+                    format!(
+                        "  [▶ RESUME PIPELINE (/api/jobs/{}/resume)] :: RE-RUN FAILED/PENDING STAGES",
+                        sel_job.job_id_str
+                    ),
+                    action_tone,
+                    None,
+                    Some(format!("ci-job-resume:{}", sel_job.job_id)),
+                ));
+                body.push((
+                    format!(
+                        "  [↻ RESTART ALL (/api/jobs/{}/restart)] :: FULL PIPELINE RE-EXECUTION",
+                        sel_job.job_id_str
+                    ),
+                    action_tone,
+                    None,
+                    Some(format!("ci-job-restart:{}", sel_job.job_id)),
+                ));
+                for (idx, st) in sel_job.stages.iter().enumerate() {
+                    let (st_sig, st_tone) = stage_glyph_and_tone(st.state);
+                    body.push((
+                        format!(
+                            "  [{}/{}] {:<16} {:<7} NODE:{:<15} THREADS:{} DUR:{:>3}s EXIT:{}",
+                            idx + 1,
+                            sel_job.stages.len(),
+                            st.name,
+                            st.state.label(),
+                            st.assigned_node.as_deref().unwrap_or("unassigned"),
+                            st.threads,
+                            st.duration_secs,
+                            st.exit_code
+                        ),
+                        st_tone,
+                        Some(st_sig),
+                        Some(format!("ci-job:{}", sel_job.job_id)),
+                    ));
+                }
+                body.push((
+                    format!("── RAW BUILD LOG (/api/jobs/{}/log) ──", sel_job.job_id_str),
+                    SemanticTone::Info,
+                    None,
+                    None,
+                ));
+                if !sel_job.raw_log_lines.is_empty() {
+                    for (li, line) in sel_job.raw_log_lines.iter().enumerate() {
+                        body.push((
+                            format!("  LOG[{:>02}]: {line}", li + 1),
+                            SemanticTone::Neutral,
+                            None,
+                            None,
+                        ));
+                    }
+                } else if !state.is_operator() {
+                    body.push((
+                        "  (raw build log requires Operator session — click READ-ONLY · SIGN IN to authenticate)"
+                            .into(),
+                        SemanticTone::Warn,
+                        None,
+                        Some("c2-auth-status".into()),
+                    ));
+                } else {
+                    body.push((
+                        format!(
+                            "  (click job {} above to fetch /api/jobs/{}/log)",
+                            sel_job.job_id_str, sel_job.job_id_str
+                        ),
+                        SemanticTone::Neutral,
+                        None,
+                        Some(format!("ci-job:{}", sel_job.job_id)),
+                    ));
+                }
+            }
+        }
         if let Some(topo) = v.topology.as_ref() {
             for tr in &topo.trains {
                 let st_label = topo
@@ -2476,6 +2606,15 @@ fn render_reg_packages(
                 ));
             }
         }
+        if body.is_empty() {
+            body.push((
+                "0 PACKAGES PUBLISHED IN MUREGIST CATALOG".into(),
+                SemanticTone::Neutral,
+                None,
+                None,
+                false,
+            ));
+        }
     }
 
     let (rows, page, total_pages) =
@@ -2580,6 +2719,14 @@ fn render_reg_canaries(
                     Some(format!("gate:{}", c.deployment_id)),
                 ));
             }
+        }
+        if body.is_empty() {
+            body.push((
+                "0 CANARY BUNDLES OR TAINTED DIGESTS IN MUREGIST LEDGER".into(),
+                SemanticTone::Neutral,
+                None,
+                None,
+            ));
         }
     }
 
@@ -3449,6 +3596,13 @@ fn render_obs_metrics(
                 Some(format!("trace:{}", m.exemplar_trace_id)),
             ));
         }
+        if rows.is_empty() {
+            rows.push((
+                "0 GOLDEN-SIGNAL OR HARDWARE BENCHMARK SERIES IN MUOBSERVE".into(),
+                SemanticTone::Neutral,
+                None,
+            ));
+        }
     }
 
     let screen_rows: Vec<ScreenRow<'_>> = rows
@@ -3610,6 +3764,7 @@ fn render_obs_datastore(
 }
 
 /// Render `FLT > Worker Nodes`: Fabric node locks (`node-a`, `worker-riscv64`) and single-slot stage execution.
+#[allow(clippy::too_many_lines)]
 fn render_fleet_worker_nodes(
     skin: &dyn Skin,
     w: &mut SvgWriter,
@@ -3633,14 +3788,29 @@ fn render_fleet_worker_nodes(
         },
     );
 
-    let headers: Vec<(String, SemanticTone)> = vec![(
+    type FltRow = (
+        String,
+        SemanticTone,
+        Option<SignalGlyph>,
+        Option<String>,
+        bool,
+    );
+    let headers: Vec<FltRow> = vec![(
         "INVARIANT: max_slots=1 per node :: thread budgets bounded via CARGO_BUILD_JOBS / RAYON_NUM_THREADS"
             .into(),
         SemanticTone::Info,
+        None,
+        None,
+        false,
     )];
-    let mut body: Vec<(String, SemanticTone)> = Vec::new();
+    let mut body: Vec<FltRow> = Vec::new();
     if let Some(v) = state.client.view() {
+        let active_node_id = state
+            .selected_node_id
+            .as_deref()
+            .or_else(|| v.nodes.first().map(|n| n.id.as_str()));
         for n in &v.nodes {
+            let is_sel = active_node_id == Some(n.id.as_str());
             let tone = if n.online {
                 SemanticTone::Pass
             } else {
@@ -3664,7 +3834,8 @@ fn render_fleet_worker_nodes(
             };
             body.push((
                 format!(
-                    "NODE {:<15} {:<7} STATUS:{:<7} SLOTS:{} LOAD:{} RAM:{} SEEN:{}s",
+                    "{}NODE {:<15} {:<7} STATUS:{:<7} SLOTS:{} LOAD:{} RAM:{} SEEN:{}s",
+                    if is_sel { "▶ " } else { "  " },
                     n.id.to_ascii_uppercase(),
                     arch_str,
                     if n.online { "ONLINE" } else { "OFFLINE" },
@@ -3674,6 +3845,13 @@ fn render_fleet_worker_nodes(
                     n.last_seen_secs_ago
                 ),
                 tone,
+                Some(if n.online {
+                    SignalGlyph::BlockPassed
+                } else {
+                    SignalGlyph::BlockFailed
+                }),
+                Some(format!("flt-node:{}", n.id)),
+                is_sel,
             ));
             if !n.tags.is_empty()
                 || !n.toolchains.is_empty()
@@ -3700,6 +3878,55 @@ fn render_fleet_worker_nodes(
                         tc_str
                     ),
                     SemanticTone::Info,
+                    None,
+                    Some(format!("flt-node:{}", n.id)),
+                    is_sel,
+                ));
+            }
+        }
+        if let Some(node_id) = active_node_id {
+            body.push((
+                format!(
+                    "── WORKER NODE STAGE DRILL-DOWN [{node_id}] (CLICK STAGE TO OPEN JOB LOG) ──"
+                ),
+                SemanticTone::Info,
+                None,
+                None,
+                false,
+            ));
+            let mut matched_stages = 0_usize;
+            for job in &v.ci_jobs {
+                for st in &job.stages {
+                    if st.assigned_node.as_deref() == Some(node_id) {
+                        matched_stages += 1;
+                        let (st_sig, st_tone) = stage_glyph_and_tone(st.state);
+                        body.push((
+                            format!(
+                                "  [{:<7}] {:<16} {}/{} @{:<14} THREADS:{} {:>3}s [JOB ↗ {}]",
+                                st.state.label(),
+                                st.name,
+                                job.repo.owner,
+                                job.repo.repo,
+                                job.ref_name,
+                                st.threads,
+                                st.duration_secs,
+                                job.job_id_str
+                            ),
+                            st_tone,
+                            Some(st_sig),
+                            Some(format!("ci-job-open:{}", job.job_id)),
+                            false,
+                        ));
+                    }
+                }
+            }
+            if matched_stages == 0 {
+                body.push((
+                    "  (0 active or recent stages recorded on this worker node)".into(),
+                    SemanticTone::Neutral,
+                    None,
+                    None,
+                    false,
                 ));
             }
         }
@@ -3719,24 +3946,33 @@ fn render_fleet_worker_nodes(
                     } else {
                         SemanticTone::Info
                     },
+                    None,
+                    Some(format!("ci-job-open:{}", tr.job_id)),
+                    false,
                 ));
             }
         }
     } else {
-        body.push(("AWAITING FLEET TELEMETRY…".into(), SemanticTone::Neutral));
+        body.push((
+            "AWAITING FLEET TELEMETRY…".into(),
+            SemanticTone::Neutral,
+            None,
+            None,
+            false,
+        ));
     }
 
     let (lines_owned, page, total_pages) =
         paginate_with_headers(headers, body, panel.grid.rows, state.fleet_page);
     let rows: Vec<ScreenRow<'_>> = lines_owned
         .iter()
-        .map(|(txt, tone)| ScreenRow {
+        .map(|(txt, tone, sig, cid, sel)| ScreenRow {
             text: txt.as_str(),
             tone: *tone,
-            signal: None,
+            signal: *sig,
             critical: false,
-            control_id: None,
-            selected: false,
+            control_id: cid.as_deref(),
+            selected: *sel,
         })
         .collect();
 
