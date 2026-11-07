@@ -844,17 +844,18 @@ fn render_twin_scorecard(
         RepoStatus::Unknown => (SemanticTone::Neutral, "UNK "),
     };
     let grade = match repo.score {
-        90..=100 => 'A',
-        80..=89 => 'B',
-        70..=79 => 'C',
-        1..=69 => 'D',
-        _ => '-',
+        97..=100 => "A+",
+        90..=96 => "A",
+        80..=89 => "B",
+        70..=79 => "C",
+        1..=69 => "D",
+        _ => "-",
     };
     let l0 = format!("{}/{}", repo.id.owner, repo.id.repo);
-    let l1 = format!("{st_tag} {:>2}/100 {grade}", repo.score.min(99));
+    let l1 = format!("{st_tag} {:>3}/100 {grade}", repo.score.min(100));
     let l2 = format!(
-        "COV {:>2}% {:+.1}%",
-        (repo.coverage_bp / 100).min(99),
+        "COV {:>3}% {:+.1}%",
+        (repo.coverage_bp / 100).min(100),
         f64::from(repo.bench_delta_bp) / 100.0
     );
     let job_tag = repo
@@ -1320,7 +1321,9 @@ fn render_c5_trainway(
                 let job_tag = format_job_id(tr.job_id);
                 stage_progress = format!(" #{job_tag} · STAGE {st_idx}/{}", tr.stage_states.len());
             }
-            let fading = matches!(al.branch.phase, SidingPhase::Fading { .. });
+            let fading = matches!(al.branch.phase, SidingPhase::Fading { .. })
+                || al.branch.pr_state == PrState::Merged;
+            let closed = al.branch.pr_state == PrState::Closed;
             let under_construction = al.branch.phase == SidingPhase::UnderConstruction;
             let (glyph, tone) = if failed || lost {
                 (SignalGlyph::BlockFailed, SemanticTone::Fail)
@@ -1335,6 +1338,8 @@ fn render_c5_trainway(
                 "NEW SIDING UNDER CONSTRUCTION"
             } else if fading {
                 "MERGED"
+            } else if closed {
+                "CLOSED"
             } else {
                 "ACTIVE"
             };
@@ -1531,6 +1536,13 @@ fn render_ci_queue_logs(
                 .route
                 .job
                 .and_then(|id| v.ci_jobs.iter().find(|j| j.job_id == id))
+                .or_else(|| {
+                    state
+                        .route
+                        .repo
+                        .as_ref()
+                        .and_then(|r| v.ci_jobs.iter().find(|j| &j.repo == r))
+                })
                 .or_else(|| v.ci_jobs.first());
             for job in &v.ci_jobs {
                 let is_sel = active_job.is_some_and(|a| a.job_id == job.job_id);
@@ -1871,6 +1883,7 @@ fn render_c6_delivery_gate(
         Some(g) if g.rollback_lit() => ("◀ ROLLBACK", SemanticTone::Fail),
         Some(g) if g.promote_lit() => ("PROMOTE ▶", SemanticTone::Pass),
         Some(_) => ("GATE PENDING", SemanticTone::Warn),
+        None if view.is_some_and(|v| !v.repos.is_empty()) => ("GATE IDLE", SemanticTone::Neutral),
         None => ("AWAITING GATE", SemanticTone::Neutral),
     };
     skin.readout(
@@ -2115,6 +2128,35 @@ fn render_c6_delivery_gate(
                 ));
             }
         }
+    } else if view.is_some_and(|v| !v.repos.is_empty()) {
+        let repo_label = state.route.repo.as_ref().map_or_else(
+            || "SELECTED REPO".into(),
+            |r| format!("{}/{}", r.owner, r.repo),
+        );
+        rows_data.push((
+            format!("NO ACTIVE CD GATE FOR {repo_label} (0 DEPLOYMENTS RECORDED)"),
+            SemanticTone::Neutral,
+            None,
+            false,
+            None,
+            false,
+        ));
+        rows_data.push((
+            "SLOT A: STANDBY · SLOT B: STANDBY · LEASE: IDLE".into(),
+            SemanticTone::Info,
+            Some(SignalGlyph::BlockPending),
+            false,
+            None,
+            false,
+        ));
+        rows_data.push((
+            "INTEGRATION GATE: READY (AWAITING .muconde/MuConDe.yml PIPELINE TRIGGER)".into(),
+            SemanticTone::Neutral,
+            None,
+            false,
+            None,
+            false,
+        ));
     } else {
         rows_data.push((
             "AWAITING DELIVERY GATE STREAM…".into(),
@@ -2896,12 +2938,14 @@ fn render_obs_smartscape(
                 None,
                 false,
             ));
+            let mut layer_count = 0_usize;
             for n in v
                 .observe
                 .smartscape_nodes
                 .iter()
                 .filter(|n| n.layer == layer)
             {
+                layer_count += 1;
                 let selected = state.selected_entity_id.as_deref() == Some(n.id.as_str());
                 let tone = if !n.healthy || n.error_rate_bp > 100 {
                     SemanticTone::Warn
@@ -2951,6 +2995,15 @@ fn render_obs_smartscape(
                         true,
                     ));
                 }
+            }
+            if layer_count == 0 {
+                body.push((
+                    "  (0 entities in layer)".into(),
+                    SemanticTone::Neutral,
+                    None,
+                    None,
+                    false,
+                ));
             }
         }
     }
@@ -3097,9 +3150,22 @@ fn render_obs_purepath(
         let active_trace = state
             .selected_trace_id
             .as_deref()
-            .and_then(|id| v.observe.traces.iter().find(|t| t.trace_id == id))
-            .or_else(|| filtered_traces.first().copied())
-            .or_else(|| v.observe.traces.first());
+            .and_then(|id| filtered_traces.iter().copied().find(|t| t.trace_id == id))
+            .or_else(|| filtered_traces.first().copied());
+
+        if filtered_traces.is_empty() {
+            body.push((
+                format!(
+                    "  0 TRACES MATCHING FILTER [ACTIVE: {}] — SELECT [ALL] OR [CI] TO INSPECT WATERFALLS",
+                    state.purepath_filter
+                ),
+                SemanticTone::Neutral,
+                None,
+                false,
+                Some("ppfilter:ALL".into()),
+                false,
+            ));
+        }
 
         for tr in &filtered_traces {
             let is_active = active_trace.is_some_and(|a| a.trace_id == tr.trace_id);
