@@ -1221,8 +1221,24 @@ fn render_c5_trainway(
                     .find(|r| Some(&r.id) == state.route.repo.as_ref())
             })
             .map_or(t.submodules.len(), |r| r.submodules.len());
+        let ci_trace_id = view
+            .and_then(|v| {
+                layout
+                    .main_train
+                    .as_ref()
+                    .map(|mt| format!("tr-ci-{}", format_job_id(mt.job_id)))
+                    .filter(|tid| v.observe.traces.iter().any(|tr| &tr.trace_id == tid))
+                    .or_else(|| {
+                        v.observe
+                            .traces
+                            .iter()
+                            .find(|tr| tr.domain == "CI")
+                            .map(|tr| tr.trace_id.clone())
+                    })
+            })
+            .unwrap_or_else(|| "tr-ci-1234".into());
         let st_header = format!(
-            "FABRIC REV {:04} · SUBMODULES: {} · INTERCHANGE ⇄ {} · [TRACE ↗ tr-ci-1234]",
+            "FABRIC REV {:04} · SUBMODULES: {} · INTERCHANGE ⇄ {} · [TRACE ↗ {ci_trace_id}]",
             t.fabric_rev,
             sub_count,
             if t.submodule_bump_pending {
@@ -1235,7 +1251,7 @@ fn render_c5_trainway(
             st_header,
             SemanticTone::Info,
             None,
-            Some("trace:tr-ci-1234".into()),
+            Some(format!("trace:{ci_trace_id}")),
             false,
         ));
 
@@ -1516,9 +1532,21 @@ fn render_ci_queue_logs(
                     (SignalGlyph::BlockRunning, SemanticTone::Pass)
                 };
                 let job_tag = format_job_id(tr.job_id);
+                let tr_trace_id = {
+                    let candidate = format!("tr-ci-{job_tag}");
+                    if v.observe.traces.iter().any(|t| t.trace_id == candidate) {
+                        candidate
+                    } else {
+                        v.observe
+                            .traces
+                            .iter()
+                            .find(|t| t.domain == "CI")
+                            .map_or_else(|| "tr-ci-1234".into(), |t| t.trace_id.clone())
+                    }
+                };
                 body.push((
                     format!(
-                        "JOB #{:<8} REF {:<18} STAGE {:<8} NODE {:<15} [TRACE ↗ tr-ci-1234]",
+                        "JOB #{:<8} REF {:<18} STAGE {:<8} NODE {:<15} [TRACE ↗ {tr_trace_id}]",
                         job_tag,
                         tr.ref_name,
                         st_label,
@@ -1526,7 +1554,7 @@ fn render_ci_queue_logs(
                     ),
                     tone,
                     Some(sig),
-                    Some("trace:tr-ci-1234".into()),
+                    Some(format!("trace:{tr_trace_id}")),
                 ));
                 if !topo.stations.is_empty() && !tr.stage_states.is_empty() {
                     let breakdown: Vec<String> = topo
@@ -1545,6 +1573,48 @@ fn render_ci_queue_logs(
                         Some(format!("c5-track-{}", tr.ref_name)),
                     ));
                 }
+            }
+        }
+        let live_ci_traces: Vec<_> = v
+            .observe
+            .traces
+            .iter()
+            .filter(|t| {
+                t.domain == "CI" && t.trace_id != "tr-ci-1234" && t.trace_id != "tr-obs-p99-07"
+            })
+            .take(10)
+            .collect();
+        if !live_ci_traces.is_empty() {
+            body.push((
+                "── CLUSTER-WIDE CI QUEUE LEDGER (/api/queue) ──".into(),
+                SemanticTone::Info,
+                None,
+                None,
+            ));
+            for tr in live_ci_traces {
+                let tone = if tr.error {
+                    SemanticTone::Fail
+                } else {
+                    SemanticTone::Pass
+                };
+                let sig = if tr.error {
+                    SignalGlyph::BlockFailed
+                } else {
+                    SignalGlyph::BlockPassed
+                };
+                body.push((
+                    format!(
+                        "{:<14} {:<42} {:>6}ms ({} stages) [TRACE ↗ {}]",
+                        tr.trace_id,
+                        tr.root_operation,
+                        tr.duration_ms,
+                        tr.spans.len(),
+                        tr.trace_id
+                    ),
+                    tone,
+                    Some(sig),
+                    Some(format!("trace:{}", tr.trace_id)),
+                ));
             }
         }
         body.push((
@@ -1703,6 +1773,30 @@ fn render_c6_delivery_gate(
                 .checked_sub(1)
                 .and_then(|hi| v.history.get(hi))
         });
+        let ttl_secs = view
+            .and_then(|v| {
+                v.leases
+                    .iter()
+                    .find(|l| l.deployment_id == g.deployment_id)
+                    .map(|l| l.ttl_remaining_ms / 1_000)
+            })
+            .unwrap_or(142);
+        let cd_trace_id = view
+            .and_then(|v| {
+                v.registry
+                    .canaries
+                    .iter()
+                    .find(|c| c.deployment_id == g.deployment_id || c.repo == g.repo)
+                    .map(|c| c.trace_id.clone())
+                    .or_else(|| {
+                        v.observe
+                            .traces
+                            .iter()
+                            .find(|t| t.domain == "CD")
+                            .map(|t| t.trace_id.clone())
+                    })
+            })
+            .unwrap_or_else(|| "tr-cd-0042".into());
         let hdr = if let Some(hs) = active_summary {
             format!(
                 "REPLAY {} · {} · IT {}/{} · {:?}",
@@ -1710,10 +1804,11 @@ fn render_c6_delivery_gate(
             )
         } else {
             format!(
-                "DEPLOY {} · SLOT {:?}->{:?} · TTL 142s{} · [TRACE ↗ tr-cd-0042]",
+                "DEPLOY {} · SLOT {:?}->{:?} · TTL {}s{} · [TRACE ↗ {cd_trace_id}]",
                 g.deployment_id,
                 g.restore_slot,
                 g.staged_slot,
+                ttl_secs,
                 g.rollback_reason
                     .map_or_else(String::new, |r| format!(" ({r:?})"))
             )
@@ -1723,7 +1818,7 @@ fn render_c6_delivery_gate(
             junc_tone,
             None,
             false,
-            Some("trace:tr-cd-0042".into()),
+            Some(format!("trace:{cd_trace_id}")),
             false,
         ));
 
@@ -1985,9 +2080,23 @@ fn render_cd_deployments_slots(
                         (SignalGlyph::BlockFailed, SemanticTone::Fail)
                     }
                 };
+                let cd_trace_id = v
+                    .registry
+                    .canaries
+                    .iter()
+                    .find(|c| c.deployment_id == cd.deployment_id || c.repo == r.id)
+                    .map(|c| c.trace_id.clone())
+                    .or_else(|| {
+                        v.observe
+                            .traces
+                            .iter()
+                            .find(|t| t.domain == "CD")
+                            .map(|t| t.trace_id.clone())
+                    })
+                    .unwrap_or_else(|| "tr-cd-0042".into());
                 body.push((
                     format!(
-                        "{:<24} DEPLOY {:<10} ACTIVE:{:?} STAGED:{:?} IT {}/{} {:?} [TRACE ↗ tr-cd-0042]",
+                        "{:<24} DEPLOY {:<10} ACTIVE:{:?} STAGED:{:?} IT {}/{} {:?} [TRACE ↗ {cd_trace_id}]",
                         format!("{}/{}", r.id.owner, r.id.repo),
                         cd.deployment_id,
                         cd.active_slot,
@@ -1998,7 +2107,7 @@ fn render_cd_deployments_slots(
                     ),
                     tone,
                     Some(sig),
-                    Some("trace:tr-cd-0042".into()),
+                    Some(format!("trace:{cd_trace_id}")),
                 ));
             }
         }
@@ -2678,15 +2787,20 @@ fn render_obs_smartscape(
                         .filter(|e| e.from_id == n.id || e.to_id == n.id)
                         .map(|e| format!("{} -> {} ({})", e.from_id, e.to_id, e.protocol))
                         .collect();
+                    let entity_trace_id = v
+                        .observe
+                        .traces
+                        .first()
+                        .map_or_else(|| "tr-ci-1234".into(), |t| t.trace_id.clone());
                     body.push((
                         format!(
-                            "    └─ ENTITY DRAWER [{}]: {} · [TRACE ↗ tr-ci-1234]",
+                            "    └─ ENTITY DRAWER [{}]: {} · [TRACE ↗ {entity_trace_id}]",
                             n.id,
                             edges.join(" | ")
                         ),
                         SemanticTone::Info,
                         None,
-                        Some("trace:tr-ci-1234".into()),
+                        Some(format!("trace:{entity_trace_id}")),
                         true,
                     ));
                 }
@@ -3051,6 +3165,12 @@ fn render_obs_problems_slos(
     );
 
     type ProblemRow = (String, SemanticTone, Option<SignalGlyph>, Option<String>);
+    let headers: Vec<ProblemRow> = vec![(
+        "PROBLEM ID   CATEGORY             BURN RATE   CAUSAL ANOMALY & ROOT CAUSE TRACE".into(),
+        SemanticTone::Info,
+        None,
+        None,
+    )];
     let mut body: Vec<ProblemRow> = Vec::new();
     if let Some(v) = state.client.view() {
         for p in &v.observe.problems {
@@ -3082,10 +3202,18 @@ fn render_obs_problems_slos(
                 Some(format!("trace:{}", p.root_cause_trace_id)),
             ));
         }
+        if body.is_empty() {
+            body.push((
+                "ALL SLO BUDGETS NOMINAL :: 0 ACTIVE CAUSAL PROBLEMS DETECTED".into(),
+                SemanticTone::Pass,
+                Some(SignalGlyph::BlockPassed),
+                None,
+            ));
+        }
     }
 
     let (rows, page, total_pages) =
-        paginate_with_headers(Vec::new(), body, panel.grid.rows, state.subview_page);
+        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, cid)| ScreenRow {
@@ -3518,14 +3646,62 @@ fn render_fleet_worker_nodes(
             } else {
                 SemanticTone::Fail
             };
+            let arch_str = if n.arch.is_empty() {
+                if n.id.contains("riscv64") {
+                    "riscv64"
+                } else {
+                    "x86_64"
+                }
+            } else {
+                n.arch.as_str()
+            };
+            let slots_str = format!("{}/{}", n.active_slots, n.max_slots.max(1));
+            let cpu_str = format!("{:.2}", f64::from(n.cpu_load_bp) / 100.0);
+            let ram_str = if n.ram_total_mb > 0 {
+                format!("{}/{}MB", n.ram_used_mb, n.ram_total_mb)
+            } else {
+                "KVM READY".into()
+            };
             body.push((
                 format!(
-                    "NODE {:<16} STATUS: {}  SLOTS: 1/1  KVM: /dev/kvm READY",
+                    "NODE {:<15} {:<7} STATUS:{:<7} SLOTS:{} LOAD:{} RAM:{} SEEN:{}s",
                     n.id.to_ascii_uppercase(),
-                    if n.online { "ONLINE" } else { "OFFLINE / LOST" }
+                    arch_str,
+                    if n.online { "ONLINE" } else { "OFFLINE" },
+                    slots_str,
+                    cpu_str,
+                    ram_str,
+                    n.last_seen_secs_ago
                 ),
                 tone,
             ));
+            if !n.tags.is_empty()
+                || !n.toolchains.is_empty()
+                || n.btrfs_enabled
+                || n.exclusive_locked
+                || n.ram_total_mb > 0
+            {
+                let tags_str = if n.tags.is_empty() {
+                    "default".to_owned()
+                } else {
+                    n.tags.join(",")
+                };
+                let tc_str = if n.toolchains.is_empty() {
+                    "rust".to_owned()
+                } else {
+                    n.toolchains.join(",")
+                };
+                body.push((
+                    format!(
+                        "  └─ BTRFS:{} LOCK:{} TAGS:[{}] TOOLCHAINS:[{}]",
+                        if n.btrfs_enabled { "YES" } else { "NO" },
+                        if n.exclusive_locked { "HELD" } else { "FREE" },
+                        tags_str,
+                        tc_str
+                    ),
+                    SemanticTone::Info,
+                ));
+            }
         }
         if let Some(topo) = v.topology.as_ref() {
             for tr in &topo.trains {

@@ -185,10 +185,7 @@ mod tests {
             ClientUpdate::View
         );
         c.on_frame(&frame(&DataEvent::Patch(vec![Delta::NodeUpsert(
-            FabricNode {
-                id: "node-a".into(),
-                online: false,
-            },
+            FabricNode::new("node-a", false),
         )])));
         assert_eq!(c.view().map(|v| v.nodes.len()), Some(1));
         c.on_frame(&frame(&DataEvent::Connection(ConnState::Live)));
