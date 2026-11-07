@@ -1665,4 +1665,15 @@ fn u19_live_workflow_parity_ci_job_drilldown_resume_restart_and_worker_node_stag
     assert_eq!(st.route.subview, SubView::Ci(CiSubView::QueueLogs));
     assert_eq!(st.route.job, Some(1_233));
     assert!(open_job_cmds.contains(&UiCommand::SelectJob { job_id: 1_233 }));
+
+    // Switching repository via c4-card-select clears stale route.job and route.branch.
+    st.route.branch = Some("refs/heads/feat/test".into());
+    st.on_dom_action(
+        "data-control-id",
+        "c4-card-select:LMA1980/ActionRunner-rs",
+        false,
+        1_500,
+    );
+    assert_eq!(st.route.job, None);
+    assert_eq!(st.route.branch, None);
 }

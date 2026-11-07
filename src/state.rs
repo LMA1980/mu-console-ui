@@ -654,6 +654,8 @@ impl ConsoleState {
         let chosen = &repos[self.outer_index];
         self.route.repo = Some(chosen.id.clone());
         self.route.submodule = None;
+        self.route.branch = None;
+        self.route.job = None;
         self.pending_select_at_ms = Some(now_ms.saturating_add(ROTARY_SETTLE_MS));
         self.aria_polite = format!("Selected repository {}/{}", chosen.id.owner, chosen.id.repo);
     }
@@ -700,6 +702,8 @@ impl ConsoleState {
         if let Some(first) = repos.first() {
             self.route.repo = Some(first.id.clone());
             self.route.submodule = None;
+            self.route.branch = None;
+            self.route.job = None;
             self.pending_select_at_ms = Some(now_ms.saturating_add(ROTARY_SETTLE_MS));
         }
     }
@@ -1028,6 +1032,8 @@ impl ConsoleState {
                 let rid = RepoId::new(owner, repo);
                 self.route.repo = Some(rid.clone());
                 self.route.submodule = None;
+                self.route.branch = None;
+                self.route.job = None;
                 self.sync_rotary_from_route();
                 self.aria_polite = format!("Selected repository {owner}/{repo}");
                 return vec![UiCommand::SelectRepo {
@@ -1041,6 +1047,8 @@ impl ConsoleState {
                 let rid = RepoId::new(owner, repo);
                 self.route.repo = Some(rid.clone());
                 self.route.submodule = None;
+                self.route.branch = None;
+                self.route.job = None;
                 self.sync_rotary_from_route();
                 let mut cmds = vec![UiCommand::SelectRepo {
                     repo: rid,
@@ -1055,6 +1063,8 @@ impl ConsoleState {
                 let rid = RepoId::new(owner, repo);
                 self.route.repo = Some(rid.clone());
                 self.route.submodule = None;
+                self.route.branch = None;
+                self.route.job = None;
                 self.sync_rotary_from_route();
                 let mut cmds = vec![UiCommand::SelectRepo {
                     repo: rid,
