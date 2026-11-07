@@ -1940,6 +1940,7 @@ fn render_c6_delivery_gate(
                     })
             })
             .unwrap_or_else(|| "tr-cd-0042".into());
+        let short_cd_tid: String = cd_trace_id.chars().take(12).collect();
         let hdr = if let Some(hs) = active_summary {
             format!(
                 "REPLAY {} · {} · IT {}/{} · {:?}",
@@ -1947,7 +1948,7 @@ fn render_c6_delivery_gate(
             )
         } else {
             format!(
-                "DEPLOY {} · SLOT {:?}->{:?} · TTL {}s{} · [TRACE ↗ {cd_trace_id}]",
+                "DEPLOY {} · SLOT {:?}->{:?} · TTL {}s{} · [TRACE ↗ {short_cd_tid}]",
                 g.deployment_id,
                 g.restore_slot,
                 g.staged_slot,
@@ -2266,9 +2267,10 @@ fn render_cd_deployments_slots(
                             .map(|t| t.trace_id.clone())
                     })
                     .unwrap_or_else(|| "tr-cd-0042".into());
+                let short_cd_tid: String = cd_trace_id.chars().take(12).collect();
                 body.push((
                     format!(
-                        "{:<24} DEPLOY {:<10} ACTIVE:{:?} STAGED:{:?} IT {}/{} {:?} [TRACE ↗ {cd_trace_id}]",
+                        "{:<24} DEPLOY {:<10} ACTIVE:{:?} STAGED:{:?} IT {}/{} {:?} [TRACE ↗ {short_cd_tid}]",
                         format!("{}/{}", r.id.owner, r.id.repo),
                         cd.deployment_id,
                         cd.active_slot,
@@ -2736,15 +2738,15 @@ fn render_reg_canaries(
                     (SignalGlyph::BlockFailed, SemanticTone::Fail)
                 }
             };
+            let short_tid: String = c.trace_id.chars().take(12).collect();
             body.push((
                 format!(
-                    "{:<8}  {:<23}  {:<16}  {:<19}  {:<11}  [TRACE ↗ {}]",
+                    "{:<8}  {:<23}  {:<16}  {:<19}  {:<11}  [TRACE ↗ {short_tid}]",
                     c.bundle_id,
                     format!("{}/{}", c.repo.owner, c.repo.repo),
                     c.service,
                     c.artifact_digest,
                     c.state.label(),
-                    c.trace_id
                 ),
                 tone,
                 Some(sig),
@@ -2833,13 +2835,23 @@ fn render_reg_cas_health(
     let mut rows: Vec<(String, SemanticTone)> = Vec::new();
     if let Some(v) = state.client.view() {
         let cas = &v.registry.cas;
+        let fmt_mb = |b: u64| {
+            if b == 0 || b >= 10_000_000 {
+                format!("{} MB", b / 1_000_000)
+            } else {
+                format!(
+                    "{:.2} MB",
+                    f64::from(u32::try_from(b).unwrap_or(0)) / 1_000_000.0
+                )
+            }
+        };
         rows.push((
             format!(
-                "CAS BLOB COUNT: {} blobs :: DEDUP RATIO: {:.2}x ({} MB dedup / {} MB raw)",
+                "CAS BLOB COUNT: {} blobs :: DEDUP RATIO: {:.2}x ({} dedup / {} raw)",
                 cas.blob_count,
                 f64::from(cas.dedup_ratio_bp) / 100.0,
-                cas.dedup_bytes / 1_000_000,
-                cas.raw_bytes / 1_000_000
+                fmt_mb(cas.dedup_bytes),
+                fmt_mb(cas.raw_bytes)
             ),
             SemanticTone::Pass,
         ));
