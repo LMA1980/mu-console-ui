@@ -1614,3 +1614,55 @@ fn u18_avionics_skin_switcher_and_operator_job_restart_actions() {
     let direct_cmds = st.on_dom_action("data-restart-job", "1234", false, 1_300);
     assert_eq!(direct_cmds, vec![UiCommand::RestartJob { job_id: 1_234 }]);
 }
+
+#[test]
+fn u19_live_workflow_parity_ci_job_drilldown_resume_restart_and_worker_node_stages() {
+    use mu_console_protocol::FleetSubView;
+
+    let mut st = state_for_scenario(
+        Scenario::StageFailure,
+        SubView::Ci(CiSubView::QueueLogs),
+        CrtFont::Hurmit,
+    );
+    let svg_ql = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_ql.contains("INTERACTIVE CI JOB QUEUE"));
+    assert!(svg_ql.contains("SELECTED JOB DRILL-DOWN"));
+    assert!(svg_ql.contains("RESUME PIPELINE"));
+    assert!(svg_ql.contains("RESTART ALL"));
+    assert_svg_zero_overflow(&svg_ql, 1512.0, 860.0, "u19_ci_queue_logs");
+
+    let sel_cmds = st.on_dom_action("data-control-id", "ci-job:1233", false, 1_000);
+    assert_eq!(st.route.job, Some(1_233));
+    assert_eq!(sel_cmds, vec![UiCommand::SelectJob { job_id: 1_233 }]);
+
+    let res_cmds = st.on_dom_action("data-control-id", "ci-job-resume:1233", false, 1_100);
+    assert_eq!(res_cmds, vec![UiCommand::ResumeJob { job_id: 1_233 }]);
+
+    let rst_cmds = st.on_dom_action("data-control-id", "ci-job-restart:1233", false, 1_200);
+    assert_eq!(rst_cmds, vec![UiCommand::RestartJob { job_id: 1_233 }]);
+
+    // Switch to FLT > Worker Nodes and verify node selection + stage drill-down.
+    st.select_subview(SubView::Fleet(FleetSubView::WorkerNodes));
+    let svg_flt = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_flt.contains("WORKER NODE STAGE DRILL-DOWN"));
+    assert!(svg_flt.contains("flt-node:node-a"));
+    assert_svg_zero_overflow(&svg_flt, 1512.0, 860.0, "u19_flt_worker_nodes");
+
+    st.on_dom_action("data-control-id", "flt-node:worker-riscv64", false, 1_300);
+    assert_eq!(st.selected_node_id.as_deref(), Some("worker-riscv64"));
+
+    let open_job_cmds = st.on_dom_action("data-control-id", "ci-job-open:1233", false, 1_400);
+    assert_eq!(st.route.subview, SubView::Ci(CiSubView::QueueLogs));
+    assert_eq!(st.route.job, Some(1_233));
+    assert!(open_job_cmds.contains(&UiCommand::SelectJob { job_id: 1_233 }));
+}
