@@ -9,9 +9,9 @@ use mu_console_layout::{
 };
 use mu_console_protocol::{
     format_job_id, sanitize_public_log, Area, AuthState, CanaryBundleState, CdSubView, CiSubView,
-    ConnState, CrtFont, FleetSubView, GateOutcome, GateTest, LogSeverity, ObserveSubView,
-    PackageEcosystem, PrState, RegistrySubView, RepoScore, RepoStatus, RepoTopology, SidingPhase,
-    SmartscapeLayer, StageState, SubView, TestState,
+    ConnState, ConsoleSkin, CrtFont, FleetSubView, GateOutcome, GateTest, LogSeverity,
+    ObserveSubView, PackageEcosystem, PrState, RegistrySubView, RepoScore, RepoStatus,
+    RepoTopology, SidingPhase, SmartscapeLayer, StageState, SubView, TestState,
 };
 use mu_console_theme::instruments::switch::SwitchAction;
 use mu_console_theme::instruments::Rect;
@@ -22,7 +22,7 @@ use mu_console_theme::skin::{
 use mu_console_theme::svg::{escape_into, PathData, SvgWriter};
 
 use crate::router::{area_label, breadcrumb_segments};
-use crate::state::{font_slug, ConsoleState};
+use crate::state::{font_slug, skin_slug, ConsoleState};
 
 const fn stage_glyph_and_tone(state: StageState) -> (SignalGlyph, SemanticTone) {
     match state {
@@ -3854,6 +3854,11 @@ fn escape_html(s: &str) -> String {
 #[must_use]
 pub fn render_html_shell(svg: &str, state: &ConsoleState) -> String {
     let font_attr = font_slug(state.font);
+    let skin_attr = skin_slug(state.skin);
+    let skin_label = match state.skin {
+        ConsoleSkin::Wireframe => "SKIN: WIREFRAME [S]",
+        ConsoleSkin::Avionics => "SKIN: AVIONICS [S]",
+    };
     let dyslexic_face = if state.lazy_dyslexic_loaded {
         "@font-face{font-family:'OpenDyslexicM Nerd Font Mono';src:url('/fonts/OpenDyslexicMNerdFontMono-Regular.woff2') format('woff2');font-display:swap;}"
     } else {
@@ -3885,7 +3890,7 @@ pub fn render_html_shell(svg: &str, state: &ConsoleState) -> String {
     let escaped_auth_label = escape_html(&auth_label);
 
     format!(
-        "<div id=\"muconsole-shell\" data-crt-font=\"{font_attr}\" data-lazy-dyslexic=\"{lazy_dyslexic}\" data-area=\"{area}\" data-subview=\"{subview}\" data-auth-state=\"{auth_slug}\">\
+        "<div id=\"muconsole-shell\" data-crt-font=\"{font_attr}\" data-skin=\"{skin_attr}\" data-lazy-dyslexic=\"{lazy_dyslexic}\" data-area=\"{area}\" data-subview=\"{subview}\" data-auth-state=\"{auth_slug}\">\
          <style>{dyslexic_face}#muconsole-filter{{font-size:16px;}}</style>\
          <header id=\"muconsole-header\" role=\"banner\">\
          <a href=\"#muconsole-dashboard\" class=\"skip-link\">Skip to dashboard</a>\
@@ -3895,6 +3900,7 @@ pub fn render_html_shell(svg: &str, state: &ConsoleState) -> String {
          <a id=\"muconsole-auth-link\" href=\"{escaped_auth_href}\" data-auth-state=\"{auth_slug}\">{escaped_auth_label}</a>\
          </header>\
          <main id=\"muconsole-dashboard\" role=\"main\" aria-label=\"MuConsole Unified CI/CD Dashboard\" tabindex=\"-1\">{svg}</main>\
+         <button id=\"muconsole-skin-toggle\" type=\"button\" data-skin-toggle=\"true\" aria-label=\"Toggle visual skin\" style=\"position:fixed;bottom:8px;right:12px;z-index:20;font-family:var(--font-crt);font-size:11px;color:var(--accent-neon-cyan);background:rgba(5,10,14,0.85);border:1px solid var(--accent-neon-cyan);border-radius:3px;padding:3px 8px;cursor:pointer;white-space:nowrap\">{skin_label}</button>\
          </div>",
         lazy_dyslexic = state.lazy_dyslexic_loaded,
         area = area_label(state.route.area),

@@ -62,8 +62,6 @@ fn state_for_scenario(scenario: Scenario, subview: SubView, font: CrtFont) -> Co
 }
 
 fn assert_svg_zero_overflow(svg: &str, vw: f64, vh: f64, context: &str) {
-    let doc =
-        roxmltree::Document::parse(svg).unwrap_or_else(|e| panic!("{context}: invalid XML: {e}"));
     assert!(
         !svg.contains("feGaussianBlur"),
         "{context}: WireframeSkin must not emit feGaussianBlur"
@@ -76,6 +74,12 @@ fn assert_svg_zero_overflow(svg: &str, vw: f64, vh: f64, context: &str) {
         !svg.contains("mu-brushed"),
         "{context}: WireframeSkin must not emit brushed tungsten filter"
     );
+    assert_svg_bounds_zero_overflow(svg, vw, vh, context);
+}
+
+fn assert_svg_bounds_zero_overflow(svg: &str, vw: f64, vh: f64, context: &str) {
+    let doc =
+        roxmltree::Document::parse(svg).unwrap_or_else(|e| panic!("{context}: invalid XML: {e}"));
 
     let lower = svg.to_ascii_lowercase();
     let probe_tokens: Vec<String> = std::env::var("MU_TEST_FORBIDDEN_IDENTIFIERS")
@@ -1527,4 +1531,86 @@ fn u17_interactive_scorecards_breadcrumbs_filters_trace_selection_and_pagination
     assert_eq!(st.selected_trace_id.as_deref(), Some("tr-cd-0042"));
     assert_eq!(st.route.trace_id.as_deref(), Some("tr-cd-0042"));
     assert!(!cmds_tr.is_empty());
+}
+
+#[test]
+fn u18_avionics_skin_switcher_and_operator_job_restart_actions() {
+    use mu_console_protocol::ConsoleSkin;
+    use mu_console_theme::tokens::Effects;
+    use mu_console_theme::wireframe::AvionicsSkin;
+    use mu_console_ui::state::parse_skin_pref;
+
+    // 1. Skin query parameter and storage preference parsing.
+    assert_eq!(
+        parse_skin_pref("?skin=avionics", None),
+        ConsoleSkin::Avionics
+    );
+    assert_eq!(
+        parse_skin_pref("?skin=wireframe", Some("avionics")),
+        ConsoleSkin::Wireframe
+    );
+    assert_eq!(
+        parse_skin_pref("", Some("skeuomorphic")),
+        ConsoleSkin::Avionics
+    );
+
+    let mut st = state_for_scenario(
+        Scenario::StageFailure,
+        SubView::Ci(CiSubView::Trainway),
+        CrtFont::Hurmit,
+    );
+    assert_eq!(st.skin, ConsoleSkin::Wireframe);
+
+    // 2. Toggle skin via 's' hotkey and via data-skin-toggle button.
+    let key_cmd = st.on_key("s", false, 50);
+    assert_eq!(st.skin, ConsoleSkin::Avionics);
+    assert_eq!(key_cmd, Some(UiCommand::SetSkin(ConsoleSkin::Avionics)));
+    assert!(st.aria_polite.contains("avionics"));
+
+    let shell_av = render_html_shell("<svg id=\"canvas\"></svg>", &st);
+    assert!(shell_av.contains("data-skin=\"avionics\""));
+    assert!(shell_av.contains("SKIN: AVIONICS [S]"));
+
+    let btn_cmds = st.on_dom_action("data-skin-toggle", "true", false, 100);
+    assert_eq!(st.skin, ConsoleSkin::Wireframe);
+    assert_eq!(btn_cmds, vec![UiCommand::SetSkin(ConsoleSkin::Wireframe)]);
+
+    // 3. Render AvionicsSkin across all 6 target viewports and verify zero overflow + tactile tokens.
+    let av_skin = AvionicsSkin {
+        effects: Effects::FULL,
+    };
+    let viewports = [
+        (390.0, 844.0, "phone_portrait"),
+        (844.0, 390.0, "phone_landscape"),
+        (820.0, 1180.0, "tablet"),
+        (1100.0, 720.0, "compact"),
+        (1512.0, 860.0, "desktop"),
+        (2560.0, 1080.0, "wide"),
+    ];
+    for (w, h, label) in viewports {
+        let svg = render_console(&av_skin, &st, Viewport::new(w, h), SafeArea::ZERO);
+        assert_svg_bounds_zero_overflow(&svg, w, h, &format!("u18_avionics_{label}"));
+        assert!(svg.contains("mu-woodgrain"));
+        assert!(svg.contains("mu-brushed"));
+        assert!(svg.contains("mu-park"));
+        assert!(svg.contains("mu-lcdbg"));
+        assert!(svg.contains("mu-crt-ci"));
+        assert!(svg.contains("mu-vignette"));
+        assert!(svg.contains("mu-glass"));
+    }
+
+    // 4. Operator pull-to-turn c5-restart-switch and data-restart-job emit UiCommand::RestartJob.
+    assert!(st.auth().is_operator());
+    let pull_cmds = st.on_dom_action("data-control-id", "c5-restart-switch", true, 1_000);
+    assert!(pull_cmds.is_empty(), "first Shift+click arms pull-to-turn");
+    let turn_cmds = st.on_dom_action("data-control-id", "c5-restart-switch", true, 1_200);
+    assert!(
+        turn_cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::RestartJob { job_id: 1_233 })),
+        "confirming c5-restart-switch must emit RestartJob for active failed job 1233"
+    );
+
+    let direct_cmds = st.on_dom_action("data-restart-job", "1234", false, 1_300);
+    assert_eq!(direct_cmds, vec![UiCommand::RestartJob { job_id: 1_234 }]);
 }

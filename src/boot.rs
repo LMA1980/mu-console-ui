@@ -9,8 +9,10 @@ use std::rc::Rc;
 
 use js_sys::{Array, ArrayBuffer, Date, Uint8Array};
 use mu_console_layout::{SafeArea, Viewport};
-use mu_console_protocol::{AuthState, UiCommand, WorkerConfig};
-use mu_console_theme::wireframe::WireframeSkin;
+use mu_console_protocol::{AuthState, ConsoleSkin, UiCommand, WorkerConfig};
+use mu_console_theme::skin::Skin;
+use mu_console_theme::tokens::Effects;
+use mu_console_theme::wireframe::{AvionicsSkin, WireframeSkin};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
@@ -22,8 +24,8 @@ use crate::client::{reload_banner_text, ClientUpdate, DataClient, WORKER_URL};
 use crate::components::{render_console, render_html_shell};
 use crate::router::{area_slug, format_hash};
 use crate::state::{
-    extract_invite_token, font_slug, ConsoleState, FONT_STORAGE_KEY, PENDING_INVITE_STORAGE_KEY,
-    REPO_STORAGE_KEY,
+    extract_invite_token, font_slug, skin_slug, ConsoleState, FONT_STORAGE_KEY,
+    PENDING_INVITE_STORAGE_KEY, REPO_STORAGE_KEY, SKIN_STORAGE_KEY,
 };
 
 thread_local! {
@@ -59,6 +61,7 @@ fn sync_browser_state(st: &ConsoleState) {
     }
     if let Ok(Some(storage)) = win.local_storage() {
         let _ = storage.set_item(FONT_STORAGE_KEY, font_slug(st.font));
+        let _ = storage.set_item(SKIN_STORAGE_KEY, skin_slug(st.skin));
         if let Some(repo_str) = st.stored_repo_value() {
             let _ = storage.set_item(REPO_STORAGE_KEY, &repo_str);
         }
@@ -118,12 +121,20 @@ fn repaint(st: &ConsoleState) {
         .ok()
         .and_then(|v| v.as_f64())
         .unwrap_or(860.0);
-    let svg = render_console(&WireframeSkin, st, Viewport::new(w, h), SafeArea::ZERO);
+    let av_skin = AvionicsSkin {
+        effects: Effects::FULL,
+    };
+    let skin: &dyn Skin = match st.skin {
+        ConsoleSkin::Wireframe => &WireframeSkin,
+        ConsoleSkin::Avionics => &av_skin,
+    };
+    let svg = render_console(skin, st, Viewport::new(w, h), SafeArea::ZERO);
 
     if let Some(dash) = doc.get_element_by_id("muconsole-dashboard") {
         dash.set_inner_html(&svg);
         if let Some(shell) = doc.get_element_by_id("muconsole-shell") {
             let _ = shell.set_attribute("data-crt-font", font_slug(st.font));
+            let _ = shell.set_attribute("data-skin", skin_slug(st.skin));
             let _ = shell.set_attribute(
                 "data-lazy-dyslexic",
                 if st.lazy_dyslexic_loaded {
@@ -152,6 +163,13 @@ fn repaint(st: &ConsoleState) {
                 ),
             };
             let _ = shell.set_attribute("data-auth-state", auth_slug);
+            if let Some(skin_btn) = doc.get_element_by_id("muconsole-skin-toggle") {
+                let skin_label = match st.skin {
+                    ConsoleSkin::Wireframe => "SKIN: WIREFRAME [S]",
+                    ConsoleSkin::Avionics => "SKIN: AVIONICS [S]",
+                };
+                skin_btn.set_text_content(Some(skin_label));
+            }
             if let Some(auth_link) = doc.get_element_by_id("muconsole-auth-link") {
                 let _ = auth_link.set_attribute("href", &auth_href);
                 let _ = auth_link.set_attribute("data-auth-state", auth_slug);
@@ -182,7 +200,7 @@ fn repaint(st: &ConsoleState) {
 }
 
 fn find_action_attribute(target: &Element) -> Option<(&'static str, String)> {
-    const ATTRS: [&str; 15] = [
+    const ATTRS: [&str; 17] = [
         "data-trace-id",
         "data-select-trace",
         "data-page-step",
@@ -191,6 +209,8 @@ fn find_action_attribute(target: &Element) -> Option<(&'static str, String)> {
         "data-subview",
         "data-repo-step",
         "data-dyslexia-toggle",
+        "data-skin-toggle",
+        "data-restart-job",
         "data-trainway-restart",
         "data-ecosystem",
         "data-package",
@@ -251,6 +271,11 @@ pub fn start() {
             .ok()
             .flatten()
             .and_then(|s| s.get_item(FONT_STORAGE_KEY).ok().flatten());
+        let stored_skin = window
+            .local_storage()
+            .ok()
+            .flatten()
+            .and_then(|s| s.get_item(SKIN_STORAGE_KEY).ok().flatten());
         let stored_repo = window
             .local_storage()
             .ok()
@@ -258,6 +283,7 @@ pub fn start() {
             .and_then(|s| s.get_item(REPO_STORAGE_KEY).ok().flatten());
         let mut st = state.borrow_mut();
         st.init_from_env(&hash, &raw_search, stored_font.as_deref());
+        st.restore_stored_skin(&raw_search, stored_skin.as_deref());
         if st.pending_invite.is_none() {
             st.pending_invite.clone_from(&stored_invite);
         }
