@@ -6,8 +6,9 @@
 use std::collections::BTreeMap;
 
 use mu_console_protocol::{
-    Area, AuthState, CdSubView, CiSubView, CrtFont, LogSeverity, ObserveSubView, PackageEcosystem,
-    PanelId, RegistrySubView, RepoId, RepoScore, Route, SubView, SubmoduleId, UiCommand,
+    Area, AuthState, CdSubView, CiSubView, ConsoleSkin, CrtFont, LogSeverity, ObserveSubView,
+    PackageEcosystem, PanelId, RegistrySubView, RepoId, RepoScore, Route, SubView, SubmoduleId,
+    UiCommand,
 };
 use mu_console_theme::instruments::switch::SwitchAction;
 use mu_console_theme::interaction::{SwitchEvent, SwitchOutcome, SwitchState};
@@ -18,6 +19,8 @@ use crate::router::{area_label, escape_up, parse_area, parse_hash, parse_subview
 
 /// `localStorage` key persisting the user's selected CRT reading font.
 pub const FONT_STORAGE_KEY: &str = "muconsole.dyslexia_font";
+/// `localStorage` key persisting the user's selected visual skin (`wireframe` or `avionics`).
+pub const SKIN_STORAGE_KEY: &str = "muconsole.skin";
 /// `localStorage` key persisting the user's active repository/submodule selection.
 pub const REPO_STORAGE_KEY: &str = "muconsole.active_repo";
 /// `sessionStorage` key holding a captured one-time `?invite=<token>` across OAuth redirects.
@@ -168,12 +171,50 @@ pub const fn font_slug(font: CrtFont) -> &'static str {
     }
 }
 
+/// Parse `?skin=avionics|wireframe` or stored `localStorage` value.
+#[must_use]
+pub fn parse_skin_pref(query: &str, stored: Option<&str>) -> ConsoleSkin {
+    for pair in query.trim_start_matches('?').split('&') {
+        if let Some(("skin", val)) = pair.split_once('=') {
+            if val.eq_ignore_ascii_case("avionics")
+                || val.eq_ignore_ascii_case("skeuomorphic")
+                || val.eq_ignore_ascii_case("tactile")
+            {
+                return ConsoleSkin::Avionics;
+            }
+            if val.eq_ignore_ascii_case("wireframe") || val.eq_ignore_ascii_case("flat") {
+                return ConsoleSkin::Wireframe;
+            }
+        }
+    }
+    if let Some(s) = stored {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("avionics")
+            || s.eq_ignore_ascii_case("skeuomorphic")
+            || s.eq_ignore_ascii_case("tactile")
+        {
+            return ConsoleSkin::Avionics;
+        }
+    }
+    ConsoleSkin::Wireframe
+}
+
+/// Serialize [`ConsoleSkin`] for `localStorage` / query parameters.
+#[must_use]
+pub const fn skin_slug(skin: ConsoleSkin) -> &'static str {
+    match skin {
+        ConsoleSkin::Wireframe => "wireframe",
+        ConsoleSkin::Avionics => "avionics",
+    }
+}
+
 /// Complete UI state for the console.
 #[derive(Debug)]
 pub struct ConsoleState {
     pub client: DataClient,
     pub route: Route,
     pub font: CrtFont,
+    pub skin: ConsoleSkin,
     pub lazy_dyslexic_loaded: bool,
     pub reduced_motion: bool,
     /// Outer rotary ring index into [`Self::filtered_repos`].
@@ -257,6 +298,7 @@ impl ConsoleState {
                 filter: None,
             },
             font: CrtFont::Hurmit,
+            skin: ConsoleSkin::Wireframe,
             lazy_dyslexic_loaded: false,
             reduced_motion: false,
             outer_index: 0,
@@ -300,6 +342,13 @@ impl ConsoleState {
         }
         let f = parse_font_pref(search, stored_font);
         self.set_font(f);
+        let sk = parse_skin_pref(search, None);
+        self.skin = sk;
+    }
+
+    /// Restore stored visual skin from `localStorage` (`muconsole.skin`) unless overridden by `?skin=`.
+    pub fn restore_stored_skin(&mut self, search: &str, stored_skin: Option<&str>) {
+        self.skin = parse_skin_pref(search, stored_skin);
     }
 
     /// Apply a location hash and synchronize sub-view filters / trace selection.
@@ -419,6 +468,60 @@ impl ConsoleState {
             CrtFont::OpenDyslexic => CrtFont::Hurmit,
         };
         self.set_font(next)
+    }
+
+    /// Set the active visual skin (`Wireframe` or `Avionics`).
+    pub fn set_skin(&mut self, skin: ConsoleSkin) -> UiCommand {
+        self.skin = skin;
+        self.aria_polite = format!("Visual skin set to {}", skin_slug(skin));
+        UiCommand::SetSkin(skin)
+    }
+
+    /// Toggle between `Wireframe` and `Avionics` skins.
+    pub fn toggle_skin(&mut self) -> UiCommand {
+        let next = match self.skin {
+            ConsoleSkin::Wireframe => ConsoleSkin::Avionics,
+            ConsoleSkin::Avionics => ConsoleSkin::Wireframe,
+        };
+        self.set_skin(next)
+    }
+
+    /// Active or latest job ID for the selected repository/topology.
+    #[must_use]
+    pub fn active_job_id(&self) -> Option<u64> {
+        if let Some(j) = self.route.job {
+            return Some(j);
+        }
+        if let Some(v) = self.client.view() {
+            if let Some(topo) = v.topology.as_ref() {
+                if let Some(failed) = topo.trains.iter().find(|t| t.failed()) {
+                    return Some(failed.job_id);
+                }
+                if let Some(first) = topo.trains.first() {
+                    return Some(first.job_id);
+                }
+            }
+            if let Some(rid) = self.route.repo.as_ref() {
+                if let Some(r) = v.repos.iter().find(|x| &x.id == rid) {
+                    if let Some(jid) = r.latest_job_id {
+                        return Some(jid);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Dispatch an authenticated `POST /api/jobs/{id}/restart` for `job_id`.
+    pub fn restart_job(&mut self, job_id: u64) -> Option<UiCommand> {
+        if !self.is_operator() {
+            self.aria_assertive =
+                "RAW LOGS & JOB RESTART REQUIRE INVITED GITHUB OPERATOR SESSION".into();
+            return None;
+        }
+        self.restart_count = self.restart_count.saturating_add(1);
+        self.aria_assertive = format!("Restarted job #{job_id}");
+        Some(UiCommand::RestartJob { job_id })
     }
 
     /// Feed a worker frame into [`DataClient`] and synchronize selection/route.
@@ -789,16 +892,31 @@ impl ConsoleState {
             "data-dyslexia-toggle" => {
                 return vec![self.toggle_font()];
             }
+            "data-skin-toggle" => {
+                return vec![self.toggle_skin()];
+            }
+            "data-restart-job" => {
+                if let Ok(job_id) = attr_val.parse::<u64>() {
+                    return self.restart_job(job_id).into_iter().collect();
+                }
+            }
             "data-trainway-restart" => {
-                if let Some(cmd) = self.on_restart_switch(
+                let res = self.on_restart_switch(
                     SwitchEvent::Rotate {
                         to: 1,
                         at_ms: now_ms,
                         shift: true,
                     },
                     now_ms,
-                ) {
-                    return vec![cmd];
+                );
+                let _ = self.on_restart_switch(SwitchEvent::Release { at_ms: now_ms }, now_ms);
+                if let Some(cmd) = res {
+                    let mut cmds = Vec::new();
+                    if let Some(job_id) = self.active_job_id() {
+                        cmds.push(UiCommand::RestartJob { job_id });
+                    }
+                    cmds.push(cmd);
+                    return cmds;
                 }
             }
             "data-trace-id" => {
@@ -1022,6 +1140,9 @@ impl ConsoleState {
             "c2-font-switch" | "c2-font-switch:hurmit" | "c2-font-switch:dyslexic" => {
                 vec![self.toggle_font()]
             }
+            "c2-skin-switch" | "muconsole-skin-toggle" => {
+                vec![self.toggle_skin()]
+            }
             "c2-repo-prev" | "c3-rotary:outer-prev" => {
                 self.rotate_outer(-1, now_ms);
                 Vec::new()
@@ -1053,17 +1174,27 @@ impl ConsoleState {
                 self.yard_page = self.yard_page.wrapping_add(1);
                 Vec::new()
             }
-            "c5-restart-switch" | "c5-restart-switch:rst" => self
-                .on_restart_switch(
+            "c5-restart-switch" | "c5-restart-switch:rst" => {
+                let res = self.on_restart_switch(
                     SwitchEvent::Rotate {
                         to: 1,
                         at_ms: now_ms,
                         shift,
                     },
                     now_ms,
-                )
-                .into_iter()
-                .collect(),
+                );
+                let _ = self.on_restart_switch(SwitchEvent::Release { at_ms: now_ms }, now_ms);
+                if let Some(cmd) = res {
+                    let mut cmds = Vec::new();
+                    if let Some(job_id) = self.active_job_id() {
+                        cmds.push(UiCommand::RestartJob { job_id });
+                    }
+                    cmds.push(cmd);
+                    cmds
+                } else {
+                    Vec::new()
+                }
+            }
             "c6-log-pager" => {
                 self.log_page = self.log_page.wrapping_add(1);
                 Vec::new()
@@ -1165,6 +1296,7 @@ impl ConsoleState {
             "ArrowLeft" => Some(self.step_carousel(-1, 3)),
             "ArrowRight" => Some(self.step_carousel(1, 3)),
             "d" | "D" | "f" | "F" => Some(self.toggle_font()),
+            "s" | "S" => Some(self.toggle_skin()),
             "r" | "R" => {
                 self.aria_polite = "Stream reset and resynchronized".into();
                 Some(UiCommand::ResetStream)
