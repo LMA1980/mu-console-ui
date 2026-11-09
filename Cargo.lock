@@ -99,7 +99,7 @@ dependencies = [
 [[package]]
 name = "mu-console-layout"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-console-layout.git#014c36b57ff37f22bd69295d37e9fcfde83dba4f"
+source = "git+https://github.com/LMA1980/mu-console-layout.git#5e2b6d63248260ea3a243651d168c8e978f12a82"
 dependencies = [
  "mu-console-protocol",
  "mu-console-theme",
@@ -117,7 +117,7 @@ dependencies = [
 [[package]]
 name = "mu-console-theme"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-console-theme.git#07f9df6e981325ad5d9fb549eb43c92aa13f2cd3"
+source = "git+https://github.com/LMA1980/mu-console-theme.git#d16597eb58cd8d6376d57bb4cc0035f445eb3867"
 
 [[package]]
 name = "mu-console-ui"

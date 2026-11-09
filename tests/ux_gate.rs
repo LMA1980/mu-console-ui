@@ -1814,3 +1814,87 @@ fn u20_dom_action_target_resolution_repo_steppers_subview_tabs_and_trainway_sign
         }
     }
 }
+
+#[test]
+fn u21_compact_trainway_band_pitch_and_dynamic_scorecard_page_capacity() {
+    let mut st = state_for_scenario(
+        Scenario::Repos40,
+        SubView::Ci(CiSubView::Scorecards),
+        CrtFont::Hurmit,
+    );
+
+    // 1. Dynamic Scorecard cards-per-page scales with viewport dimensions.
+    let cases = [
+        (Viewport::new(402.0, 720.0), 3_usize),
+        (Viewport::new(932.0, 430.0), 4_usize),
+        (Viewport::new(1024.0, 768.0), 6_usize),
+        (Viewport::new(1512.0, 860.0), 9_usize),
+        (Viewport::new(1600.0, 1000.0), 12_usize),
+        (Viewport::new(1920.0, 1080.0), 20_usize),
+    ];
+    for (vp, expected_per_page) in cases {
+        st.set_viewport(vp, SafeArea::ZERO);
+        assert_eq!(
+            st.scorecard_cards_per_page(),
+            expected_per_page,
+            "unexpected scorecard capacity at {}x{}",
+            vp.width,
+            vp.height
+        );
+        let svg = render_console(&WireframeSkin, &st, vp, SafeArea::ZERO);
+        assert_svg_zero_overflow(
+            &svg,
+            vp.width,
+            vp.height,
+            &format!("u21_scorecards_{}x{}", vp.width, vp.height),
+        );
+    }
+
+    // 2. Stepping carousel at 1920x1080 (20 cards/page, 40 repos -> 2 pages) wraps after 2 steps.
+    st.set_viewport(Viewport::new(1920.0, 1080.0), SafeArea::ZERO);
+    st.carousel_page = 0;
+    st.on_dom_action("data-control-id", "c4-carousel-switch:next", false, 1_000);
+    assert_eq!(st.carousel_page, 1);
+    st.on_dom_action("data-control-id", "c4-carousel-switch:next", false, 1_100);
+    assert_eq!(st.carousel_page, 0);
+
+    // 3. Compact Trainway schematic uses split left metadata column + tight vertical track pitch.
+    let st_tw = state_for_scenario(
+        Scenario::Submodules,
+        SubView::Ci(CiSubView::Trainway),
+        CrtFont::Hurmit,
+    );
+    let svg_tw = render_console(
+        &WireframeSkin,
+        &st_tw,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    assert!(
+        svg_tw.contains("LANE / BRANCH / STAGE"),
+        "Desktop Trainway must render split-column LANE / BRANCH / STAGE header"
+    );
+    let doc_tw = roxmltree::Document::parse(&svg_tw).expect("valid Trainway XML");
+    let trunk_row = doc_tw
+        .descendants()
+        .find(|n| n.attribute("data-control-id") == Some("c5-track-main"))
+        .and_then(|g| g.descendants().find(|c| c.has_tag_name("text")))
+        .and_then(|t| t.attribute("y"))
+        .and_then(|y| y.parse::<f64>().ok())
+        .expect("c5-track-main text y");
+    let first_siding_row = doc_tw
+        .descendants()
+        .find(|n| {
+            n.attribute("data-control-id")
+                .is_some_and(|cid| cid.starts_with("c5-track-") && cid != "c5-track-main")
+        })
+        .and_then(|g| g.descendants().find(|c| c.has_tag_name("text")))
+        .and_then(|t| t.attribute("y"))
+        .and_then(|y| y.parse::<f64>().ok())
+        .expect("first siding text y");
+    let pitch = (first_siding_row - trunk_row).abs();
+    assert!(
+        (18.0..=26.0).contains(&pitch),
+        "Trainway track vertical pitch must be compact (18..=26px), got {pitch}px"
+    );
+}
