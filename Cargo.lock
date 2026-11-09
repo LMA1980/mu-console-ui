@@ -117,7 +117,7 @@ dependencies = [
 [[package]]
 name = "mu-console-theme"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-console-theme.git#d16597eb58cd8d6376d57bb4cc0035f445eb3867"
+source = "git+https://github.com/LMA1980/mu-console-theme.git#4d7b2327e551dedb4bd60983f94e60c48b302022"
 
 [[package]]
 name = "mu-console-ui"

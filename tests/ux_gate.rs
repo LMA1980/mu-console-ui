@@ -1859,7 +1859,7 @@ fn u21_compact_trainway_band_pitch_and_dynamic_scorecard_page_capacity() {
     assert_eq!(st.carousel_page, 0);
 
     // 3. Compact Trainway schematic uses split left metadata column + tight vertical track pitch.
-    let st_tw = state_for_scenario(
+    let mut st_tw = state_for_scenario(
         Scenario::Submodules,
         SubView::Ci(CiSubView::Trainway),
         CrtFont::Hurmit,
@@ -1896,5 +1896,34 @@ fn u21_compact_trainway_band_pitch_and_dynamic_scorecard_page_capacity() {
     assert!(
         (18.0..=26.0).contains(&pitch),
         "Trainway track vertical pitch must be compact (18..=26px), got {pitch}px"
+    );
+
+    // Verify that a merged siding with fork_stage at the last station still draws a full
+    // horizontal track segment and curves back into the trunk at the right edge.
+    let merged_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::BranchUpsert(Branch {
+        ref_name: "feat/merged-at-end".into(),
+        base_ref: "main".into(),
+        fork_stage: 8,
+        pr_state: PrState::Merged,
+        last_job: None,
+        phase: SidingPhase::Active,
+    })]))
+    .expect("encode merged branch");
+    st_tw.on_worker_frame(&merged_patch);
+    let svg_tw_merged = render_console(
+        &WireframeSkin,
+        &st_tw,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    let doc_merged = roxmltree::Document::parse(&svg_tw_merged).expect("valid XML");
+    let merged_path = doc_merged
+        .descendants()
+        .find(|n| n.attribute("data-track-ref") == Some("feat/merged-at-end"))
+        .and_then(|n| n.attribute("d"))
+        .expect("feat/merged-at-end path d");
+    assert!(
+        merged_path.matches(" Q").count() >= 2,
+        "Merged siding path must have left turnout and right merge-back quadratic curves: {merged_path}"
     );
 }
