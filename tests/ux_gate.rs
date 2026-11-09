@@ -1683,3 +1683,134 @@ fn u19_live_workflow_parity_ci_job_drilldown_resume_restart_and_worker_node_stag
     assert_eq!(st.route.job, None);
     assert_eq!(st.route.branch, None);
 }
+
+#[test]
+fn u20_dom_action_target_resolution_repo_steppers_subview_tabs_and_trainway_signals() {
+    use mu_console_ui::state::{
+        is_action_root_boundary, is_passive_container_control_id, ACTION_ATTRS,
+    };
+
+    fn resolve_dom_action<'a>(node: roxmltree::Node<'a, 'a>) -> Option<(&'static str, String)> {
+        let mut cur = Some(node);
+        while let Some(el) = cur {
+            if el.is_element() {
+                if let Some(id) = el.attribute("id") {
+                    if is_action_root_boundary(id) {
+                        break;
+                    }
+                }
+                for attr in ACTION_ATTRS {
+                    if let Some(val) = el.attribute(attr) {
+                        return Some((attr, val.to_owned()));
+                    }
+                }
+                if let Some(cid) = el.attribute("data-control-id") {
+                    if !is_passive_container_control_id(cid) {
+                        return Some(("data-control-id", cid.to_owned()));
+                    }
+                }
+            }
+            cur = el.parent();
+        }
+        None
+    }
+
+    let mut st = state_for_scenario(
+        Scenario::StageFailure,
+        SubView::Ci(CiSubView::Scorecards),
+        CrtFont::Hurmit,
+    );
+    let svg = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    let html = render_html_shell(&svg, &st);
+    let doc = roxmltree::Document::parse(&html).expect("valid HTML shell XML");
+
+    // 1. Verify clicking leaf <text> or <rect> inside sub-view tabs, repo steppers, and carousel
+    // buttons inside #muconsole-shell[data-area="ci"][data-subview="scorecards"] resolves to the
+    // leaf control and is NEVER hijacked by #muconsole-shell's data-area="ci".
+    let check_leaf_target = |control_id: &str, expected: (&str, &str)| {
+        let grp = doc
+            .descendants()
+            .find(|n| n.attribute("data-control-id") == Some(control_id))
+            .unwrap_or_else(|| panic!("missing control {control_id}"));
+        let leaf = grp
+            .descendants()
+            .find(|n| n.has_tag_name("text") || n.has_tag_name("rect"))
+            .unwrap_or(grp);
+        let resolved = resolve_dom_action(leaf)
+            .unwrap_or_else(|| panic!("no action resolved for leaf of {control_id}"));
+        assert_eq!(
+            (resolved.0, resolved.1.as_str()),
+            expected,
+            "leaf click inside {control_id} was hijacked"
+        );
+    };
+
+    check_leaf_target("c2-subview-bar:trainway", ("data-subview", "trainway"));
+    check_leaf_target("c2-subview-bar:logs", ("data-subview", "logs"));
+    check_leaf_target("c2-repo-prev", ("data-repo-step", "prev"));
+    check_leaf_target("c2-repo-next", ("data-repo-step", "next"));
+    check_leaf_target("c2-sub-next", ("data-repo-step", "sub-next"));
+    check_leaf_target(
+        "c4-carousel-switch:next",
+        ("data-control-id", "c4-carousel-switch:next"),
+    );
+
+    // 2. Stepping repositories via c2-repo-next / c2-repo-prev updates outer_index, route.repo,
+    // resets carousel_page to 0, and updates the C2 readout index/name.
+    assert!(svg.contains("9/10 superproject"));
+    st.carousel_page = 1;
+    st.on_dom_action("data-repo-step", "next", false, 2_000);
+    assert_eq!(st.outer_index, 9);
+    assert_eq!(st.carousel_page, 0);
+    let svg_next = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_next.contains("10/10 tokenizer"));
+
+    // 3. Trainway station header and signal aspect controls drill into CI > Queue & Logs.
+    st.select_subview(SubView::Ci(CiSubView::Trainway));
+    let svg_tw = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_tw.contains("c5-station:"));
+    assert!(svg_tw.contains("c5-signal:"));
+    let sig_cmds = st.on_dom_action("data-control-id", "c5-signal:main:0", false, 2_100);
+    assert_eq!(st.route.subview, SubView::Ci(CiSubView::QueueLogs));
+    assert_eq!(st.route.branch.as_deref(), Some("main"));
+    assert!(!sig_cmds.is_empty());
+
+    // 4. AvionicsSkin CRT decorative overlays must carry pointer-events="none".
+    let svg_av = render_console(
+        &AvionicsSkin::default(),
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    let doc_av = roxmltree::Document::parse(&svg_av).expect("valid Avionics XML");
+    for node in doc_av.descendants().filter(|n| n.has_tag_name("rect")) {
+        if let Some(fill) = node.attribute("fill") {
+            if fill.starts_with("url(#mu-lcdbg-")
+                || fill.starts_with("url(#mu-scan-")
+                || fill.starts_with("url(#mu-vignette-")
+                || fill.starts_with("url(#mu-glass-")
+            {
+                assert_eq!(
+                    node.attribute("pointer-events"),
+                    Some("none"),
+                    "Avionics overlay rect fill={fill} must have pointer-events=\"none\""
+                );
+            }
+        }
+    }
+}

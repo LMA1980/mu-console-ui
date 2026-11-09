@@ -320,8 +320,15 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
     } else {
         // Compact C2 Repository & Submodule Stepper (`[<] REPO [>] SUB`).
         let repos = state.filtered_repos();
+        let repo_total = repos.len();
         let current_repo = repos.get(state.outer_index);
         let repo_label = current_repo.map_or("ALL REPOS", |x| x.id.repo.as_str());
+        let repo_display = if repo_total == 0 {
+            "ALL REPOS".to_owned()
+        } else {
+            let idx = state.outer_index.min(repo_total - 1) + 1;
+            format!("{idx}/{repo_total} {repo_label}")
+        };
         let sub_label = if state.inner_index == 0 {
             "PARENT"
         } else {
@@ -329,9 +336,9 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
                 .and_then(|x| x.submodules.get(state.inner_index - 1))
                 .map_or("PARENT", |s| s.path.as_str())
         };
-        let step_w = 28.0;
-        let repo_w = 112.0_f64.min(right_reserve * 0.18).max(64.0);
-        let sub_w = 88.0_f64.min(right_reserve * 0.14).max(56.0);
+        let step_w = 26.0;
+        let repo_w = 136.0_f64.min(right_reserve * 0.22).max(68.0);
+        let sub_w = 82.0_f64.min(right_reserve * 0.13).max(52.0);
         let mut cur_x = rx;
 
         let prev_rect = clamp_rect(Rect::new(cur_x, inner.y, step_w, inner.h), inner);
@@ -353,8 +360,8 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
             w,
             &Readout {
                 control_id: "c2-repo-select",
-                label: "REPO",
-                value: repo_label,
+                label: "",
+                value: &repo_display,
                 rect: sel_rect,
                 tone: SemanticTone::Info,
                 interactive: true,
