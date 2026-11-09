@@ -1638,7 +1638,13 @@ fn u19_live_workflow_parity_ci_job_drilldown_resume_restart_and_worker_node_stag
 
     let sel_cmds = st.on_dom_action("data-control-id", "ci-job:1233", false, 1_000);
     assert_eq!(st.route.job, Some(1_233));
+    assert!(st.follow_log);
     assert_eq!(sel_cmds, vec![UiCommand::SelectJob { job_id: 1_233 }]);
+
+    st.on_dom_action("data-control-id", "ci-log-follow-toggle", false, 1_050);
+    assert!(!st.follow_log);
+    st.on_dom_action("data-control-id", "ci-log-follow-toggle", false, 1_060);
+    assert!(st.follow_log);
 
     let res_cmds = st.on_dom_action("data-control-id", "ci-job-resume:1233", false, 1_100);
     assert_eq!(res_cmds, vec![UiCommand::ResumeJob { job_id: 1_233 }]);

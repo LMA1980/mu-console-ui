@@ -252,6 +252,8 @@ pub struct ConsoleState {
     pub fleet_page: u32,
     /// Active sub-view CRT page cursor (`QueueLogs`, `DeploymentsSlots`, `ActiveLeases`, `Reg*`, `Obs*`).
     pub subview_page: u32,
+    /// `CI > Queue & Logs` auto-follow newest log page while selected job is active/queued.
+    pub follow_log: bool,
     /// `REG > Packages` ecosystem filter (`None` = `ALL`).
     pub reg_ecosystem_filter: Option<PackageEcosystem>,
     /// `REG > Packages` selected package name for the version/dependency drawer.
@@ -321,6 +323,7 @@ impl ConsoleState {
             log_page: 0,
             fleet_page: 0,
             subview_page: 0,
+            follow_log: true,
             reg_ecosystem_filter: None,
             selected_package: None,
             selected_entity_id: None,
@@ -715,6 +718,7 @@ impl ConsoleState {
             self.route.subview = SubView::default_for(area);
         }
         self.subview_page = 0;
+        self.follow_log = true;
         self.aria_polite = format!(
             "Area {} :: {}",
             area_label(area),
@@ -728,6 +732,7 @@ impl ConsoleState {
         self.route.area = subview.area();
         self.route.subview = subview;
         self.subview_page = 0;
+        self.follow_log = true;
         self.aria_polite = format!(
             "Sub-view {} :: {}",
             area_label(self.route.area),
@@ -810,6 +815,12 @@ impl ConsoleState {
             }
             SubView::Fleet(_) => {
                 self.fleet_page = step(self.fleet_page);
+            }
+            SubView::Ci(CiSubView::QueueLogs) => {
+                if delta < 0 {
+                    self.follow_log = false;
+                }
+                self.subview_page = step(self.subview_page);
             }
             _ => {
                 self.subview_page = step(self.subview_page);
@@ -1085,6 +1096,8 @@ impl ConsoleState {
         {
             if let Ok(job_id) = job_str.parse::<u64>() {
                 self.route.job = Some(job_id);
+                self.follow_log = true;
+                self.subview_page = 0;
                 let mut cmds = self.select_subview(SubView::Ci(CiSubView::QueueLogs));
                 cmds.push(UiCommand::SelectJob { job_id });
                 return cmds;
@@ -1093,6 +1106,8 @@ impl ConsoleState {
         if let Some(job_str) = id.strip_prefix("ci-job:") {
             if let Ok(job_id) = job_str.parse::<u64>() {
                 self.route.job = Some(job_id);
+                self.follow_log = true;
+                self.subview_page = 0;
                 self.aria_polite = format!("Selected CI job #{job_id}");
                 return vec![UiCommand::SelectJob { job_id }];
             }
@@ -1217,6 +1232,10 @@ impl ConsoleState {
             "c4-carousel-switch:next" => vec![self.step_carousel(1, 3)],
             "c5-live-toggle" => {
                 self.trainway_live = !self.trainway_live;
+                Vec::new()
+            }
+            "ci-log-follow-toggle" => {
+                self.follow_log = !self.follow_log;
                 Vec::new()
             }
             "c5-open-logs" => self.select_subview(SubView::Ci(CiSubView::QueueLogs)),
