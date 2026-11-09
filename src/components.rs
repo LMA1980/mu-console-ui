@@ -1523,6 +1523,8 @@ fn render_ci_queue_logs(
     )];
     let mut body: Vec<QueueRow> = Vec::new();
 
+    let mut follow_active_tail = false;
+
     if let Some(v) = state.client.view() {
         if !v.ci_jobs.is_empty() {
             body.push((
@@ -1544,6 +1546,11 @@ fn render_ci_queue_logs(
                         .and_then(|r| v.ci_jobs.iter().find(|j| &j.repo == r))
                 })
                 .or_else(|| v.ci_jobs.first());
+            follow_active_tail = state.follow_log
+                && active_job.is_some_and(|j| {
+                    (j.queue_state == "Active" || j.queue_state == "Queued")
+                        && !j.raw_log_lines.is_empty()
+                });
             for job in &v.ci_jobs {
                 let is_sel = active_job.is_some_and(|a| a.job_id == job.job_id);
                 let (sig, tone) = match job.queue_state.as_str() {
@@ -1625,10 +1632,14 @@ fn render_ci_queue_logs(
                     ));
                 }
                 body.push((
-                    format!("── RAW BUILD LOG (/api/jobs/{}/log) ──", sel_job.job_id_str),
+                    format!(
+                        "── RAW BUILD LOG (/api/jobs/{}/log · FOLLOW:{}) ──",
+                        sel_job.job_id_str,
+                        if state.follow_log { "ON" } else { "OFF" }
+                    ),
                     SemanticTone::Info,
                     None,
-                    None,
+                    Some("ci-log-follow-toggle".into()),
                 ));
                 if !sel_job.raw_log_lines.is_empty() {
                     for (li, line) in sel_job.raw_log_lines.iter().enumerate() {
@@ -1802,8 +1813,13 @@ fn render_ci_queue_logs(
         ));
     }
 
+    let effective_page = if follow_active_tail {
+        u32::MAX
+    } else {
+        state.subview_page
+    };
     let (rows, page, total_pages) =
-        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
+        paginate_with_headers(headers, body, panel.grid.rows, effective_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, cid)| ScreenRow {
