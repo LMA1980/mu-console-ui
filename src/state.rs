@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use mu_console_layout::{scorecard_page_capacity, solve, SafeArea, Viewport};
 use mu_console_protocol::{
     Area, AuthState, CdSubView, CiSubView, ConsoleSkin, CrtFont, LogSeverity, ObserveSubView,
     PackageEcosystem, PanelId, RegistrySubView, RepoId, RepoScore, Route, SubView, SubmoduleId,
@@ -262,6 +263,10 @@ pub struct ConsoleState {
     pub route: Route,
     pub font: CrtFont,
     pub skin: ConsoleSkin,
+    /// Current viewport used to compute dynamic Scorecard/Trainway page capacities.
+    pub viewport: Viewport,
+    /// Current safe-area insets.
+    pub safe_area: SafeArea,
     pub lazy_dyslexic_loaded: bool,
     pub reduced_motion: bool,
     /// Outer rotary ring index into [`Self::filtered_repos`].
@@ -350,6 +355,8 @@ impl ConsoleState {
             },
             font: CrtFont::Hurmit,
             skin: ConsoleSkin::Wireframe,
+            viewport: Viewport::new(1512.0, 860.0),
+            safe_area: SafeArea::ZERO,
             lazy_dyslexic_loaded: false,
             reduced_motion: false,
             outer_index: 0,
@@ -830,6 +837,24 @@ impl ConsoleState {
         ]
     }
 
+    /// Update the active viewport and safe-area insets used for dynamic page capacity calculation.
+    pub fn set_viewport(&mut self, viewport: Viewport, safe_area: SafeArea) {
+        self.viewport = viewport;
+        self.safe_area = safe_area;
+    }
+
+    /// Compute the dynamic number of repository scorecards per page for the current viewport and font.
+    #[must_use]
+    pub fn scorecard_cards_per_page(&self) -> usize {
+        let font = self.font_metrics();
+        let frames = solve(self.viewport, self.safe_area, self.route.area, font);
+        let screen_rect = frames
+            .panels
+            .first()
+            .map_or(frames.active_canvas, |p| p.crt);
+        scorecard_page_capacity(screen_rect, frames.breakpoint, font)
+    }
+
     /// Step the `CI > Scorecards` page by `delta` pages.
     pub fn step_carousel(&mut self, delta: i32, cards_per_page: usize) -> UiCommand {
         let total_repos = self.ordered_carousel_repos().len();
@@ -855,7 +880,8 @@ impl ConsoleState {
         };
         match self.route.subview {
             SubView::Ci(CiSubView::Scorecards) => {
-                let _ = self.step_carousel(if delta >= 0 { 1 } else { -1 }, 6);
+                let per_page = self.scorecard_cards_per_page();
+                let _ = self.step_carousel(if delta >= 0 { 1 } else { -1 }, per_page);
             }
             SubView::Ci(CiSubView::Trainway) => {
                 self.yard_page = step(self.yard_page);
@@ -1105,10 +1131,11 @@ impl ConsoleState {
             }
         }
         if let Some(rest) = id.strip_prefix("c4-card-") {
+            let per_page = self.scorecard_cards_per_page();
             if let Some(idx_str) = rest.strip_suffix("-left") {
                 if let Ok(idx) = idx_str.parse::<usize>() {
                     let ordered = self.ordered_carousel_repos();
-                    let slot = (self.carousel_page as usize) * 6 + idx;
+                    let slot = (self.carousel_page as usize) * per_page + idx;
                     if let Some(r) = ordered.get(slot) {
                         let target = format!("c4-open-trainway:{}/{}", r.id.owner, r.id.repo);
                         return self.on_control_id(&target, shift, now_ms);
@@ -1117,7 +1144,7 @@ impl ConsoleState {
             } else if let Some(idx_str) = rest.strip_suffix("-right") {
                 if let Ok(idx) = idx_str.parse::<usize>() {
                     let ordered = self.ordered_carousel_repos();
-                    let slot = (self.carousel_page as usize) * 6 + idx;
+                    let slot = (self.carousel_page as usize) * per_page + idx;
                     if let Some(r) = ordered.get(slot) {
                         let target = format!("c4-open-gate:{}/{}", r.id.owner, r.id.repo);
                         return self.on_control_id(&target, shift, now_ms);
@@ -1333,8 +1360,14 @@ impl ConsoleState {
                 self.phone_rotary_open = !self.phone_rotary_open;
                 Vec::new()
             }
-            "c4-carousel-switch:prev" => vec![self.step_carousel(-1, 6)],
-            "c4-carousel-switch:next" => vec![self.step_carousel(1, 6)],
+            "c4-carousel-switch:prev" => {
+                let per_page = self.scorecard_cards_per_page();
+                vec![self.step_carousel(-1, per_page)]
+            }
+            "c4-carousel-switch:next" => {
+                let per_page = self.scorecard_cards_per_page();
+                vec![self.step_carousel(1, per_page)]
+            }
             "c5-live-toggle" => {
                 self.trainway_live = !self.trainway_live;
                 Vec::new()
@@ -1467,8 +1500,14 @@ impl ConsoleState {
                 }
                 None
             }
-            "ArrowLeft" => Some(self.step_carousel(-1, 6)),
-            "ArrowRight" => Some(self.step_carousel(1, 6)),
+            "ArrowLeft" => {
+                let per_page = self.scorecard_cards_per_page();
+                Some(self.step_carousel(-1, per_page))
+            }
+            "ArrowRight" => {
+                let per_page = self.scorecard_cards_per_page();
+                Some(self.step_carousel(1, per_page))
+            }
             "d" | "D" | "f" | "F" => Some(self.toggle_font()),
             "s" | "S" => Some(self.toggle_skin()),
             "r" | "R" => {

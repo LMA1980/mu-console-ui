@@ -5,7 +5,8 @@
 
 use mu_console_layout::trainway::allocate_lanes;
 use mu_console_layout::{
-    scorecard_cards, solve, Breakpoint, Card, Frames, Panel as LayoutPanel, SafeArea, Viewport,
+    scorecard_cards, scorecard_page_capacity, solve, trainway_siding_capacity, truncate,
+    Breakpoint, Card, Frames, Panel as LayoutPanel, SafeArea, Viewport,
 };
 use mu_console_protocol::{
     format_job_id, sanitize_public_log, Area, AuthState, CanaryBundleState, CdSubView, CiSubView,
@@ -706,12 +707,9 @@ fn render_ci_scorecards(
         },
     );
 
+    let font = state.font_metrics();
     let repos = state.ordered_carousel_repos();
-    let per_page = match frames.breakpoint {
-        Breakpoint::Wide => 6,
-        Breakpoint::Medium | Breakpoint::CompactLandscape => 4,
-        Breakpoint::Phone => 2,
-    };
+    let per_page = scorecard_page_capacity(screen_rect, frames.breakpoint, font);
     let total_pages = repos.len().div_ceil(per_page).max(1);
     let page = (state.carousel_page as usize).min(total_pages - 1);
     let start = page * per_page;
@@ -760,7 +758,7 @@ fn render_ci_scorecards(
         },
     );
 
-    let dots_w = 180.0_f64.min((step_rect.x - rect.x - 16.0).max(60.0));
+    let dots_w = 210.0_f64.min((step_rect.x - rect.x - 16.0).max(60.0));
     let dots_rect = clamp_rect(
         Rect::new(
             (step_rect.x - dots_w - 6.0).max(rect.x),
@@ -770,7 +768,11 @@ fn render_ci_scorecards(
         ),
         rect,
     );
-    let dots_val = format!("PAGE {}/{total_pages} ({} REPOS)", page + 1, repos.len());
+    let dots_val = format!(
+        "PAGE {}/{total_pages} ({per_page}/PG · {} REPOS)",
+        page + 1,
+        repos.len()
+    );
     skin.readout(
         w,
         &Readout {
@@ -783,7 +785,6 @@ fn render_ci_scorecards(
         },
     );
 
-    let font = state.font_metrics();
     let cards = scorecard_cards(screen_rect, frames.breakpoint, slice.len().max(1), font);
     for (idx, card_slot) in cards.iter().enumerate() {
         let plate_rect = clamp_rect(card_slot.plate, frames.canvas);
@@ -1196,11 +1197,7 @@ fn render_c5_trainway(
         );
     }
 
-    let max_sidings = match frames.breakpoint {
-        Breakpoint::Wide | Breakpoint::Medium => 6,
-        Breakpoint::CompactLandscape => 3,
-        Breakpoint::Phone => 2,
-    };
+    let max_sidings = trainway_siding_capacity(screen_rect, frames.breakpoint, panel.grid.rows);
 
     type TrainwayRow = (
         String,
@@ -1277,12 +1274,13 @@ fn render_c5_trainway(
             let node_str = mt.node_id.as_deref().unwrap_or("QUEUE");
             let stage_idx = (mt.stage as usize + 1).min(mt.stage_states.len().max(1));
             let job_tag = format_job_id(mt.job_id);
+            let ref_short = truncate(&mt.ref_name, 12);
             let line = format!(
-                "L0 {:<14} #{:<6} [{}] {} · STAGE {}/{}",
-                mt.ref_name,
+                "L0 {:<12} #{:<5} [{}] {} {}/{}",
+                ref_short,
                 job_tag,
                 node_str,
-                if mt.node_lost { "NODE LOST" } else { "TRUNK" },
+                if mt.node_lost { "LOST" } else { "TRUNK" },
                 stage_idx,
                 mt.stage_states.len()
             );
@@ -1326,7 +1324,7 @@ fn render_c5_trainway(
                 failed = tr.failed();
                 let st_idx = (tr.stage as usize + 1).min(tr.stage_states.len().max(1));
                 let job_tag = format_job_id(tr.job_id);
-                stage_progress = format!(" #{job_tag} · STAGE {st_idx}/{}", tr.stage_states.len());
+                stage_progress = format!(" #{job_tag} {st_idx}/{}", tr.stage_states.len());
             }
             let fading = matches!(al.branch.phase, SidingPhase::Fading { .. })
                 || al.branch.pr_state == PrState::Merged;
@@ -1340,19 +1338,20 @@ fn render_c5_trainway(
                 (SignalGlyph::BlockRunning, SemanticTone::Info)
             };
             let phase_tag = if lost {
-                "NODE LOST"
+                "LOST"
             } else if under_construction {
-                "NEW SIDING UNDER CONSTRUCTION"
+                "NEW"
             } else if fading {
                 "MERGED"
             } else if closed {
                 "CLOSED"
             } else {
-                "ACTIVE"
+                "OPEN"
             };
+            let ref_short = truncate(&al.branch.ref_name, 12);
             let line = format!(
-                "L{} {:<14} {:?} [{}] {phase_tag}{stage_progress}",
-                al.lane, al.branch.ref_name, al.branch.pr_state, node_str
+                "L{} {:<12} [{}] {phase_tag}{stage_progress}",
+                al.lane, ref_short, node_str
             );
             let is_sel = state.route.branch.as_deref() == Some(al.branch.ref_name.as_str());
             row_strings.push((

@@ -106,13 +106,7 @@ fn ensure_dyslexic_stylesheet(doc: &web_sys::Document) {
     }
 }
 
-fn repaint(st: &ConsoleState) {
-    let Some(win) = web_sys::window() else {
-        return;
-    };
-    let Some(doc) = win.document() else {
-        return;
-    };
+fn window_viewport(win: &web_sys::Window) -> Viewport {
     let w = win
         .inner_width()
         .ok()
@@ -123,6 +117,17 @@ fn repaint(st: &ConsoleState) {
         .ok()
         .and_then(|v| v.as_f64())
         .unwrap_or(860.0);
+    Viewport::new(w, h)
+}
+
+fn repaint(st: &ConsoleState) {
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    let Some(doc) = win.document() else {
+        return;
+    };
+    let vp = window_viewport(&win);
     let av_skin = AvionicsSkin {
         effects: Effects::FULL,
     };
@@ -130,7 +135,7 @@ fn repaint(st: &ConsoleState) {
         ConsoleSkin::Wireframe => &WireframeSkin,
         ConsoleSkin::Avionics => &av_skin,
     };
-    let svg = render_console(skin, st, Viewport::new(w, h), SafeArea::ZERO);
+    let svg = render_console(skin, st, vp, SafeArea::ZERO);
 
     if let Some(dash) = doc.get_element_by_id("muconsole-dashboard") {
         let svg_changed = LAST_SVG.with(|last| {
@@ -282,6 +287,7 @@ pub fn start() {
             .flatten()
             .and_then(|s| s.get_item(REPO_STORAGE_KEY).ok().flatten());
         let mut st = state.borrow_mut();
+        st.set_viewport(window_viewport(&window), SafeArea::ZERO);
         st.init_from_env(&hash, &raw_search, stored_font.as_deref());
         st.restore_stored_skin(&raw_search, stored_skin.as_deref());
         if st.pending_invite.is_none() {
@@ -349,7 +355,11 @@ pub fn start() {
     {
         let state_for_resize = Rc::clone(&state);
         let on_resize = Closure::<dyn FnMut()>::new(move || {
-            repaint(&state_for_resize.borrow());
+            let mut st = state_for_resize.borrow_mut();
+            if let Some(win) = web_sys::window() {
+                st.set_viewport(window_viewport(&win), SafeArea::ZERO);
+            }
+            repaint(&st);
         });
         let _ =
             window.add_event_listener_with_callback("resize", on_resize.as_ref().unchecked_ref());
