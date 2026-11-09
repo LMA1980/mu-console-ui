@@ -1306,6 +1306,36 @@ fn render_c5_trainway(
                 Some(node_str.to_owned()),
                 mt.node_lost,
             ));
+        } else {
+            let n_st = t.stations.len();
+            let mut sigs = Vec::with_capacity(n_st);
+            for idx in 0..n_st {
+                sigs.push((
+                    u32::try_from(idx).unwrap_or(0),
+                    SignalGlyph::BlockPassed,
+                    SemanticTone::Pass,
+                ));
+            }
+            let ref_short = truncate(&t.default_branch, 12);
+            let line = format!("L0 {:<12} [IDLE] TRUNK {n_st}/{n_st}", ref_short);
+            let is_sel = state.route.branch.as_deref() == Some(t.default_branch.as_str());
+            row_strings.push((
+                line,
+                SemanticTone::Pass,
+                Some(SignalGlyph::BlockPassed),
+                Some(format!("c5-track-{}", t.default_branch)),
+                is_sel,
+            ));
+            track_signals.push(sigs);
+            track_refs.push((
+                t.default_branch.clone(),
+                0,
+                0,
+                false,
+                false,
+                Some("IDLE".to_owned()),
+                false,
+            ));
         }
 
         for al in &layout.visible_sidings {
