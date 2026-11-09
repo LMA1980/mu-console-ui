@@ -24,12 +24,14 @@ use crate::client::{reload_banner_text, ClientUpdate, DataClient, WORKER_URL};
 use crate::components::{render_console, render_html_shell};
 use crate::router::{area_slug, format_hash};
 use crate::state::{
-    extract_invite_token, font_slug, skin_slug, ConsoleState, FONT_STORAGE_KEY,
-    PENDING_INVITE_STORAGE_KEY, REPO_STORAGE_KEY, SKIN_STORAGE_KEY,
+    extract_invite_token, font_slug, is_action_root_boundary, is_passive_container_control_id,
+    skin_slug, ConsoleState, ACTION_ATTRS, FONT_STORAGE_KEY, PENDING_INVITE_STORAGE_KEY,
+    REPO_STORAGE_KEY, SKIN_STORAGE_KEY,
 };
 
 thread_local! {
     static WORKER: RefCell<Option<Worker>> = const { RefCell::new(None) };
+    static LAST_SVG: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 fn now_ms() -> u64 {
@@ -131,7 +133,18 @@ fn repaint(st: &ConsoleState) {
     let svg = render_console(skin, st, Viewport::new(w, h), SafeArea::ZERO);
 
     if let Some(dash) = doc.get_element_by_id("muconsole-dashboard") {
-        dash.set_inner_html(&svg);
+        let svg_changed = LAST_SVG.with(|last| {
+            let mut prev = last.borrow_mut();
+            if *prev == svg {
+                false
+            } else {
+                prev.clone_from(&svg);
+                true
+            }
+        });
+        if svg_changed {
+            dash.set_inner_html(&svg);
+        }
         if let Some(shell) = doc.get_element_by_id("muconsole-shell") {
             let _ = shell.set_attribute("data-crt-font", font_slug(st.font));
             let _ = shell.set_attribute("data-skin", skin_slug(st.skin));
@@ -194,43 +207,30 @@ fn repaint(st: &ConsoleState) {
             }
         }
     } else if let Some(body) = doc.body() {
+        LAST_SVG.with(|last| *last.borrow_mut() = svg.clone());
         let html = render_html_shell(&svg, st);
         body.set_inner_html(&html);
     }
 }
 
 fn find_action_attribute(target: &Element) -> Option<(&'static str, String)> {
-    const ATTRS: [&str; 17] = [
-        "data-trace-id",
-        "data-select-trace",
-        "data-page-step",
-        "data-cd-gate",
-        "data-area",
-        "data-subview",
-        "data-repo-step",
-        "data-dyslexia-toggle",
-        "data-skin-toggle",
-        "data-restart-job",
-        "data-trainway-restart",
-        "data-ecosystem",
-        "data-package",
-        "data-entity-id",
-        "data-purepath-filter",
-        "data-span-id",
-        "data-log-severity",
-    ];
-    for attr in ATTRS {
-        let selector = format!("[{attr}]");
-        if let Ok(Some(el)) = target.closest(&selector) {
+    let mut cur = Some(target.clone());
+    while let Some(el) = cur {
+        let el_id = el.id();
+        if is_action_root_boundary(&el_id) {
+            break;
+        }
+        for attr in ACTION_ATTRS {
             if let Some(val) = el.get_attribute(attr) {
                 return Some((attr, val));
             }
         }
-    }
-    if let Ok(Some(el)) = target.closest("[data-control-id]") {
         if let Some(val) = el.get_attribute("data-control-id") {
-            return Some(("data-control-id", val));
+            if !is_passive_container_control_id(&val) {
+                return Some(("data-control-id", val));
+            }
         }
+        cur = el.parent_element();
     }
     None
 }

@@ -33,6 +33,53 @@ pub const RESTART_ARM_WINDOW_MS: u64 = 3_000;
 /// Ordered areas on the C1 selector rail (`CI`, `CD`, `REG`, `OBS`, `FLT`).
 pub const AREAS: [Area; 5] = Area::ALL;
 
+/// Action attributes checked on each DOM ancestor from innermost target to outermost container.
+pub const ACTION_ATTRS: [&str; 17] = [
+    "data-trace-id",
+    "data-select-trace",
+    "data-page-step",
+    "data-cd-gate",
+    "data-area",
+    "data-subview",
+    "data-repo-step",
+    "data-dyslexia-toggle",
+    "data-skin-toggle",
+    "data-restart-job",
+    "data-trainway-restart",
+    "data-ecosystem",
+    "data-package",
+    "data-entity-id",
+    "data-purepath-filter",
+    "data-span-id",
+    "data-log-severity",
+];
+
+/// Returns `true` if `element_id` is a root layout container whose state attributes must
+/// never be interpreted as delegated click actions.
+#[must_use]
+pub fn is_action_root_boundary(element_id: &str) -> bool {
+    matches!(
+        element_id,
+        "muconsole-dashboard" | "muconsole-shell" | "muconsole-header"
+    )
+}
+
+/// Returns `true` if `control_id` is a passive grouping container rather than a leaf action target.
+#[must_use]
+pub fn is_passive_container_control_id(control_id: &str) -> bool {
+    matches!(
+        control_id,
+        "c1-area-selector"
+            | "c2-subview-bar"
+            | "c4-carousel-switch"
+            | "reg-pkg-filter"
+            | "obs-pp-filter"
+            | "obs-log-filter"
+            | "c3-rotary"
+            | "c4-page-dots"
+    ) || control_id.ends_with("-screen")
+}
+
 /// Extract `?invite=<token>` from a URL query string and return `(Some(token), sanitized_query)`
 /// with the `invite` parameter stripped so one-time invite tokens are removed from browser history.
 #[must_use]
@@ -591,17 +638,18 @@ impl ConsoleState {
         let Some(v) = self.client.view() else {
             return Vec::new();
         };
-        let mut out = Vec::with_capacity(v.repos.len());
+        let repos = self.filtered_repos();
+        let mut out = Vec::with_capacity(repos.len());
         let parent_id = self
             .route
             .repo
             .as_ref()
             .or_else(|| v.selection.as_ref().map(|s| &s.repo));
         if let Some(pid) = parent_id {
-            if let Some(parent) = v.repos.iter().find(|r| &r.id == pid) {
+            if let Some(parent) = repos.iter().find(|r| &r.id == pid) {
                 out.push(parent.clone());
                 for sub in &parent.submodules {
-                    if let Some(sr) = v.repos.iter().find(|r| r.id == sub.repo) {
+                    if let Some(sr) = repos.iter().find(|r| r.id == sub.repo) {
                         if !out.iter().any(|x| x.id == sr.id) {
                             out.push(sr.clone());
                         }
@@ -609,7 +657,7 @@ impl ConsoleState {
                 }
             }
         }
-        for r in &v.repos {
+        for r in &repos {
             if !out.iter().any(|x| x.id == r.id) {
                 out.push(r.clone());
             }
@@ -654,6 +702,7 @@ impl ConsoleState {
         let next = (cur + delta).rem_euclid(len);
         self.outer_index = usize::try_from(next).unwrap_or(0);
         self.inner_index = 0;
+        self.carousel_page = 0;
         let chosen = &repos[self.outer_index];
         self.route.repo = Some(chosen.id.clone());
         self.route.submodule = None;
@@ -701,6 +750,7 @@ impl ConsoleState {
         self.filter_query = query.to_owned();
         self.outer_index = 0;
         self.inner_index = 0;
+        self.carousel_page = 0;
         let repos = self.filtered_repos();
         if let Some(first) = repos.first() {
             self.route.repo = Some(first.id.clone());
@@ -805,7 +855,7 @@ impl ConsoleState {
         };
         match self.route.subview {
             SubView::Ci(CiSubView::Scorecards) => {
-                let _ = self.step_carousel(if delta >= 0 { 1 } else { -1 }, 3);
+                let _ = self.step_carousel(if delta >= 0 { 1 } else { -1 }, 6);
             }
             SubView::Ci(CiSubView::Trainway) => {
                 self.yard_page = step(self.yard_page);
@@ -1045,12 +1095,34 @@ impl ConsoleState {
                 self.route.submodule = None;
                 self.route.branch = None;
                 self.route.job = None;
+                self.carousel_page = 0;
                 self.sync_rotary_from_route();
                 self.aria_polite = format!("Selected repository {owner}/{repo}");
                 return vec![UiCommand::SelectRepo {
                     repo: rid,
                     submodule: None,
                 }];
+            }
+        }
+        if let Some(rest) = id.strip_prefix("c4-card-") {
+            if let Some(idx_str) = rest.strip_suffix("-left") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    let ordered = self.ordered_carousel_repos();
+                    let slot = (self.carousel_page as usize) * 6 + idx;
+                    if let Some(r) = ordered.get(slot) {
+                        let target = format!("c4-open-trainway:{}/{}", r.id.owner, r.id.repo);
+                        return self.on_control_id(&target, shift, now_ms);
+                    }
+                }
+            } else if let Some(idx_str) = rest.strip_suffix("-right") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    let ordered = self.ordered_carousel_repos();
+                    let slot = (self.carousel_page as usize) * 6 + idx;
+                    if let Some(r) = ordered.get(slot) {
+                        let target = format!("c4-open-gate:{}/{}", r.id.owner, r.id.repo);
+                        return self.on_control_id(&target, shift, now_ms);
+                    }
+                }
             }
         }
         if let Some(repo_str) = id.strip_prefix("c4-open-trainway:") {
@@ -1089,6 +1161,39 @@ impl ConsoleState {
             self.route.branch = Some(branch_ref.to_owned());
             self.aria_polite = format!("Selected branch {branch_ref}");
             return vec![UiCommand::Subscribe(self.route.clone())];
+        }
+        if let Some(sig_rest) = id.strip_prefix("c5-signal:") {
+            if let Some((branch_ref, _st_idx)) = sig_rest.rsplit_once(':') {
+                self.route.branch = Some(branch_ref.to_owned());
+                let matched_job = self
+                    .client
+                    .view()
+                    .and_then(|v| v.topology.as_ref())
+                    .and_then(|t| t.trains.iter().find(|tr| tr.ref_name == branch_ref))
+                    .map(|tr| tr.job_id)
+                    .filter(|&jid| jid > 0)
+                    .or_else(|| self.active_job_id());
+                self.follow_log = true;
+                self.subview_page = 0;
+                let mut cmds = self.select_subview(SubView::Ci(CiSubView::QueueLogs));
+                if let Some(job_id) = matched_job {
+                    self.route.job = Some(job_id);
+                    cmds.push(UiCommand::SelectJob { job_id });
+                }
+                return cmds;
+            }
+        }
+        if let Some(station) = id.strip_prefix("c5-station:") {
+            let matched_job = self.active_job_id();
+            self.follow_log = true;
+            self.subview_page = 0;
+            let mut cmds = self.select_subview(SubView::Ci(CiSubView::QueueLogs));
+            if let Some(job_id) = matched_job.filter(|&jid| jid > 0) {
+                self.route.job = Some(job_id);
+                cmds.push(UiCommand::SelectJob { job_id });
+            }
+            self.aria_polite = format!("Opened Queue & Logs for stage {station}");
+            return cmds;
         }
         if let Some(job_str) = id
             .strip_prefix("c5-job-select:")
@@ -1228,8 +1333,8 @@ impl ConsoleState {
                 self.phone_rotary_open = !self.phone_rotary_open;
                 Vec::new()
             }
-            "c4-carousel-switch:prev" => vec![self.step_carousel(-1, 3)],
-            "c4-carousel-switch:next" => vec![self.step_carousel(1, 3)],
+            "c4-carousel-switch:prev" => vec![self.step_carousel(-1, 6)],
+            "c4-carousel-switch:next" => vec![self.step_carousel(1, 6)],
             "c5-live-toggle" => {
                 self.trainway_live = !self.trainway_live;
                 Vec::new()
@@ -1362,8 +1467,8 @@ impl ConsoleState {
                 }
                 None
             }
-            "ArrowLeft" => Some(self.step_carousel(-1, 3)),
-            "ArrowRight" => Some(self.step_carousel(1, 3)),
+            "ArrowLeft" => Some(self.step_carousel(-1, 6)),
+            "ArrowRight" => Some(self.step_carousel(1, 6)),
             "d" | "D" | "f" | "F" => Some(self.toggle_font()),
             "s" | "S" => Some(self.toggle_skin()),
             "r" | "R" => {
