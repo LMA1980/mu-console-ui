@@ -494,6 +494,12 @@ impl ConsoleState {
     /// Apply a location hash and synchronize sub-view filters / trace selection.
     pub fn apply_hash(&mut self, hash: &str) {
         self.route = parse_hash(hash);
+        if matches!(
+            self.route.subview,
+            SubView::Ci(CiSubView::QueueLogs) | SubView::Observe(ObserveSubView::Logs)
+        ) {
+            self.follow_log = true;
+        }
         if let Some(tr) = self.route.trace_id.clone() {
             self.selected_trace_id = Some(tr);
         }
@@ -912,6 +918,7 @@ impl ConsoleState {
             let chosen = services[next_idx].clone();
             self.obs_service_filter = Some(chosen.clone());
             self.subview_page = 0;
+            self.follow_log = true;
             self.aria_polite = format!("Filtered Observe by service {chosen}");
             return;
         };
@@ -923,6 +930,7 @@ impl ConsoleState {
         if (cur == 0 && delta < 0) || (cur + 1 == len && delta > 0) {
             self.obs_service_filter = None;
             self.subview_page = 0;
+            self.follow_log = true;
             self.aria_polite = "Selected * All services".to_owned();
             return;
         }
@@ -930,6 +938,7 @@ impl ConsoleState {
         let chosen = services[next].clone();
         self.obs_service_filter = Some(chosen.clone());
         self.subview_page = 0;
+        self.follow_log = true;
         self.aria_polite = format!("Filtered Observe by service {chosen}");
     }
 
@@ -940,6 +949,9 @@ impl ConsoleState {
             self.filter_query = query.to_owned();
             self.subview_page = 0;
             self.fleet_page = 0;
+            if self.route.subview == SubView::Observe(ObserveSubView::Logs) {
+                self.follow_log = true;
+            }
             return;
         }
         self.filter_query = query.to_owned();
@@ -1363,6 +1375,7 @@ impl ConsoleState {
                     _ => None,
                 };
                 self.subview_page = 0;
+                self.follow_log = true;
                 self.route.filter = self.log_severity_filter.map(|s| s.label().to_owned());
             }
             "data-action" | "data-control-id" => {
@@ -1417,17 +1430,20 @@ impl ConsoleState {
                 self.aria_polite = format!("Filtered Observe by service {trimmed}");
             }
             self.subview_page = 0;
+            self.follow_log = true;
             return Vec::new();
         }
         if id == "obs-service-reset" {
             self.obs_service_filter = None;
             self.subview_page = 0;
+            self.follow_log = true;
             self.aria_polite = "Selected * All services".to_owned();
             return Vec::new();
         }
         if id == "ci-queue-filter" {
             self.ci_queue_filter = (self.ci_queue_filter + 1) % 4;
             self.subview_page = 0;
+            self.follow_log = true;
             self.aria_polite = format!("CI queue filter {}", self.ci_queue_filter);
             return Vec::new();
         }
@@ -1440,6 +1456,7 @@ impl ConsoleState {
                 _ => (self.ci_queue_filter + 1) % 4,
             };
             self.subview_page = 0;
+            self.follow_log = true;
             self.aria_polite = format!("CI queue filter {}", self.ci_queue_filter);
             return Vec::new();
         }
@@ -1450,6 +1467,8 @@ impl ConsoleState {
                 } else {
                     self.selected_stage_idx = Some(idx);
                 }
+                self.log_page = 0;
+                self.follow_log = true;
                 self.aria_polite = format!("Selected CI stage #{}", idx + 1);
                 return Vec::new();
             }
@@ -1830,6 +1849,7 @@ impl ConsoleState {
                 self.follow_log = !self.follow_log;
                 if self.follow_log {
                     self.log_page = u32::MAX;
+                    self.subview_page = u32::MAX;
                 } else if self.log_page == 0 || self.log_page == u32::MAX {
                     self.log_page = self.rendered_ci_log_page.get();
                 }
@@ -1839,6 +1859,7 @@ impl ConsoleState {
                 self.follow_log = !self.follow_log;
                 if self.follow_log {
                     self.subview_page = u32::MAX;
+                    self.log_page = u32::MAX;
                 } else if self.subview_page == 0 || self.subview_page == u32::MAX {
                     self.subview_page = self.rendered_obs_log_page.get();
                 }

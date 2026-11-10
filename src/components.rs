@@ -2427,7 +2427,10 @@ fn render_ci_queue_logs(
                             false,
                         ));
                     }
-                    for log in &v.observe.logs {
+                    let mut fallback_logs: Vec<&mu_console_protocol::OtelLogEntry> =
+                        v.observe.logs.iter().collect();
+                    fallback_logs.sort_by_key(|l| l.timestamp_ms);
+                    for log in fallback_logs {
                         let tone = match log.severity {
                             LogSeverity::Error => SemanticTone::Fail,
                             LogSeverity::Warn => SemanticTone::Warn,
@@ -3184,7 +3187,7 @@ fn render_c6_delivery_gate(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: state.log_page,
+            page: state.log_page.min(total_log_pages.saturating_sub(1)),
             total_pages: total_log_pages,
         },
     );
