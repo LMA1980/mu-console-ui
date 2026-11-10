@@ -2279,4 +2279,99 @@ fn u23_c2_top_bar_declutter_header_skin_toggle_and_compact_dyslexia_switch() {
     assert_eq!(st.obs_service_filter.as_deref(), Some(services[0].as_str()));
     st.activate_target("c2-obs-service-prev");
     assert!(st.obs_service_filter.is_none());
+
+    // 6. Follow Tail in OBS > Logs and CI > Queue & Logs:
+    // Populate 75 OTel log entries and 70 CI build log lines on a finished job so both have multiple pages.
+    let mut vm = st.client.view().expect("view").clone();
+    for i in 0..75_u64 {
+        vm.observe.logs.push(mu_console_protocol::OtelLogEntry {
+            timestamp_ms: 1_760_000_000_000 + i * 1_000,
+            severity: mu_console_protocol::LogSeverity::Info,
+            service: "actionrunner-controller".into(),
+            trace_id: format!("tr-obs-tail-{i:03}"),
+            span_id: Some(format!("sp-obs-tail-{i:03}")),
+            message: format!("obs-stream-entry-{i:03}"),
+        });
+    }
+    vm.ci_jobs[0].queue_state = "Passed".into();
+    vm.ci_jobs[0].raw_log_lines = (0..70)
+        .map(|i| {
+            format!(
+                "2026-11-10T02:37:{:02}.000000+00:00 [worker-riscv64] [miri-check] [stdout] ci-tail-line-{i:03}",
+                i % 60
+            )
+        })
+        .collect();
+    let snap_tail = Engine::encode_event(&DataEvent::Snapshot(vm)).expect("encode tail snapshot");
+    st.on_worker_frame(&snap_tail);
+
+    // 6a. OBS > Logs defaults to Follow ON and displays the tail page (newest entry obs-stream-entry-074).
+    st.select_subview(SubView::Observe(ObserveSubView::Logs));
+    assert!(st.follow_log);
+    let svg_obs_tail = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_obs_tail.contains("obs-log-follow-toggle"));
+    assert!(svg_obs_tail.contains("FOLLOW ON"));
+    assert!(svg_obs_tail.contains("FOLLOW: ON"));
+    assert!(svg_obs_tail.contains("obs-stream-entry-074"));
+    assert!(!svg_obs_tail.contains("obs-stream-entry-000"));
+    assert_svg_zero_overflow(&svg_obs_tail, 1440.0, 900.0, "u23_obs_logs_follow_tail");
+
+    // Clicking obs-logs-screen:prev disengages Follow Tail and steps back by 1 page from the tail.
+    st.activate_target("obs-logs-screen:prev");
+    assert!(!st.follow_log);
+    let svg_obs_prev = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_obs_prev.contains("FOLLOW OFF"));
+    assert!(svg_obs_prev.contains("FOLLOW: OFF"));
+    assert!(!svg_obs_prev.contains("obs-stream-entry-074"));
+    assert!(!svg_obs_prev.contains("obs-stream-entry-000"));
+
+    // Clicking obs-log-follow-toggle re-engages Follow Tail and jumps back to the newest log page.
+    st.activate_target("obs-log-follow-toggle");
+    assert!(st.follow_log);
+    let svg_obs_refollow = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_obs_refollow.contains("obs-stream-entry-074"));
+
+    // 6b. CI > Queue & Logs defaults to Follow ON and displays the tail page even for a completed job.
+    st.select_subview(SubView::Ci(CiSubView::QueueLogs));
+    assert!(st.follow_log);
+    assert_eq!(st.log_page, 0);
+    let svg_ci_tail = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_ci_tail.contains("ci-log-follow-toggle"));
+    assert!(svg_ci_tail.contains("FOLLOW ON"));
+    assert!(svg_ci_tail.contains("ci-tail-line-069"));
+    assert!(!svg_ci_tail.contains("ci-tail-line-000"));
+    assert_svg_zero_overflow(&svg_ci_tail, 1440.0, 900.0, "u23_ci_logs_follow_tail");
+
+    // Clicking ci-job-detail-screen:prev disengages Follow Tail and steps back by 1 page from the tail.
+    st.activate_target("ci-job-detail-screen:prev");
+    assert!(!st.follow_log);
+    let svg_ci_prev = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_ci_prev.contains("FOLLOW OFF"));
+    assert!(!svg_ci_prev.contains("ci-tail-line-069"));
+    assert!(!svg_ci_prev.contains("ci-tail-line-000"));
 }

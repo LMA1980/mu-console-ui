@@ -360,8 +360,12 @@ pub struct ConsoleState {
     pub fleet_page: u32,
     /// Active sub-view CRT page cursor (`QueueLogs`, `DeploymentsSlots`, `ActiveLeases`, `Reg*`, `Obs*`).
     pub subview_page: u32,
-    /// `CI > Queue & Logs` auto-follow newest log page while selected job is active/queued.
+    /// `CI > Queue & Logs` and `OBS > Logs` auto-follow newest log page (tail).
     pub follow_log: bool,
+    /// Last rendered 0-based page index of `ci-job-detail-screen` (or compact `ci-queue-logs-screen`).
+    pub(crate) rendered_ci_log_page: std::cell::Cell<u32>,
+    /// Last rendered 0-based page index of `obs-logs-screen`.
+    pub(crate) rendered_obs_log_page: std::cell::Cell<u32>,
     /// `CI > Queue & Logs` queue filter (`0 = ALL`, `1 = ACTIVE`, `2 = FAILED`, `3 = REPO`).
     pub ci_queue_filter: u8,
     /// `CI > Queue & Logs` selected stage index in the job detail inspector.
@@ -446,6 +450,8 @@ impl ConsoleState {
             fleet_page: 0,
             subview_page: 0,
             follow_log: true,
+            rendered_ci_log_page: std::cell::Cell::new(0),
+            rendered_obs_log_page: std::cell::Cell::new(0),
             ci_queue_filter: 0,
             selected_stage_idx: None,
             selected_metric_idx: 0,
@@ -488,6 +494,12 @@ impl ConsoleState {
     /// Apply a location hash and synchronize sub-view filters / trace selection.
     pub fn apply_hash(&mut self, hash: &str) {
         self.route = parse_hash(hash);
+        if matches!(
+            self.route.subview,
+            SubView::Ci(CiSubView::QueueLogs) | SubView::Observe(ObserveSubView::Logs)
+        ) {
+            self.follow_log = true;
+        }
         if let Some(tr) = self.route.trace_id.clone() {
             self.selected_trace_id = Some(tr);
         }
@@ -906,6 +918,7 @@ impl ConsoleState {
             let chosen = services[next_idx].clone();
             self.obs_service_filter = Some(chosen.clone());
             self.subview_page = 0;
+            self.follow_log = true;
             self.aria_polite = format!("Filtered Observe by service {chosen}");
             return;
         };
@@ -917,6 +930,7 @@ impl ConsoleState {
         if (cur == 0 && delta < 0) || (cur + 1 == len && delta > 0) {
             self.obs_service_filter = None;
             self.subview_page = 0;
+            self.follow_log = true;
             self.aria_polite = "Selected * All services".to_owned();
             return;
         }
@@ -924,6 +938,7 @@ impl ConsoleState {
         let chosen = services[next].clone();
         self.obs_service_filter = Some(chosen.clone());
         self.subview_page = 0;
+        self.follow_log = true;
         self.aria_polite = format!("Filtered Observe by service {chosen}");
     }
 
@@ -934,6 +949,9 @@ impl ConsoleState {
             self.filter_query = query.to_owned();
             self.subview_page = 0;
             self.fleet_page = 0;
+            if self.route.subview == SubView::Observe(ObserveSubView::Logs) {
+                self.follow_log = true;
+            }
             return;
         }
         self.filter_query = query.to_owned();
@@ -999,6 +1017,7 @@ impl ConsoleState {
         }
         self.prune_unused_route_params(self.route.subview);
         self.subview_page = 0;
+        self.log_page = 0;
         self.follow_log = true;
         self.aria_polite = format!(
             "Area {} :: {}",
@@ -1014,6 +1033,7 @@ impl ConsoleState {
         self.route.subview = subview;
         self.prune_unused_route_params(subview);
         self.subview_page = 0;
+        self.log_page = 0;
         self.follow_log = true;
         self.aria_polite = format!(
             "Sub-view {} :: {}",
@@ -1094,6 +1114,45 @@ impl ConsoleState {
         }
     }
 
+    fn step_ci_log_page(&mut self, delta: isize) {
+        if delta < 0 {
+            let base = if self.follow_log && (self.log_page == 0 || self.log_page == u32::MAX) {
+                self.rendered_ci_log_page.get()
+            } else {
+                self.log_page
+            };
+            self.log_page = base.saturating_sub(1);
+            self.follow_log = false;
+        } else {
+            let base = if self.log_page == u32::MAX {
+                self.rendered_ci_log_page.get()
+            } else {
+                self.log_page
+            };
+            self.log_page = base.saturating_add(1);
+        }
+    }
+
+    fn step_obs_log_page(&mut self, delta: isize) {
+        if delta < 0 {
+            let base =
+                if self.follow_log && (self.subview_page == 0 || self.subview_page == u32::MAX) {
+                    self.rendered_obs_log_page.get()
+                } else {
+                    self.subview_page
+                };
+            self.subview_page = base.saturating_sub(1);
+            self.follow_log = false;
+        } else {
+            let base = if self.subview_page == u32::MAX {
+                self.rendered_obs_log_page.get()
+            } else {
+                self.subview_page
+            };
+            self.subview_page = base.saturating_add(1);
+        }
+    }
+
     /// Step the active screen's pagination cursor by `delta`.
     pub fn step_active_page(&mut self, delta: isize) {
         let step = |cur: u32| -> u32 {
@@ -1118,10 +1177,11 @@ impl ConsoleState {
                 self.fleet_page = step(self.fleet_page);
             }
             SubView::Ci(CiSubView::QueueLogs) => {
-                if delta < 0 {
-                    self.follow_log = false;
-                }
+                self.step_ci_log_page(delta);
                 self.subview_page = step(self.subview_page);
+            }
+            SubView::Observe(ObserveSubView::Logs) => {
+                self.step_obs_log_page(delta);
             }
             _ => {
                 self.subview_page = step(self.subview_page);
@@ -1315,6 +1375,7 @@ impl ConsoleState {
                     _ => None,
                 };
                 self.subview_page = 0;
+                self.follow_log = true;
                 self.route.filter = self.log_severity_filter.map(|s| s.label().to_owned());
             }
             "data-action" | "data-control-id" => {
@@ -1369,17 +1430,20 @@ impl ConsoleState {
                 self.aria_polite = format!("Filtered Observe by service {trimmed}");
             }
             self.subview_page = 0;
+            self.follow_log = true;
             return Vec::new();
         }
         if id == "obs-service-reset" {
             self.obs_service_filter = None;
             self.subview_page = 0;
+            self.follow_log = true;
             self.aria_polite = "Selected * All services".to_owned();
             return Vec::new();
         }
         if id == "ci-queue-filter" {
             self.ci_queue_filter = (self.ci_queue_filter + 1) % 4;
             self.subview_page = 0;
+            self.follow_log = true;
             self.aria_polite = format!("CI queue filter {}", self.ci_queue_filter);
             return Vec::new();
         }
@@ -1392,6 +1456,7 @@ impl ConsoleState {
                 _ => (self.ci_queue_filter + 1) % 4,
             };
             self.subview_page = 0;
+            self.follow_log = true;
             self.aria_polite = format!("CI queue filter {}", self.ci_queue_filter);
             return Vec::new();
         }
@@ -1402,6 +1467,8 @@ impl ConsoleState {
                 } else {
                     self.selected_stage_idx = Some(idx);
                 }
+                self.log_page = 0;
+                self.follow_log = true;
                 self.aria_polite = format!("Selected CI stage #{}", idx + 1);
                 return Vec::new();
             }
@@ -1782,24 +1849,55 @@ impl ConsoleState {
                 self.follow_log = !self.follow_log;
                 if self.follow_log {
                     self.log_page = u32::MAX;
+                    self.subview_page = u32::MAX;
+                } else if self.log_page == 0 || self.log_page == u32::MAX {
+                    self.log_page = self.rendered_ci_log_page.get();
+                }
+                Vec::new()
+            }
+            "obs-log-follow-toggle" => {
+                self.follow_log = !self.follow_log;
+                if self.follow_log {
+                    self.subview_page = u32::MAX;
+                    self.log_page = u32::MAX;
+                } else if self.subview_page == 0 || self.subview_page == u32::MAX {
+                    self.subview_page = self.rendered_obs_log_page.get();
                 }
                 Vec::new()
             }
             "ci-log-page-prev" | "ci-job-detail-screen:prev" => {
-                self.log_page = self.log_page.saturating_sub(1);
-                self.follow_log = false;
+                self.step_ci_log_page(-1);
                 Vec::new()
             }
             "ci-log-page-next" | "ci-job-detail-screen:next" => {
-                self.log_page = self.log_page.saturating_add(1);
+                self.step_ci_log_page(1);
+                Vec::new()
+            }
+            "obs-logs-screen:prev" => {
+                self.step_obs_log_page(-1);
+                Vec::new()
+            }
+            "obs-logs-screen:next" => {
+                self.step_obs_log_page(1);
                 Vec::new()
             }
             "screen-page-prev" | "ci-queue-logs-screen:prev" => {
-                self.subview_page = self.subview_page.saturating_sub(1);
+                if self.route.subview == SubView::Observe(ObserveSubView::Logs) {
+                    self.step_obs_log_page(-1);
+                } else {
+                    if self.route.subview == SubView::Ci(CiSubView::QueueLogs) {
+                        self.follow_log = false;
+                    }
+                    self.subview_page = self.subview_page.saturating_sub(1);
+                }
                 Vec::new()
             }
             "screen-page-next" | "ci-queue-logs-screen:next" => {
-                self.subview_page = self.subview_page.saturating_add(1);
+                if self.route.subview == SubView::Observe(ObserveSubView::Logs) {
+                    self.step_obs_log_page(1);
+                } else {
+                    self.subview_page = self.subview_page.saturating_add(1);
+                }
                 Vec::new()
             }
             "c5-open-logs" => self.select_subview(SubView::Ci(CiSubView::QueueLogs)),
@@ -2127,5 +2225,25 @@ mod tests {
                 submodule: None,
             }]
         );
+
+        // Verify obs-log-follow-toggle and obs-logs-screen:prev step-back from rendered tail page.
+        st.select_subview(SubView::Observe(ObserveSubView::Logs));
+        assert!(st.follow_log);
+        st.rendered_obs_log_page.set(3);
+        st.activate_target("obs-logs-screen:prev");
+        assert!(!st.follow_log);
+        assert_eq!(st.subview_page, 2);
+        st.activate_target("obs-log-follow-toggle");
+        assert!(st.follow_log);
+        assert_eq!(st.subview_page, u32::MAX);
+
+        // Verify ci-job-detail-screen:prev steps back from rendered tail page when follow_log is true.
+        st.select_subview(SubView::Ci(CiSubView::QueueLogs));
+        assert!(st.follow_log);
+        assert_eq!(st.log_page, 0);
+        st.rendered_ci_log_page.set(4);
+        st.activate_target("ci-job-detail-screen:prev");
+        assert!(!st.follow_log);
+        assert_eq!(st.log_page, 3);
     }
 }
