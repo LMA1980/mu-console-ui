@@ -16,7 +16,7 @@ pub mod state;
 
 pub use client::{reload_banner_text, ClientUpdate, DataClient, WORKER_URL};
 pub use components::{render_console, render_html_shell};
-pub use state::ConsoleState;
+pub use state::{service_filter_matches, ConsoleState};
 
 use mu_console_layout::{solve, Area, Frames, SafeArea, Viewport};
 use mu_console_theme::defs::write_defs;

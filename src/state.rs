@@ -34,6 +34,51 @@ pub const RESTART_ARM_WINDOW_MS: u64 = 3_000;
 /// Ordered areas on the C1 selector rail (`CI`, `CD`, `REG`, `OBS`, `FLT`).
 pub const AREAS: [Area; 5] = Area::ALL;
 
+fn compact_service_token(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let bare = trimmed
+        .strip_prefix("svc:")
+        .or_else(|| trimmed.strip_prefix("proc:"))
+        .unwrap_or(trimmed);
+    let head = bare.split('·').next().unwrap_or(bare).trim();
+    let head = head.split('@').next().unwrap_or(head).trim();
+    let head = head.split('(').next().unwrap_or(head).trim();
+    head.chars()
+        .filter(|c| !matches!(c, '-' | '_' | ' '))
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Compare an `OBS` service filter token against a candidate service/entity name,
+/// case-insensitively and ignoring hyphens/underscores (e.g.
+/// `"action-runner-controller"` matches `"actionrunner-controller"`).
+#[must_use]
+pub fn service_filter_matches(filter: &str, candidate: &str) -> bool {
+    let fa = compact_service_token(filter);
+    let fb = compact_service_token(candidate);
+    !fa.is_empty() && !fb.is_empty() && fa == fb
+}
+
+fn push_observed_service(out: &mut Vec<String>, raw: &str) {
+    let trimmed = raw.trim().strip_prefix("svc:").unwrap_or(raw.trim()).trim();
+    let base = trimmed.split('·').next().unwrap_or(trimmed).trim();
+    let base = base.split('(').next().unwrap_or(base).trim();
+    if base.is_empty() || base.starts_with("node:") {
+        return;
+    }
+    let normalized = if base.eq_ignore_ascii_case("action-runner-controller") {
+        "actionrunner-controller"
+    } else {
+        base
+    };
+    if !out
+        .iter()
+        .any(|existing| service_filter_matches(existing, normalized))
+    {
+        out.push(normalized.to_owned());
+    }
+}
+
 /// Action attributes checked on each DOM ancestor from innermost target to outermost container.
 pub const ACTION_ATTRS: [&str; 18] = [
     "data-action",
@@ -822,35 +867,21 @@ impl ConsoleState {
         let mut out = Vec::new();
         if let Some(v) = self.client.view() {
             for log in &v.observe.logs {
-                let s = log.service.trim();
-                if !s.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(s)) {
-                    out.push(s.to_owned());
-                }
+                push_observed_service(&mut out, &log.service);
             }
             for m in &v.observe.metrics {
-                let s = m.service.trim();
-                if !s.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(s)) {
-                    out.push(s.to_owned());
-                }
+                push_observed_service(&mut out, &m.service);
             }
             for t in &v.observe.traces {
-                let rs = t.root_service.trim();
-                if !rs.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(rs)) {
-                    out.push(rs.to_owned());
-                }
+                push_observed_service(&mut out, &t.root_service);
                 for sp in &t.spans {
-                    let s = sp.service.trim();
-                    if !s.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(s)) {
-                        out.push(s.to_owned());
-                    }
+                    push_observed_service(&mut out, &sp.service);
                 }
             }
             for n in &v.observe.smartscape_nodes {
                 if n.layer == SmartscapeLayer::Service {
-                    let s = n.id.strip_prefix("svc:").unwrap_or(&n.label).trim();
-                    if !s.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(s)) {
-                        out.push(s.to_owned());
-                    }
+                    let s = n.id.strip_prefix("svc:").unwrap_or(&n.label);
+                    push_observed_service(&mut out, s);
                 }
             }
         }
@@ -880,7 +911,7 @@ impl ConsoleState {
         };
         let cur = services
             .iter()
-            .position(|s| s.eq_ignore_ascii_case(cur_svc))
+            .position(|s| service_filter_matches(s, cur_svc))
             .and_then(|i| isize::try_from(i).ok())
             .unwrap_or(0);
         if (cur == 0 && delta < 0) || (cur + 1 == len && delta > 0) {

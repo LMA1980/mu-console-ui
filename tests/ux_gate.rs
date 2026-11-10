@@ -2264,7 +2264,12 @@ fn u23_c2_top_bar_declutter_header_skin_toggle_and_compact_dyslexia_switch() {
     assert!(svg_obs_logs.contains("c2-obs-service-select"));
     assert!(svg_obs_logs.contains("* All services"));
     assert!(!svg_obs_logs.contains("c2-repo-select"));
-    assert!(svg_obs_logs.contains("ACTIVE SERVICES &amp; SIDECARS:"));
+    assert!(svg_obs_logs.contains("ACTIVE SERVICES, CRATES &amp; SIDECARS:"));
+    assert!(svg_obs_logs.contains("ENTRIES (ERR:"));
+    assert!(mu_console_ui::service_filter_matches(
+        "action-runner-controller",
+        "actionrunner-controller"
+    ));
     assert_svg_zero_overflow(&svg_obs_logs, 1440.0, 900.0, "u23_obs_logs_multi_service");
 
     // Stepping service selector filters Observe logs by service and cycles back to * All services.
