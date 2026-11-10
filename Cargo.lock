@@ -85,7 +85,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "mu-console-data"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-console-data.git#0a3972d5405a5b52fb80ff7c3a5e697c68c3080c"
+source = "git+https://github.com/LMA1980/mu-console-data.git#6ce79ae85db8ef05bbd82323f46ef761aab2f0e1"
 dependencies = [
  "js-sys",
  "mu-console-protocol",
@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "mu-console-protocol"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-console-protocol.git#ef3810878b12262b7ea1b7015d3694fe5157de6d"
+source = "git+https://github.com/LMA1980/mu-console-protocol.git#a7f7157d5e80ffce2df03582d88783512b1e6478"
 dependencies = [
  "postcard",
  "serde",
@@ -117,7 +117,7 @@ dependencies = [
 [[package]]
 name = "mu-console-theme"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-console-theme.git#4d7b2327e551dedb4bd60983f94e60c48b302022"
+source = "git+https://github.com/LMA1980/mu-console-theme.git#5ca4699eedd0b499a07a788c18d180f6c8f10889"
 
 [[package]]
 name = "mu-console-ui"

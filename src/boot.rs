@@ -21,7 +21,7 @@ use web_sys::{
 };
 
 use crate::client::{reload_banner_text, ClientUpdate, DataClient, WORKER_URL};
-use crate::components::{render_console, render_html_shell};
+use crate::components::{filter_placeholder, render_console, render_html_shell};
 use crate::router::{area_slug, format_hash};
 use crate::state::{
     extract_invite_token, font_slug, is_action_root_boundary, is_passive_container_control_id,
@@ -66,6 +66,8 @@ fn sync_browser_state(st: &ConsoleState) {
         let _ = storage.set_item(SKIN_STORAGE_KEY, skin_slug(st.skin));
         if let Some(repo_str) = st.stored_repo_value() {
             let _ = storage.set_item(REPO_STORAGE_KEY, &repo_str);
+        } else {
+            let _ = storage.remove_item(REPO_STORAGE_KEY);
         }
     }
 }
@@ -207,6 +209,7 @@ fn repaint(st: &ConsoleState) {
             .get_element_by_id("muconsole-filter")
             .and_then(|e| e.dyn_into::<HtmlInputElement>().ok())
         {
+            let _ = input.set_attribute("placeholder", filter_placeholder(st.route.area));
             if input.value() != st.filter_query {
                 input.set_value(&st.filter_query);
             }
