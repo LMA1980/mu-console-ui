@@ -23,7 +23,7 @@ use mu_console_theme::skin::{
 use mu_console_theme::svg::{escape_into, PathData, SvgWriter};
 
 use crate::router::{area_label, breadcrumb_segments};
-use crate::state::{font_slug, skin_slug, ConsoleState};
+use crate::state::{font_slug, service_filter_matches, skin_slug, ConsoleState};
 
 const fn stage_glyph_and_tone(state: StageState) -> (SignalGlyph, SemanticTone) {
     match state {
@@ -401,7 +401,7 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
                 Some(sel) => {
                     let idx = services
                         .iter()
-                        .position(|s| s.eq_ignore_ascii_case(sel))
+                        .position(|s| service_filter_matches(s, sel))
                         .map_or(1, |i| i + 1);
                     format!("{idx}/{} {sel}", svc_total.max(1))
                 }
@@ -4014,6 +4014,15 @@ fn render_obs_smartscape(
                 .iter()
                 .filter(|n| n.layer == layer)
             {
+                if layer == SmartscapeLayer::Service {
+                    if let Some(svc) = state.obs_service_filter.as_deref() {
+                        if !service_filter_matches(svc, &n.id)
+                            && !service_filter_matches(svc, &n.label)
+                        {
+                            continue;
+                        }
+                    }
+                }
                 layer_count += 1;
                 let selected = state.selected_entity_id.as_deref() == Some(n.id.as_str());
                 let tone = if !n.healthy || n.error_rate_bp > 100 {
@@ -4222,10 +4231,10 @@ fn render_obs_purepath(
                     return false;
                 }
                 if let Some(svc) = state.obs_service_filter.as_deref() {
-                    let svc_match = t.root_service.eq_ignore_ascii_case(svc)
+                    let svc_match = service_filter_matches(svc, &t.root_service)
                         || t.spans
                             .iter()
-                            .any(|sp| sp.service.eq_ignore_ascii_case(svc));
+                            .any(|sp| service_filter_matches(svc, &sp.service));
                     if !svc_match {
                         return false;
                     }
@@ -4489,7 +4498,8 @@ fn render_obs_problems_slos(
         for p in &v.observe.problems {
             if let Some(svc) = state.obs_service_filter.as_deref() {
                 let svc_lc = svc.to_ascii_lowercase();
-                if !p.impacted_entity.to_ascii_lowercase().contains(&svc_lc)
+                if !service_filter_matches(svc, &p.impacted_entity)
+                    && !p.impacted_entity.to_ascii_lowercase().contains(&svc_lc)
                     && !p.title.to_ascii_lowercase().contains(&svc_lc)
                 {
                     continue;
@@ -4673,15 +4683,23 @@ fn render_obs_logs(
     type LogRow = (String, SemanticTone, Option<String>, bool);
     let mut body: Vec<LogRow> = Vec::new();
     let mut total_logs = 0_usize;
+    let mut err_cnt = 0_usize;
+    let mut warn_cnt = 0_usize;
+    let mut info_cnt = 0_usize;
 
     if let Some(v) = state.client.view() {
         total_logs = v.observe.logs.len();
         let q = state.filter_query.trim().to_ascii_lowercase();
         for log in &v.observe.logs {
             if let Some(svc) = state.obs_service_filter.as_deref() {
-                if !log.service.eq_ignore_ascii_case(svc) {
+                if !service_filter_matches(svc, &log.service) {
                     continue;
                 }
+            }
+            match log.severity {
+                LogSeverity::Error => err_cnt += 1,
+                LogSeverity::Warn => warn_cnt += 1,
+                LogSeverity::Info => info_cnt += 1,
             }
             if let Some(flt) = state.log_severity_filter {
                 if log.severity != flt {
@@ -4708,12 +4726,12 @@ fn render_obs_logs(
             };
             let has_trace = !log.trace_id.is_empty() && !log.trace_id.chars().all(|c| c == '0');
             if has_trace {
+                let short_tr: String = log.trace_id.chars().take(12).collect();
                 body.push((
                     format!(
-                        "{ts_str} [{sev_tag}] {:<20} {} [TRACE ↗ {}]",
+                        "{ts_str} [{sev_tag}] {:<20} {} [TRACE ↗ {short_tr}]",
                         log.service,
                         sanitize_public_log(&log.message),
-                        log.trace_id
                     ),
                     tone,
                     Some(format!("trace:{}", log.trace_id)),
@@ -4744,12 +4762,12 @@ fn render_obs_logs(
     } else {
         services
             .iter()
-            .take(6)
+            .take(8)
             .map(|s| {
                 if state
                     .obs_service_filter
                     .as_deref()
-                    .is_some_and(|sel| sel.eq_ignore_ascii_case(s))
+                    .is_some_and(|sel| service_filter_matches(sel, s))
                 {
                     format!("[*{s}]")
                 } else {
@@ -4762,7 +4780,7 @@ fn render_obs_logs(
     let headers: Vec<LogRow> = vec![
         (
             format!(
-                "OTEL LOG STREAM [SEVERITY: {active_sev}] · SCOPE: [{scope_label}] · {}/{total_logs} ENTRIES",
+                "OTEL LOG STREAM [SEVERITY: {active_sev}] · SCOPE: [{scope_label}] · {}/{total_logs} ENTRIES (ERR:{err_cnt} WARN:{warn_cnt} INFO:{info_cnt})",
                 body.len()
             ),
             SemanticTone::Info,
@@ -4770,7 +4788,7 @@ fn render_obs_logs(
             state.obs_service_filter.is_some(),
         ),
         (
-            format!("ACTIVE SERVICES & SIDECARS: [ * ALL ] · {services_summary}"),
+            format!("ACTIVE SERVICES, CRATES & SIDECARS: [ * ALL ] · {services_summary}"),
             SemanticTone::Info,
             Some("c2-obs-service-select".into()),
             false,
@@ -4787,8 +4805,17 @@ fn render_obs_logs(
         ));
     }
 
+    let font = state.font_metrics();
+    let obs_font_px = (panel.grid.font_px * 0.78).clamp(12.0, 13.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let obs_cols =
+        (((screen_rect.w - 16.0) / (obs_font_px * font.advance_em)).floor() as usize).max(40);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let obs_rows =
+        (((screen_rect.h - 16.0) / (obs_font_px * 1.35)).floor() as usize).max(panel.grid.rows);
+
     let (rows, page, total_pages) =
-        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
+        paginate_with_headers(headers, body, obs_rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, cid, sel)| ScreenRow {
@@ -4801,7 +4828,6 @@ fn render_obs_logs(
         })
         .collect();
 
-    let font = state.font_metrics();
     skin.screen(
         w,
         &Screen {
@@ -4809,9 +4835,9 @@ fn render_obs_logs(
             title: "MuObserve Sanitized Logs",
             rect: screen_rect,
             font_family: font.family,
-            font_px: panel.grid.font_px,
-            cols: panel.grid.cols,
-            rows: panel.grid.rows,
+            font_px: obs_font_px,
+            cols: obs_cols,
+            rows: obs_rows,
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
@@ -4869,7 +4895,7 @@ fn render_obs_metrics(
         let q = state.filter_query.trim().to_ascii_lowercase();
         for (idx, m) in v.observe.metrics.iter().enumerate() {
             if let Some(svc) = state.obs_service_filter.as_deref() {
-                if !m.service.eq_ignore_ascii_case(svc) {
+                if !service_filter_matches(svc, &m.service) {
                     continue;
                 }
             }
