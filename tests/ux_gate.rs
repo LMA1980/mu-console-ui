@@ -2211,4 +2211,35 @@ fn u23_c2_top_bar_declutter_header_skin_toggle_and_compact_dyslexia_switch() {
         SafeArea::ZERO,
     );
     assert!(svg_back.contains("* All repositories"));
+
+    // 4. Compact split CI Queue & Build Logs renders full log payloads without 78-char prefix truncation.
+    st.select_subview(SubView::Ci(CiSubView::QueueLogs));
+    let mut job_with_logs = st.client.view().expect("view").ci_jobs[0].clone();
+    job_with_logs.raw_log_lines = vec![
+        "2026-11-10T02:37:19.728991+00:00 [node-a] [miri-check] [stdout] test result: ok. 42 passed"
+            .into(),
+        "2026-11-10T02:37:20.112000+00:00 [node-a] [miri-check] [stderr] warning: unused variable"
+            .into(),
+    ];
+    let log_patch = Engine::encode_event(&DataEvent::Patch(vec![
+        Delta::Auth(AuthState::Operator {
+            github_login: "LMA1980".into(),
+            role: Some("admin".into()),
+        }),
+        Delta::CiJobs(vec![job_with_logs]),
+    ]))
+    .expect("encode patch");
+    st.on_worker_frame(&log_patch);
+    let svg_logs = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_logs.contains("CI QUEUE, WORKER SLOTS &amp; BUILD LOGS"));
+    assert!(svg_logs.contains("02:37:19 [miri-check] test result: ok. 42 passed"));
+    assert!(svg_logs.contains("02:37:20 [miri-check] ERR warning: unused variable"));
+    assert!(!svg_logs.contains("2026-11-10T02:37:19.728991+00:00"));
+    assert!(!svg_logs.contains("[stdout]"));
+    assert_svg_zero_overflow(&svg_logs, 1440.0, 900.0, "u23_compact_ci_build_logs");
 }

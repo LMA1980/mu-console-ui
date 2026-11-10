@@ -1828,6 +1828,99 @@ fn render_c5_selected_inspector(
     w.close();
 }
 
+fn parse_bracket_tag(s: &str) -> Option<(&str, &str)> {
+    let rest = s.strip_prefix('[')?;
+    let (tag, after) = rest.split_once(']')?;
+    Some((tag.trim(), after.trim_start()))
+}
+
+fn classify_log_tone(msg: &str) -> SemanticTone {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("error") || msg.contains("FAILED") {
+        SemanticTone::Fail
+    } else if lower.contains("warning:") {
+        SemanticTone::Warn
+    } else {
+        SemanticTone::Neutral
+    }
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_owned()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
+
+fn stage_tag_matches(line_stage: &str, st_name: &str) -> bool {
+    !line_stage.is_empty()
+        && (line_stage.eq_ignore_ascii_case(st_name)
+            || st_name
+                .to_ascii_lowercase()
+                .contains(&line_stage.to_ascii_lowercase())
+            || line_stage
+                .to_ascii_lowercase()
+                .contains(&st_name.to_ascii_lowercase()))
+}
+
+fn format_compact_build_log_line(
+    li: usize,
+    raw: &str,
+    selected_stage_name: Option<&str>,
+) -> (String, SemanticTone, Option<String>) {
+    let clean = sanitize_public_log(raw);
+    let trimmed = clean.trim_start();
+    let (first_tok, after_ts) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
+    let bytes = first_tok.as_bytes();
+    let is_rfc3339 = bytes.len() >= 19
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && (bytes[10] == b'T' || bytes[10] == b' ')
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && first_tok.is_char_boundary(11)
+        && first_tok.is_char_boundary(19);
+
+    if is_rfc3339 {
+        let hh_mm_ss = &first_tok[11..19];
+        let rem0 = after_ts.trim_start();
+        let (stage, stream, msg) = if let Some((tag1, rem1)) = parse_bracket_tag(rem0) {
+            if let Some((tag2, rem2)) = parse_bracket_tag(rem1) {
+                if let Some((tag3, rem3)) = parse_bracket_tag(rem2) {
+                    (Some(tag2), Some(tag3), rem3)
+                } else if tag2.eq_ignore_ascii_case("stdout") || tag2.eq_ignore_ascii_case("stderr")
+                {
+                    (Some(tag1), Some(tag2), rem2)
+                } else {
+                    (Some(tag2), None, rem2)
+                }
+            } else {
+                (Some(tag1), None, rem1)
+            }
+        } else {
+            (None, None, rem0)
+        };
+
+        let tone = classify_log_tone(msg);
+        let is_stderr = stream.is_some_and(|s| s.eq_ignore_ascii_case("stderr"));
+        let body_msg = if is_stderr && !msg.is_empty() {
+            format!("ERR {msg}")
+        } else {
+            msg.to_owned()
+        };
+
+        let formatted = match (selected_stage_name, stage) {
+            (Some(_), _) | (None, None) => format!("{:>4}│ {hh_mm_ss} {body_msg}", li + 1),
+            (None, Some(st)) => format!("{:>4}│ {hh_mm_ss} [{st}] {body_msg}", li + 1),
+        };
+        return (formatted, tone, stage.map(str::to_owned));
+    }
+
+    let tone = classify_log_tone(&clean);
+    (format!("{:>4}│ {clean}", li + 1), tone, None)
+}
+
 /// Render `CI > Queue & Job Logs`: Split Master–Detail active CI queue, stage selector, and independent log pager.
 #[allow(clippy::too_many_lines)]
 fn render_ci_queue_logs(
@@ -1848,6 +1941,8 @@ fn render_ci_queue_logs(
             id: "ci-queue-logs-panel",
             title: if rect.w < 680.0 {
                 "CI QUEUE & JOB LOGS"
+            } else if state.is_operator() {
+                "CI QUEUE, WORKER SLOTS & BUILD LOGS"
             } else {
                 "CI QUEUE, WORKER SLOTS & SANITIZED JOB LOGS"
             },
@@ -1961,9 +2056,9 @@ fn render_ci_queue_logs(
     let is_split = screen_rect.w >= 760.0;
 
     if is_split {
-        let left_w = (screen_rect.w * 0.44)
+        let left_w = (screen_rect.w * 0.34)
             .round()
-            .clamp(300.0, (screen_rect.w - 320.0).max(300.0));
+            .clamp(280.0, (screen_rect.w - 380.0).max(280.0));
         let left_rect = clamp_rect(
             Rect::new(screen_rect.x, screen_rect.y, left_w, screen_rect.h),
             rect,
@@ -1977,16 +2072,14 @@ fn render_ci_queue_logs(
             ),
             rect,
         );
-        let left_cols = (((left_rect.w - 20.0).max(16.0) / panel.grid.column_px.max(7.0)).floor()
-            as usize)
-            .max(16);
-        let right_cols = (((right_rect.w - 20.0).max(16.0) / panel.grid.column_px.max(7.0)).floor()
-            as usize)
-            .max(16);
+        let split_font_px = (panel.grid.font_px * 0.78).clamp(12.0, 13.0);
+        let split_col_px = (split_font_px * font.advance_em).max(7.2);
+        let left_cols = (((left_rect.w - 16.0).max(16.0) / split_col_px).floor() as usize).max(24);
+        let right_cols =
+            (((right_rect.w - 16.0).max(16.0) / split_col_px).floor() as usize).max(32);
 
         let mut left_headers: Vec<QueueRow> = vec![(
-            "INVARIANT: max_slots = 1 per worker :: thread budgets: node-a=2, node-b=6, worker-riscv64=6"
-                .into(),
+            "SLOTS: max=1/worker · threads: a=2 b=6 rv64=6".into(),
             SemanticTone::Info,
             None,
             None,
@@ -2035,7 +2128,7 @@ fn render_ci_queue_logs(
 
             left_headers.push((
                 format!(
-                    "INTERACTIVE CI JOB QUEUE · QUEUE FILTER: [{filter_label}] · {running_count} RUNNING · {queued_count} QUEUED · {shown_count}/{total_count} JOBS"
+                    "INTERACTIVE CI JOB QUEUE [{filter_label}] · {running_count} RUN · {queued_count} WAIT · {shown_count}/{total_count}"
                 ),
                 SemanticTone::Info,
                 None,
@@ -2060,9 +2153,7 @@ fn render_ci_queue_logs(
 
             if filtered_jobs.is_empty() {
                 left_rows.push((
-                    format!(
-                        "  (0 jobs match filter [{filter_label}] — click to cycle queue filter)"
-                    ),
+                    format!("  (0 jobs match [{filter_label}] — click to cycle filter)"),
                     SemanticTone::Neutral,
                     None,
                     Some("ci-queue-filter".into()),
@@ -2077,15 +2168,24 @@ fn render_ci_queue_logs(
                     "Queued" => (SignalGlyph::BlockPending, SemanticTone::Warn),
                     _ => (SignalGlyph::BlockPassed, SemanticTone::Pass),
                 };
+                let short_id = job
+                    .job_id_str
+                    .strip_prefix("job-")
+                    .unwrap_or(&job.job_id_str);
+                let st_short = match job.queue_state.as_str() {
+                    "Failed" => "FAIL",
+                    "Active" => "RUN ",
+                    "Queued" => "WAIT",
+                    _ => "PASS",
+                };
                 left_rows.push((
                     format!(
-                        "{}{:<10} {}/{} @{:<12} [{:<6}] COV:{:.1}% {:>3}s",
-                        if is_sel { "▸ " } else { "  " },
-                        job.job_id_str,
-                        job.repo.owner,
-                        job.repo.repo,
-                        job.ref_name,
-                        job.queue_state.to_ascii_uppercase(),
+                        "{}{:<6} {:<16} @{:<8} [{}] {:.0}% {:>3}s",
+                        if is_sel { "▸" } else { " " },
+                        truncate_str(short_id, 6),
+                        truncate_str(&job.repo.repo, 16),
+                        truncate_str(&job.ref_name, 8),
+                        st_short,
                         f64::from(job.coverage_bp) / 100.0,
                         job.elapsed_secs
                     ),
@@ -2112,11 +2212,11 @@ fn render_ci_queue_logs(
                     let job_tag = format_job_id(tr.job_id);
                     left_rows.push((
                         format!(
-                            "TRAIN #{:<6} {:<16} {:<8} NODE {:<12}",
+                            "TRAIN #{:<6} {:<14} {:<8} {:<10}",
                             job_tag,
-                            tr.ref_name,
-                            st_label,
-                            tr.node_id.as_deref().unwrap_or("QUEUED")
+                            truncate_str(&tr.ref_name, 14),
+                            truncate_str(st_label, 8),
+                            truncate_str(tr.node_id.as_deref().unwrap_or("QUEUED"), 10)
                         ),
                         tone,
                         Some(sig),
@@ -2154,23 +2254,10 @@ fn render_ci_queue_logs(
                 };
                 let trace_tag = format!("tr-ci-{}", format_job_id(sel_job.job_id));
                 detail_headers.push((
-                    format!(
-                        "  [▶ RESUME PIPELINE (/api/jobs/{}/resume)] · [↻ RESTART ALL (/api/jobs/{}/restart)] · [INSPECT PUREPATH ↗ {trace_tag}]",
-                        sel_job.job_id_str, sel_job.job_id_str
-                    ),
+                    format!("  [▶ RESUME PIPELINE] · [↻ RESTART ALL] · [PUREPATH ↗ {trace_tag}]"),
                     action_tone,
                     None,
                     Some(format!("ci-job-resume:{}", sel_job.job_id)),
-                    false,
-                ));
-                detail_headers.push((
-                    format!(
-                        "  [↻ RESTART ALL (/api/jobs/{}/restart)] :: [INSPECT PUREPATH ↗ {trace_tag}]",
-                        sel_job.job_id_str
-                    ),
-                    action_tone,
-                    None,
-                    Some(format!("ci-job-restart:{}", sel_job.job_id)),
                     false,
                 ));
 
@@ -2184,10 +2271,10 @@ fn render_ci_queue_logs(
                     let dur_ms = st.duration_secs * 1000;
                     detail_headers.push((
                         format!(
-                            "  [{}] #{} {:<14} node:{:<13} thr:{} {}ms",
+                            "  [{}] #{} {:<28} node:{:<10} thr:{} {}ms",
                             st_sig.symbol(),
                             idx + 1,
-                            st.name,
+                            truncate_str(&st.name, 28),
                             st.assigned_node.as_deref().unwrap_or("unassigned"),
                             st.threads,
                             dur_ms
@@ -2200,7 +2287,7 @@ fn render_ci_queue_logs(
                     if is_st_sel && detail_headers.len() < max_stage_headers {
                         detail_headers.push((
                             format!(
-                                "    ▸ STAGE #{} INSPECTOR: {} · STATE:{} · NODE:{} · THREAD_BUDGET:{} · DURATION:{}ms · EXIT:{}",
+                                "    ▸ STAGE #{} INSPECTOR: {} · {} · node:{} · thr:{} · {}ms · exit:{}",
                                 idx + 1,
                                 st.name,
                                 st.state.label(),
@@ -2230,15 +2317,35 @@ fn render_ci_queue_logs(
                 ));
 
                 if !sel_job.raw_log_lines.is_empty() {
+                    let selected_stage_name = state
+                        .selected_stage_idx
+                        .and_then(|idx| sel_job.stages.get(idx))
+                        .map(|st| st.name.as_str());
+                    let has_stage_match = selected_stage_name.is_some_and(|st_name| {
+                        sel_job.raw_log_lines.iter().any(|line| {
+                            let (_, _, line_stage) = format_compact_build_log_line(0, line, None);
+                            line_stage
+                                .as_deref()
+                                .is_some_and(|ls| stage_tag_matches(ls, st_name))
+                        })
+                    });
+                    let effective_stage_filter = if has_stage_match {
+                        selected_stage_name
+                    } else {
+                        None
+                    };
                     for (li, line) in sel_job.raw_log_lines.iter().enumerate() {
-                        let clean = sanitize_public_log(line);
-                        detail_rows.push((
-                            format!("  LOG[{:>02}]: {clean}", li + 1),
-                            SemanticTone::Neutral,
-                            None,
-                            None,
-                            false,
-                        ));
+                        let (formatted, tone, line_stage) =
+                            format_compact_build_log_line(li, line, effective_stage_filter);
+                        if let Some(st_name) = effective_stage_filter {
+                            if !line_stage
+                                .as_deref()
+                                .is_some_and(|ls| stage_tag_matches(ls, st_name))
+                            {
+                                continue;
+                            }
+                        }
+                        detail_rows.push((formatted, tone, None, None, false));
                     }
                 } else {
                     if !state.is_operator() {
@@ -2331,7 +2438,7 @@ fn render_ci_queue_logs(
                 title: "CI Queue and Worker Slots",
                 rect: left_rect,
                 font_family: font.family,
-                font_px: panel.grid.font_px,
+                font_px: split_font_px,
                 cols: left_cols,
                 rows: panel.grid.rows,
                 lines: &left_screen_rows,
@@ -2376,7 +2483,7 @@ fn render_ci_queue_logs(
                 title: "Selected CI Job Stage Inspector and Build Log",
                 rect: right_rect,
                 font_family: font.family,
-                font_px: panel.grid.font_px,
+                font_px: split_font_px,
                 cols: right_cols,
                 rows: panel.grid.rows,
                 lines: &right_screen_rows,
@@ -2495,14 +2602,8 @@ fn render_ci_queue_logs(
         }
         if let Some(sel_job) = active_job {
             for (li, line) in sel_job.raw_log_lines.iter().enumerate() {
-                let clean = sanitize_public_log(line);
-                body.push((
-                    format!("LOG[{:>02}]: {clean}", li + 1),
-                    SemanticTone::Neutral,
-                    None,
-                    None,
-                    false,
-                ));
+                let (formatted, tone, _) = format_compact_build_log_line(li, line, None);
+                body.push((formatted, tone, None, None, false));
             }
         }
     } else {
