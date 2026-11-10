@@ -225,6 +225,14 @@ fn find_action_attribute(target: &Element) -> Option<(&'static str, String)> {
         if is_action_root_boundary(&el_id) {
             break;
         }
+        if let Some(val) = el.get_attribute("data-control-id") {
+            if matches!(
+                val.as_str(),
+                "ci-job-detail-screen:prev" | "ci-job-detail-screen:next"
+            ) {
+                return Some(("data-control-id", val));
+            }
+        }
         for attr in ACTION_ATTRS {
             if let Some(val) = el.get_attribute(attr) {
                 return Some((attr, val));
@@ -515,6 +523,17 @@ pub fn start() {
                     } else {
                         st.rotate_outer(delta, now_ms());
                     }
+                } else if target
+                    .closest("[data-control-id='ci-job-detail-screen']")
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    let _ = st.activate_target(if delta < 0 {
+                        "ci-log-page-prev"
+                    } else {
+                        "ci-log-page-next"
+                    });
                 } else {
                     st.step_active_page(delta);
                 }

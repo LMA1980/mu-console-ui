@@ -1197,7 +1197,29 @@ fn render_c5_trainway(
         );
     }
 
-    let max_sidings = trainway_siding_capacity(screen_rect, frames.breakpoint, panel.grid.rows);
+    let has_inspector = rect.h >= 210.0 && screen_rect.h >= 160.0;
+    let inspector_h = if has_inspector { 46.0 } else { 0.0 };
+    let tw_screen_rect = if has_inspector {
+        clamp_rect(
+            Rect::new(
+                screen_rect.x,
+                screen_rect.y,
+                screen_rect.w,
+                (screen_rect.h - inspector_h).max(100.0),
+            ),
+            rect,
+        )
+    } else {
+        screen_rect
+    };
+    let tw_rows = if has_inspector {
+        (((tw_screen_rect.h - 16.0).max(14.0) / panel.grid.row_px.max(14.0)).floor() as usize)
+            .clamp(4, panel.grid.rows)
+    } else {
+        panel.grid.rows
+    };
+
+    let max_sidings = trainway_siding_capacity(tw_screen_rect, frames.breakpoint, tw_rows);
 
     type TrainwayRow = (
         String,
@@ -1510,11 +1532,11 @@ fn render_c5_trainway(
         &Screen {
             control_id: "c5-trainway-screen",
             title: "CI Branch and PR Trainway Screen",
-            rect: screen_rect,
+            rect: tw_screen_rect,
             font_family: font.family,
             font_px: panel.grid.font_px,
             cols: panel.grid.cols,
-            rows: panel.grid.rows,
+            rows: tw_rows,
             lines: &screen_rows,
             stations: &station_labels,
             tracks: &screen_tracks,
@@ -1522,9 +1544,280 @@ fn render_c5_trainway(
             total_pages: total_yard_pages,
         },
     );
+
+    if has_inspector {
+        let insp_rect = clamp_rect(
+            Rect::new(
+                screen_rect.x,
+                tw_screen_rect.bottom() + 4.0,
+                screen_rect.w,
+                inspector_h - 4.0,
+            ),
+            rect,
+        );
+        render_c5_selected_inspector(w, state, insp_rect, font.family);
+    }
 }
 
-/// Render `CI > Queue & Job Logs`: Active CI queue, worker slot occupancy (`max_slots = 1`), and sanitized logs.
+#[allow(clippy::too_many_lines)]
+fn render_c5_selected_inspector(
+    w: &mut SvgWriter,
+    state: &ConsoleState,
+    insp_rect: Rect,
+    font_family: &str,
+) {
+    if insp_rect.w <= 16.0 || insp_rect.h <= 16.0 {
+        return;
+    }
+    let view = state.client.view();
+    let topo = view.and_then(|v| v.topology.as_ref());
+
+    let default_branch = topo
+        .and_then(|t| {
+            t.trains
+                .iter()
+                .find(|tr| tr.ref_name == t.default_branch)
+                .map(|tr| tr.ref_name.as_str())
+                .or_else(|| t.branches.first().map(|b| b.ref_name.as_str()))
+                .or(Some(t.default_branch.as_str()))
+        })
+        .unwrap_or("refs/heads/main");
+    let sel_branch = state.route.branch.as_deref().unwrap_or(default_branch);
+    let short_branch = sel_branch.strip_prefix("refs/heads/").unwrap_or(sel_branch);
+
+    let sel_train = topo.and_then(|t| {
+        t.trains
+            .iter()
+            .find(|tr| crate::state::branch_matches_ref(&tr.ref_name, sel_branch))
+    });
+    let sel_branch_meta = topo.and_then(|t| {
+        t.branches
+            .iter()
+            .find(|b| crate::state::branch_matches_ref(&b.ref_name, sel_branch))
+    });
+    let sel_job = view.and_then(|v| {
+        state
+            .route
+            .job
+            .and_then(|jid| v.ci_jobs.iter().find(|j| j.job_id == jid))
+            .or_else(|| sel_train.and_then(|tr| v.ci_jobs.iter().find(|j| j.job_id == tr.job_id)))
+            .or_else(|| {
+                v.ci_jobs
+                    .iter()
+                    .find(|j| crate::state::branch_matches_ref(&j.ref_name, sel_branch))
+            })
+    });
+
+    let active_job_id = sel_job
+        .map(|j| j.job_id)
+        .or_else(|| sel_train.map(|tr| tr.job_id))
+        .filter(|&id| id > 0);
+    let is_failed = sel_job.is_some_and(|j| {
+        j.queue_state == "Failed" || j.stages.iter().any(|s| s.state == StageState::Failed)
+    }) || sel_train.is_some_and(mu_console_protocol::Train::failed);
+
+    let pr_part =
+        sel_branch_meta.map_or_else(String::new, |bm| format!(" · PR ({:?})", bm.pr_state));
+    let job_part = if let Some(j) = sel_job {
+        let node = j
+            .stages
+            .first()
+            .and_then(|s| s.assigned_node.as_deref())
+            .or_else(|| sel_train.and_then(|tr| tr.node_id.as_deref()))
+            .unwrap_or("node-a");
+        format!(
+            "JOB #{} @{} node:{} cov:{:.1}% tests:{}/{} ({}s)",
+            j.job_id_str,
+            truncate(&j.ref_name, 14),
+            node,
+            f64::from(j.coverage_bp) / 100.0,
+            j.tests_passed,
+            j.tests_total,
+            j.elapsed_secs
+        )
+    } else if let Some(tr) = sel_train {
+        let node = tr.node_id.as_deref().unwrap_or("QUEUE");
+        let st_idx = (tr.stage as usize + 1).min(tr.stage_states.len().max(1));
+        format!(
+            "JOB #{} @{} node:{} stage:{}/{}",
+            format_job_id(tr.job_id),
+            short_branch,
+            node,
+            st_idx,
+            tr.stage_states.len().max(1)
+        )
+    } else {
+        "IDLE / NO ACTIVE RUN".to_owned()
+    };
+
+    let stage_pills_str = if let Some(j) = sel_job.filter(|j| !j.stages.is_empty()) {
+        let parts: Vec<String> = j
+            .stages
+            .iter()
+            .enumerate()
+            .map(|(idx, st)| {
+                let (glyph, _) = stage_glyph_and_tone(st.state);
+                format!("{}:{} {}", idx + 1, st.name, glyph.symbol())
+            })
+            .collect();
+        parts.join("  ")
+    } else if let (Some(t), Some(tr)) = (topo, sel_train) {
+        let parts: Vec<String> = t
+            .stations
+            .iter()
+            .zip(tr.stage_states.iter())
+            .enumerate()
+            .map(|(idx, (st_def, st_state))| {
+                let (glyph, _) = stage_glyph_and_tone(*st_state);
+                format!("{}:{} {}", idx + 1, st_def.label, glyph.symbol())
+            })
+            .collect();
+        parts.join("  ")
+    } else {
+        "1:COMMIT ■  2:BUILD ■  3:UNIT ■  4:INTEGRATION ■  5:DEPLOY ■".to_owned()
+    };
+
+    w.tag("g")
+        .attr("data-control-id", "c5-selected-inspector")
+        .attr("data-bbox-x", insp_rect.x)
+        .attr("data-bbox-y", insp_rect.y)
+        .attr("data-bbox-w", insp_rect.w)
+        .attr("data-bbox-h", insp_rect.h)
+        .attr("role", "region")
+        .attr("aria-label", "Selected Branch and Stage Inspector")
+        .open();
+    w.tag("rect")
+        .attr("class", "wf-panel-inset")
+        .attr("x", insp_rect.x)
+        .attr("y", insp_rect.y)
+        .attr("width", insp_rect.w)
+        .attr("height", insp_rect.h)
+        .attr("rx", 3.0)
+        .attr("fill", "#0c1118")
+        .attr("stroke", if is_failed { "#ff5252" } else { "#2c3e55" })
+        .attr("stroke-width", 1.1)
+        .end();
+
+    let mut action_reserve_w = 0.0_f64;
+    if insp_rect.w >= 520.0 {
+        if let Some(jid) = active_job_id {
+            let trace_id = format!("tr-ci-{}", format_job_id(jid));
+            let mut pills: Vec<(String, String, &str)> = vec![
+                (
+                    format!("ci-job-open:{jid}"),
+                    "[OPEN LOGS ↗]".into(),
+                    "#4cc2ff",
+                ),
+                (
+                    format!("trace:{trace_id}"),
+                    "[PUREPATH ↗]".into(),
+                    "#33f08a",
+                ),
+            ];
+            if is_failed {
+                pills.push((
+                    format!("ci-job-resume:{jid}"),
+                    "[▶ RESUME]".into(),
+                    "#ffb020",
+                ));
+                pills.push((
+                    format!("ci-job-restart:{jid}"),
+                    "[↻ RESTART]".into(),
+                    "#ff5252",
+                ));
+            }
+            let pill_w = 96.0_f64;
+            let pill_h = 16.0_f64.min((insp_rect.h * 0.45).max(12.0));
+            let pill_y = insp_rect.y + 3.0;
+            let mut cur_right = insp_rect.right() - 6.0;
+            for (act_id, lbl, color) in pills.iter().rev() {
+                let px = (cur_right - pill_w).max(insp_rect.x + 8.0);
+                let pr = clamp_rect(Rect::new(px, pill_y, pill_w, pill_h), insp_rect);
+                w.tag("g")
+                    .attr("data-control-id", act_id.as_str())
+                    .attr("data-action", act_id.as_str())
+                    .attr("data-bbox-x", pr.x)
+                    .attr("data-bbox-y", pr.y)
+                    .attr("data-bbox-w", pr.w)
+                    .attr("data-bbox-h", pr.h)
+                    .attr("role", "button")
+                    .open();
+                w.tag("rect")
+                    .attr("x", pr.x)
+                    .attr("y", pr.y)
+                    .attr("width", pr.w)
+                    .attr("height", pr.h)
+                    .attr("rx", 3.0)
+                    .attr("fill", "#152030")
+                    .attr("stroke", *color)
+                    .attr("stroke-width", 1.0)
+                    .end();
+                w.tag("text")
+                    .attr("x", pr.x + pr.w * 0.5)
+                    .attr("y", pr.y + pr.h * 0.5 + 3.5)
+                    .attr("text-anchor", "middle")
+                    .attr("fill", *color)
+                    .attr("font-family", font_family)
+                    .attr("font-size", 10.5)
+                    .attr("font-weight", "bold")
+                    .text(lbl);
+                w.close();
+                cur_right = px - 4.0;
+            }
+            action_reserve_w = (insp_rect.right() - cur_right + 8.0).max(0.0);
+        }
+    }
+
+    let top_avail_cols =
+        (((insp_rect.w - action_reserve_w - 16.0).max(20.0) / 7.2).floor() as usize).max(16);
+    let top_raw = format!("SELECTED TRACK: {short_branch}{pr_part} · {job_part}");
+    let top_txt = truncate(&top_raw, top_avail_cols);
+    w.tag("text")
+        .attr("x", insp_rect.x + 8.0)
+        .attr("y", insp_rect.y + 14.5)
+        .attr("fill", if is_failed { "#ff6b6b" } else { "#e6edf3" })
+        .attr("font-family", font_family)
+        .attr("font-size", 11.5)
+        .attr("font-weight", "bold")
+        .text(&top_txt);
+
+    let bot_avail_cols = (((insp_rect.w - 16.0).max(20.0) / 7.2).floor() as usize).max(16);
+    let bot_txt = truncate(&format!("STAGES: {stage_pills_str}"), bot_avail_cols);
+    let stage_act = active_job_id.map_or_else(
+        || "c5-open-logs".to_owned(),
+        |jid| format!("ci-job-open:{jid}"),
+    );
+    let bot_rect = clamp_rect(
+        Rect::new(
+            insp_rect.x + 4.0,
+            insp_rect.y + 21.0,
+            (insp_rect.w - 8.0).max(16.0),
+            (insp_rect.h - 23.0).max(12.0),
+        ),
+        insp_rect,
+    );
+    w.tag("g")
+        .attr("data-control-id", stage_act.as_str())
+        .attr("data-action", stage_act.as_str())
+        .attr("data-bbox-x", bot_rect.x)
+        .attr("data-bbox-y", bot_rect.y)
+        .attr("data-bbox-w", bot_rect.w)
+        .attr("data-bbox-h", bot_rect.h)
+        .attr("role", "button")
+        .open();
+    w.tag("text")
+        .attr("x", insp_rect.x + 8.0)
+        .attr("y", insp_rect.y + 34.0)
+        .attr("fill", "#79c0ff")
+        .attr("font-family", font_family)
+        .attr("font-size", 11.0)
+        .text(&bot_txt);
+    w.close();
+
+    w.close();
+}
+
+/// Render `CI > Queue & Job Logs`: Split Master–Detail active CI queue, stage selector, and independent log pager.
 #[allow(clippy::too_many_lines)]
 fn render_ci_queue_logs(
     skin: &dyn Skin,
@@ -1542,52 +1835,230 @@ fn render_ci_queue_logs(
         w,
         &Panel {
             id: "ci-queue-logs-panel",
-            title: "CI QUEUE, WORKER SLOTS & SANITIZED JOB LOGS",
+            title: if rect.w < 680.0 {
+                "CI QUEUE & JOB LOGS"
+            } else {
+                "CI QUEUE, WORKER SLOTS & SANITIZED JOB LOGS"
+            },
             rect,
             role: Some("region"),
             aria_label: Some("CI Queue and Job Logs"),
         },
     );
 
-    type QueueRow = (String, SemanticTone, Option<SignalGlyph>, Option<String>);
-    let headers: Vec<QueueRow> = vec![(
-        "INVARIANT: max_slots = 1 per worker :: thread budgets: node-a=2, node-b=6, worker-riscv64=6"
-            .into(),
-        SemanticTone::Info,
-        None,
-        None,
-    )];
-    let mut body: Vec<QueueRow> = Vec::new();
+    if rect.w >= 520.0 {
+        let hdr_y = rect.y + 4.0;
+        let hdr_h = ((screen_rect.y - rect.y) - 8.0).clamp(16.0, 24.0);
+        let right = rect.right() - 6.0;
+        let follow_w = 114.0_f64.min(rect.w * 0.22);
+        let follow_rect = clamp_rect(
+            Rect::new((right - follow_w).max(rect.x), hdr_y, follow_w, hdr_h),
+            rect,
+        );
+        skin.readout(
+            w,
+            &Readout {
+                control_id: "ci-log-follow-toggle",
+                label: "",
+                value: if state.follow_log {
+                    "● FOLLOW ON"
+                } else {
+                    "○ FOLLOW OFF"
+                },
+                rect: follow_rect,
+                tone: if state.follow_log {
+                    SemanticTone::Pass
+                } else {
+                    SemanticTone::Neutral
+                },
+                interactive: true,
+            },
+        );
 
-    let mut follow_active_tail = false;
+        let flt_w = 248.0_f64.min((follow_rect.x - rect.x - 16.0).max(120.0));
+        let flt_rect = clamp_rect(
+            Rect::new(
+                (follow_rect.x - flt_w - 6.0).max(rect.x),
+                hdr_y,
+                flt_w,
+                hdr_h,
+            ),
+            rect,
+        );
+        let flt_opts = [
+            SelectorOption {
+                id: "0",
+                label: "ALL",
+                badge: None,
+                tone: SemanticTone::Info,
+            },
+            SelectorOption {
+                id: "1",
+                label: "ACTIVE",
+                badge: None,
+                tone: SemanticTone::Warn,
+            },
+            SelectorOption {
+                id: "2",
+                label: "FAILED",
+                badge: None,
+                tone: SemanticTone::Fail,
+            },
+            SelectorOption {
+                id: "3",
+                label: "REPO",
+                badge: None,
+                tone: SemanticTone::Pass,
+            },
+        ];
+        skin.selector(
+            w,
+            &Selector {
+                control_id: "ci-queue-filter",
+                label: "CI Queue Filter",
+                rect: flt_rect,
+                action: SwitchAction::Maintained,
+                options: &flt_opts,
+                selected: (state.ci_queue_filter as usize).min(3),
+                pulled: false,
+                horizontal: true,
+            },
+        );
+    }
 
-    if let Some(v) = state.client.view() {
-        if !v.ci_jobs.is_empty() {
-            body.push((
-                "── INTERACTIVE CI JOB QUEUE & STAGE DRILL-DOWN (CLICK JOB TO INSPECT / RESUME / RESTART) ──"
-                    .into(),
+    let filter_label = match state.ci_queue_filter {
+        1 => "ACTIVE",
+        2 => "FAILED",
+        3 => "REPO",
+        _ => "ALL",
+    };
+
+    type QueueRow = (
+        String,
+        SemanticTone,
+        Option<SignalGlyph>,
+        Option<String>,
+        bool,
+    );
+
+    let selected_repo_id = state.route.repo.clone().or_else(|| {
+        let repos = state.filtered_repos();
+        repos.get(state.outer_index).map(|r| r.id.clone())
+    });
+
+    let font = state.font_metrics();
+    let is_split = screen_rect.w >= 760.0;
+
+    if is_split {
+        let left_w = (screen_rect.w * 0.44)
+            .round()
+            .clamp(300.0, (screen_rect.w - 320.0).max(300.0));
+        let left_rect = clamp_rect(
+            Rect::new(screen_rect.x, screen_rect.y, left_w, screen_rect.h),
+            rect,
+        );
+        let right_rect = clamp_rect(
+            Rect::new(
+                screen_rect.x + left_w + 8.0,
+                screen_rect.y,
+                (screen_rect.w - left_w - 8.0).max(280.0),
+                screen_rect.h,
+            ),
+            rect,
+        );
+        let left_cols = (((left_rect.w - 20.0).max(16.0) / panel.grid.column_px.max(7.0)).floor()
+            as usize)
+            .max(16);
+        let right_cols = (((right_rect.w - 20.0).max(16.0) / panel.grid.column_px.max(7.0)).floor()
+            as usize)
+            .max(16);
+
+        let mut left_headers: Vec<QueueRow> = vec![(
+            "INVARIANT: max_slots = 1 per worker :: thread budgets: node-a=2, node-b=6, worker-riscv64=6"
+                .into(),
+            SemanticTone::Info,
+            None,
+            None,
+            false,
+        )];
+        let mut left_rows: Vec<QueueRow> = Vec::new();
+        let mut detail_headers: Vec<QueueRow> = Vec::new();
+        let mut detail_rows: Vec<QueueRow> = Vec::new();
+        let mut selected_job_running = false;
+
+        if let Some(v) = state.client.view() {
+            let filtered_jobs: Vec<&mu_console_protocol::CiJobSummary> = v
+                .ci_jobs
+                .iter()
+                .filter(|job| match state.ci_queue_filter {
+                    1 => {
+                        job.queue_state == "Active"
+                            || job.queue_state == "Queued"
+                            || job.stages.iter().any(|s| {
+                                matches!(s.state, StageState::Running | StageState::Pending)
+                            })
+                    }
+                    2 => {
+                        job.queue_state == "Failed"
+                            || job.stages.iter().any(|s| s.state == StageState::Failed)
+                    }
+                    3 => selected_repo_id.as_ref().is_none_or(|rid| {
+                        job.repo == *rid || job.repo.repo.eq_ignore_ascii_case(&rid.repo)
+                    }),
+                    _ => true,
+                })
+                .collect();
+
+            let running_count = v
+                .ci_jobs
+                .iter()
+                .filter(|j| j.queue_state == "Active")
+                .count();
+            let queued_count = v
+                .ci_jobs
+                .iter()
+                .filter(|j| j.queue_state == "Queued")
+                .count();
+            let total_count = v.ci_jobs.len();
+            let shown_count = filtered_jobs.len();
+
+            left_headers.push((
+                format!(
+                    "INTERACTIVE CI JOB QUEUE · QUEUE FILTER: [{filter_label}] · {running_count} RUNNING · {queued_count} QUEUED · {shown_count}/{total_count} JOBS"
+                ),
                 SemanticTone::Info,
                 None,
-                None,
+                Some("ci-queue-filter".into()),
+                false,
             ));
+
             let active_job = state
                 .route
                 .job
                 .and_then(|id| v.ci_jobs.iter().find(|j| j.job_id == id))
+                .or_else(|| filtered_jobs.first().copied())
                 .or_else(|| {
-                    state
-                        .route
-                        .repo
+                    selected_repo_id
                         .as_ref()
                         .and_then(|r| v.ci_jobs.iter().find(|j| &j.repo == r))
                 })
                 .or_else(|| v.ci_jobs.first());
-            follow_active_tail = state.follow_log
-                && active_job.is_some_and(|j| {
-                    (j.queue_state == "Active" || j.queue_state == "Queued")
-                        && !j.raw_log_lines.is_empty()
-                });
-            for job in &v.ci_jobs {
+
+            selected_job_running =
+                active_job.is_some_and(|j| j.queue_state == "Active" || j.queue_state == "Queued");
+
+            if filtered_jobs.is_empty() {
+                left_rows.push((
+                    format!(
+                        "  (0 jobs match filter [{filter_label}] — click to cycle queue filter)"
+                    ),
+                    SemanticTone::Neutral,
+                    None,
+                    Some("ci-queue-filter".into()),
+                    false,
+                ));
+            }
+            for job in &filtered_jobs {
                 let is_sel = active_job.is_some_and(|a| a.job_id == job.job_id);
                 let (sig, tone) = match job.queue_state.as_str() {
                     "Failed" => (SignalGlyph::BlockFailed, SemanticTone::Fail),
@@ -1595,250 +2066,433 @@ fn render_ci_queue_logs(
                     "Queued" => (SignalGlyph::BlockPending, SemanticTone::Warn),
                     _ => (SignalGlyph::BlockPassed, SemanticTone::Pass),
                 };
-                body.push((
+                left_rows.push((
                     format!(
-                        "{}{:<23} {}/{} @{:<14} [{:<6}] SCORE:{} COV:{:.1}% TESTS:{}/{} {:>3}s",
-                        if is_sel { "▶ " } else { "  " },
+                        "{}{:<10} {}/{} @{:<12} [{:<6}] COV:{:.1}% {:>3}s",
+                        if is_sel { "▸ " } else { "  " },
                         job.job_id_str,
                         job.repo.owner,
                         job.repo.repo,
                         job.ref_name,
                         job.queue_state.to_ascii_uppercase(),
-                        job.quality_score,
                         f64::from(job.coverage_bp) / 100.0,
-                        job.tests_passed,
-                        job.tests_total,
                         job.elapsed_secs
                     ),
                     tone,
                     Some(sig),
                     Some(format!("ci-job:{}", job.job_id)),
+                    is_sel,
                 ));
             }
+
+            if let Some(topo) = v.topology.as_ref() {
+                for tr in &topo.trains {
+                    let st_label = topo
+                        .stations
+                        .get(tr.stage as usize)
+                        .map_or("STAGE", |s| s.label.as_str());
+                    let (sig, tone) = if tr.failed() || tr.node_lost {
+                        (SignalGlyph::BlockFailed, SemanticTone::Fail)
+                    } else if tr.queued() {
+                        (SignalGlyph::BlockPending, SemanticTone::Warn)
+                    } else {
+                        (SignalGlyph::BlockRunning, SemanticTone::Pass)
+                    };
+                    let job_tag = format_job_id(tr.job_id);
+                    left_rows.push((
+                        format!(
+                            "TRAIN #{:<6} {:<16} {:<8} NODE {:<12}",
+                            job_tag,
+                            tr.ref_name,
+                            st_label,
+                            tr.node_id.as_deref().unwrap_or("QUEUED")
+                        ),
+                        tone,
+                        Some(sig),
+                        Some(format!("ci-train:{}", tr.ref_name)),
+                        state.route.branch.as_deref() == Some(tr.ref_name.as_str()),
+                    ));
+                }
+            }
+
             if let Some(sel_job) = active_job {
-                body.push((
+                let banner_action = if sel_job.queue_state == "Failed" {
+                    format!("ci-job-resume:{}", sel_job.job_id)
+                } else {
+                    format!("ci-job-restart:{}", sel_job.job_id)
+                };
+                detail_headers.push((
                     format!(
-                        "── SELECTED JOB DRILL-DOWN [{}] ({}/{} @{}) ──",
-                        sel_job.job_id_str, sel_job.repo.owner, sel_job.repo.repo, sel_job.ref_name
+                        "SELECTED JOB DRILL-DOWN #{} ({}) · {}/{} @{} · [{}]",
+                        sel_job.job_id,
+                        sel_job.job_id_str,
+                        sel_job.repo.owner,
+                        sel_job.repo.repo,
+                        sel_job.ref_name,
+                        sel_job.queue_state.to_ascii_uppercase()
                     ),
                     SemanticTone::Info,
                     None,
-                    None,
+                    Some(banner_action),
+                    true,
                 ));
                 let action_tone = if state.is_operator() {
                     SemanticTone::Pass
                 } else {
                     SemanticTone::Warn
                 };
-                body.push((
+                let trace_tag = format!("tr-ci-{}", format_job_id(sel_job.job_id));
+                detail_headers.push((
                     format!(
-                        "  [▶ RESUME PIPELINE (/api/jobs/{}/resume)] :: RE-RUN FAILED/PENDING STAGES",
-                        sel_job.job_id_str
+                        "  [▶ RESUME PIPELINE (/api/jobs/{}/resume)] · [↻ RESTART ALL (/api/jobs/{}/restart)] · [INSPECT PUREPATH ↗ {trace_tag}]",
+                        sel_job.job_id_str, sel_job.job_id_str
                     ),
                     action_tone,
                     None,
                     Some(format!("ci-job-resume:{}", sel_job.job_id)),
+                    false,
                 ));
-                body.push((
+                detail_headers.push((
                     format!(
-                        "  [↻ RESTART ALL (/api/jobs/{}/restart)] :: FULL PIPELINE RE-EXECUTION",
+                        "  [↻ RESTART ALL (/api/jobs/{}/restart)] :: [INSPECT PUREPATH ↗ {trace_tag}]",
                         sel_job.job_id_str
                     ),
                     action_tone,
                     None,
                     Some(format!("ci-job-restart:{}", sel_job.job_id)),
+                    false,
                 ));
+
+                let max_stage_headers = panel.grid.rows.saturating_sub(6).max(2);
                 for (idx, st) in sel_job.stages.iter().enumerate() {
+                    if detail_headers.len() >= max_stage_headers {
+                        break;
+                    }
                     let (st_sig, st_tone) = stage_glyph_and_tone(st.state);
-                    body.push((
+                    let is_st_sel = state.selected_stage_idx == Some(idx);
+                    let dur_ms = st.duration_secs * 1000;
+                    detail_headers.push((
                         format!(
-                            "  [{}/{}] {:<16} {:<7} NODE:{:<15} THREADS:{} DUR:{:>3}s EXIT:{}",
+                            "  [{}] #{} {:<14} node:{:<13} thr:{} {}ms",
+                            st_sig.symbol(),
                             idx + 1,
-                            sel_job.stages.len(),
                             st.name,
-                            st.state.label(),
                             st.assigned_node.as_deref().unwrap_or("unassigned"),
                             st.threads,
-                            st.duration_secs,
-                            st.exit_code
+                            dur_ms
                         ),
                         st_tone,
                         Some(st_sig),
-                        Some(format!("ci-job:{}", sel_job.job_id)),
+                        Some(format!("ci-stage-select:{idx}")),
+                        is_st_sel,
                     ));
+                    if is_st_sel && detail_headers.len() < max_stage_headers {
+                        detail_headers.push((
+                            format!(
+                                "    ▸ STAGE #{} INSPECTOR: {} · STATE:{} · NODE:{} · THREAD_BUDGET:{} · DURATION:{}ms · EXIT:{}",
+                                idx + 1,
+                                st.name,
+                                st.state.label(),
+                                st.assigned_node.as_deref().unwrap_or("unassigned"),
+                                st.threads,
+                                dur_ms,
+                                st.exit_code
+                            ),
+                            SemanticTone::Info,
+                            None,
+                            Some(format!("ci-stage-select:{idx}")),
+                            true,
+                        ));
+                    }
                 }
-                body.push((
+
+                detail_headers.push((
                     format!(
-                        "── RAW BUILD LOG (/api/jobs/{}/log · FOLLOW:{}) ──",
-                        sel_job.job_id_str,
+                        "── BUILD LOG ({} LINES) · FOLLOW: {} ──",
+                        sel_job.raw_log_lines.len(),
                         if state.follow_log { "ON" } else { "OFF" }
                     ),
                     SemanticTone::Info,
                     None,
                     Some("ci-log-follow-toggle".into()),
+                    false,
                 ));
+
                 if !sel_job.raw_log_lines.is_empty() {
                     for (li, line) in sel_job.raw_log_lines.iter().enumerate() {
-                        body.push((
-                            format!("  LOG[{:>02}]: {line}", li + 1),
+                        let clean = sanitize_public_log(line);
+                        detail_rows.push((
+                            format!("  LOG[{:>02}]: {clean}", li + 1),
                             SemanticTone::Neutral,
                             None,
                             None,
+                            false,
                         ));
                     }
-                } else if !state.is_operator() {
-                    body.push((
-                        "  (raw build log requires Operator session — click READ-ONLY · SIGN IN to authenticate)"
-                            .into(),
-                        SemanticTone::Warn,
-                        None,
-                        Some("c2-auth-status".into()),
-                    ));
                 } else {
-                    body.push((
-                        format!(
-                            "  (click job {} above to fetch /api/jobs/{}/log)",
-                            sel_job.job_id_str, sel_job.job_id_str
-                        ),
-                        SemanticTone::Neutral,
-                        None,
-                        Some(format!("ci-job:{}", sel_job.job_id)),
-                    ));
-                }
-            }
-        }
-        if let Some(topo) = v.topology.as_ref() {
-            for tr in &topo.trains {
-                let st_label = topo
-                    .stations
-                    .get(tr.stage as usize)
-                    .map_or("STAGE", |s| s.label.as_str());
-                let (sig, tone) = if tr.failed() || tr.node_lost {
-                    (SignalGlyph::BlockFailed, SemanticTone::Fail)
-                } else if tr.queued() {
-                    (SignalGlyph::BlockPending, SemanticTone::Warn)
-                } else {
-                    (SignalGlyph::BlockRunning, SemanticTone::Pass)
-                };
-                let job_tag = format_job_id(tr.job_id);
-                let tr_trace_id = {
-                    let candidate = format!("tr-ci-{job_tag}");
-                    if v.observe.traces.iter().any(|t| t.trace_id == candidate) {
-                        candidate
+                    if !state.is_operator() {
+                        detail_rows.push((
+                            "  (raw build log requires Operator session — click READ-ONLY · SIGN IN to authenticate)"
+                                .into(),
+                            SemanticTone::Warn,
+                            None,
+                            Some("c2-auth-status".into()),
+                            false,
+                        ));
                     } else {
-                        v.observe
-                            .traces
-                            .iter()
-                            .find(|t| t.domain == "CI")
-                            .map_or_else(|| "tr-ci-1234".into(), |t| t.trace_id.clone())
+                        detail_rows.push((
+                            format!(
+                                "  (click job {} to fetch /api/jobs/{}/log — fallback stage telemetry below)",
+                                sel_job.job_id_str, sel_job.job_id_str
+                            ),
+                            SemanticTone::Neutral,
+                            None,
+                            Some(format!("ci-job:{}", sel_job.job_id)),
+                            false,
+                        ));
                     }
-                };
-                body.push((
-                    format!(
-                        "JOB #{:<8} REF {:<18} STAGE {:<8} NODE {:<15} [TRACE ↗ {tr_trace_id}]",
-                        job_tag,
-                        tr.ref_name,
-                        st_label,
-                        tr.node_id.as_deref().unwrap_or("QUEUED")
-                    ),
-                    tone,
-                    Some(sig),
-                    Some(format!("trace:{tr_trace_id}")),
-                ));
-                if !topo.stations.is_empty() && !tr.stage_states.is_empty() {
-                    let breakdown: Vec<String> = topo
-                        .stations
-                        .iter()
-                        .zip(tr.stage_states.iter())
-                        .map(|(st, state_enum)| {
-                            let (glyph, _) = stage_glyph_and_tone(*state_enum);
-                            format!("{} {}", st.label, glyph.symbol())
-                        })
-                        .collect();
-                    body.push((
-                        format!("  └─ PIPELINE: {}", breakdown.join(" · ")),
-                        SemanticTone::Info,
-                        None,
-                        Some(format!("c5-track-{}", tr.ref_name)),
-                    ));
+                    for log in &v.observe.logs {
+                        let tone = match log.severity {
+                            LogSeverity::Error => SemanticTone::Fail,
+                            LogSeverity::Warn => SemanticTone::Warn,
+                            LogSeverity::Info => SemanticTone::Neutral,
+                        };
+                        let clean = sanitize_public_log(&log.message);
+                        detail_rows.push((
+                            format!(
+                                "[{}] {:<14} {} [TRACE ↗ {}]",
+                                log.severity.label(),
+                                log.service,
+                                clean,
+                                log.trace_id
+                            ),
+                            tone,
+                            None,
+                            Some(format!("trace:{}", log.trace_id)),
+                            false,
+                        ));
+                    }
                 }
-            }
-        }
-        let live_ci_traces: Vec<_> = v
-            .observe
-            .traces
-            .iter()
-            .filter(|t| {
-                t.domain == "CI" && t.trace_id != "tr-ci-1234" && t.trace_id != "tr-obs-p99-07"
-            })
-            .take(10)
-            .collect();
-        if !live_ci_traces.is_empty() {
-            body.push((
-                "── CLUSTER-WIDE CI QUEUE LEDGER (/api/queue) ──".into(),
-                SemanticTone::Info,
-                None,
-                None,
-            ));
-            for tr in live_ci_traces {
-                let tone = if tr.error {
-                    SemanticTone::Fail
-                } else {
-                    SemanticTone::Pass
-                };
-                let sig = if tr.error {
-                    SignalGlyph::BlockFailed
-                } else {
-                    SignalGlyph::BlockPassed
-                };
-                body.push((
-                    format!(
-                        "{:<14} {:<42} {:>6}ms ({} stages) [TRACE ↗ {}]",
-                        tr.trace_id,
-                        tr.root_operation,
-                        tr.duration_ms,
-                        tr.spans.len(),
-                        tr.trace_id
-                    ),
-                    tone,
-                    Some(sig),
-                    Some(format!("trace:{}", tr.trace_id)),
+            } else {
+                detail_headers.push((
+                    "NO SELECTED CI JOB IN QUEUE".into(),
+                    SemanticTone::Neutral,
+                    None,
+                    None,
+                    false,
                 ));
             }
-        }
-        body.push((
-            "── SANITIZED STAGE LOG STREAM (PUBLIC PRIVACY BOUNDARY ENFORCED) ──".into(),
-            SemanticTone::Info,
-            None,
-            None,
-        ));
-        if v.observe.logs.is_empty() {
-            body.push((
-                "  (no stage log events in active buffer — pipeline status shown above)".into(),
+        } else {
+            left_rows.push((
+                "AWAITING CI QUEUE STREAM…".into(),
                 SemanticTone::Neutral,
                 None,
                 None,
+                false,
+            ));
+            detail_rows.push((
+                "AWAITING JOB DETAIL & LOG STREAM…".into(),
+                SemanticTone::Neutral,
+                None,
+                None,
+                false,
             ));
         }
-        for log in &v.observe.logs {
-            let tone = match log.severity {
-                LogSeverity::Error => SemanticTone::Fail,
-                LogSeverity::Warn => SemanticTone::Warn,
-                LogSeverity::Info => SemanticTone::Neutral,
+
+        let (left_paged, left_page, left_total_pages) =
+            paginate_with_headers(left_headers, left_rows, panel.grid.rows, state.subview_page);
+        let left_screen_rows: Vec<ScreenRow<'_>> = left_paged
+            .iter()
+            .map(|(txt, tone, sig, cid, sel)| ScreenRow {
+                text: txt.as_str(),
+                tone: *tone,
+                signal: *sig,
+                critical: false,
+                control_id: cid.as_deref(),
+                selected: *sel,
+            })
+            .collect();
+
+        skin.screen(
+            w,
+            &Screen {
+                control_id: "ci-queue-logs-screen",
+                title: "CI Queue and Worker Slots",
+                rect: left_rect,
+                font_family: font.family,
+                font_px: panel.grid.font_px,
+                cols: left_cols,
+                rows: panel.grid.rows,
+                lines: &left_screen_rows,
+                stations: &[],
+                tracks: &[],
+                page: left_page,
+                total_pages: left_total_pages,
+            },
+        );
+
+        let avail_log_rows = panel.grid.rows.saturating_sub(detail_headers.len()).max(1);
+        let total_log_pages =
+            u32::try_from(detail_rows.len().div_ceil(avail_log_rows).max(1)).unwrap_or(1);
+        let effective_log_page =
+            if state.follow_log && (selected_job_running || state.log_page == u32::MAX) {
+                total_log_pages.saturating_sub(1)
+            } else {
+                state.log_page.min(total_log_pages.saturating_sub(1))
             };
-            let clean = sanitize_public_log(&log.message);
+        let (right_paged, right_page, right_total_pages) = paginate_with_headers(
+            detail_headers,
+            detail_rows,
+            panel.grid.rows,
+            effective_log_page,
+        );
+        let right_screen_rows: Vec<ScreenRow<'_>> = right_paged
+            .iter()
+            .map(|(txt, tone, sig, cid, sel)| ScreenRow {
+                text: txt.as_str(),
+                tone: *tone,
+                signal: *sig,
+                critical: false,
+                control_id: cid.as_deref(),
+                selected: *sel,
+            })
+            .collect();
+
+        skin.screen(
+            w,
+            &Screen {
+                control_id: "ci-job-detail-screen",
+                title: "Selected CI Job Stage Inspector and Build Log",
+                rect: right_rect,
+                font_family: font.family,
+                font_px: panel.grid.font_px,
+                cols: right_cols,
+                rows: panel.grid.rows,
+                lines: &right_screen_rows,
+                stations: &[],
+                tracks: &[],
+                page: right_page,
+                total_pages: right_total_pages,
+            },
+        );
+        return;
+    }
+
+    // Compact / mobile viewport (`screen_rect.w < 760.0`): single screen with pinned job headers.
+    let mut headers: Vec<QueueRow> = vec![(
+        format!("QUEUE FILTER: [{filter_label}] · max_slots = 1"),
+        SemanticTone::Info,
+        None,
+        Some("ci-queue-filter".into()),
+        false,
+    )];
+    let mut body: Vec<QueueRow> = Vec::new();
+    let max_headers = (panel.grid.rows / 2).max(2);
+
+    if let Some(v) = state.client.view() {
+        let filtered_jobs: Vec<&mu_console_protocol::CiJobSummary> = v
+            .ci_jobs
+            .iter()
+            .filter(|job| match state.ci_queue_filter {
+                1 => job.queue_state == "Active" || job.queue_state == "Queued",
+                2 => job.queue_state == "Failed",
+                3 => selected_repo_id.as_ref().is_none_or(|rid| job.repo == *rid),
+                _ => true,
+            })
+            .collect();
+        let active_job = state
+            .route
+            .job
+            .and_then(|id| v.ci_jobs.iter().find(|j| j.job_id == id))
+            .or_else(|| filtered_jobs.first().copied())
+            .or_else(|| v.ci_jobs.first());
+
+        if let Some(sel_job) = active_job {
+            if headers.len() < max_headers {
+                headers.push((
+                    format!(
+                        "SELECTED JOB #{} ({}) {}/{} @{} [{}]",
+                        sel_job.job_id,
+                        sel_job.job_id_str,
+                        sel_job.repo.owner,
+                        sel_job.repo.repo,
+                        sel_job.ref_name,
+                        sel_job.queue_state.to_ascii_uppercase()
+                    ),
+                    SemanticTone::Info,
+                    None,
+                    Some(format!("ci-job:{}", sel_job.job_id)),
+                    true,
+                ));
+            }
+            if headers.len() < max_headers {
+                headers.push((
+                    format!("[▶ RESUME] [↻ RESTART] #{}", sel_job.job_id_str),
+                    SemanticTone::Pass,
+                    None,
+                    Some(format!("ci-job-resume:{}", sel_job.job_id)),
+                    false,
+                ));
+            }
+            if headers.len() < max_headers && !sel_job.stages.is_empty() {
+                let st_summary: Vec<String> = sel_job
+                    .stages
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, s)| {
+                        format!(
+                            "#{}:{} {}",
+                            idx + 1,
+                            s.name,
+                            stage_glyph_and_tone(s.state).0.symbol()
+                        )
+                    })
+                    .collect();
+                headers.push((
+                    format!("STAGES: {}", st_summary.join(" ")),
+                    SemanticTone::Info,
+                    None,
+                    Some("ci-stage-select:0".into()),
+                    false,
+                ));
+            }
+        }
+
+        for job in &filtered_jobs {
+            let is_sel = active_job.is_some_and(|a| a.job_id == job.job_id);
+            let (sig, tone) = match job.queue_state.as_str() {
+                "Failed" => (SignalGlyph::BlockFailed, SemanticTone::Fail),
+                "Active" => (SignalGlyph::BlockRunning, SemanticTone::Warn),
+                "Queued" => (SignalGlyph::BlockPending, SemanticTone::Warn),
+                _ => (SignalGlyph::BlockPassed, SemanticTone::Pass),
+            };
             body.push((
                 format!(
-                    "[{}] {:<16} {} [TRACE ↗ {}]",
-                    log.severity.label(),
-                    log.service,
-                    clean,
-                    log.trace_id
+                    "{}{} {}/{} @{} [{}]",
+                    if is_sel { "▸ " } else { "  " },
+                    job.job_id_str,
+                    job.repo.owner,
+                    job.repo.repo,
+                    job.ref_name,
+                    job.queue_state.to_ascii_uppercase()
                 ),
                 tone,
-                None,
-                Some(format!("trace:{}", log.trace_id)),
+                Some(sig),
+                Some(format!("ci-job:{}", job.job_id)),
+                is_sel,
             ));
+        }
+        if let Some(sel_job) = active_job {
+            for (li, line) in sel_job.raw_log_lines.iter().enumerate() {
+                let clean = sanitize_public_log(line);
+                body.push((
+                    format!("LOG[{:>02}]: {clean}", li + 1),
+                    SemanticTone::Neutral,
+                    None,
+                    None,
+                    false,
+                ));
+            }
         }
     } else {
         body.push((
@@ -1846,29 +2500,24 @@ fn render_ci_queue_logs(
             SemanticTone::Neutral,
             None,
             None,
+            false,
         ));
     }
 
-    let effective_page = if follow_active_tail {
-        u32::MAX
-    } else {
-        state.subview_page
-    };
     let (rows, page, total_pages) =
-        paginate_with_headers(headers, body, panel.grid.rows, effective_page);
+        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
-        .map(|(txt, tone, sig, cid)| ScreenRow {
+        .map(|(txt, tone, sig, cid, sel)| ScreenRow {
             text: txt.as_str(),
             tone: *tone,
             signal: *sig,
             critical: false,
             control_id: cid.as_deref(),
-            selected: false,
+            selected: *sel,
         })
         .collect();
 
-    let font = state.font_metrics();
     skin.screen(
         w,
         &Screen {
@@ -1950,6 +2599,45 @@ fn render_c6_delivery_gate(
         },
     );
 
+    if rect.w >= 560.0 {
+        if let Some(v) = view.filter(|v| !v.history.is_empty()) {
+            let strip_right = (junc_rect.x - 6.0).max(rect.x + 8.0);
+            let pill_w = 88.0_f64;
+            let mut cur_right = strip_right;
+            for (hi, hg) in v.history.iter().enumerate().take(3).rev() {
+                let px = (cur_right - pill_w).max(rect.x + 8.0);
+                if px + pill_w > strip_right + 1.0 {
+                    break;
+                }
+                let pr = clamp_rect(Rect::new(px, hdr_y, pill_w, hdr_h), rect);
+                let cid = format!("c6-history:{hi}");
+                let sym = match hg.outcome {
+                    GateOutcome::Promoted => "■",
+                    GateOutcome::Pending => "▢",
+                    GateOutcome::RolledBack | GateOutcome::Tainted => "✕",
+                };
+                let is_sel = state.selected_history_idx == hi + 1;
+                let lbl = format!("{}{sym}", hg.deployment_id);
+                skin.readout(
+                    w,
+                    &Readout {
+                        control_id: &cid,
+                        label: "",
+                        value: &lbl,
+                        rect: pr,
+                        tone: if is_sel {
+                            SemanticTone::Info
+                        } else {
+                            SemanticTone::Neutral
+                        },
+                        interactive: true,
+                    },
+                );
+                cur_right = px - 4.0;
+            }
+        }
+    }
+
     type GateRowData = (
         String,
         SemanticTone,
@@ -1966,7 +2654,7 @@ fn render_c6_delivery_gate(
             state
                 .selected_history_idx
                 .checked_sub(1)
-                .and_then(|hi| v.history.get(hi))
+                .and_then(|hi| v.history.get(hi).map(|hs| (hi, hs)))
         });
         let ttl_secs = view
             .and_then(|v| {
@@ -1993,7 +2681,7 @@ fn render_c6_delivery_gate(
             })
             .unwrap_or_else(|| "tr-cd-0042".into());
         let short_cd_tid: String = cd_trace_id.chars().take(12).collect();
-        let hdr = if let Some(hs) = active_summary {
+        let hdr = if let Some((_, hs)) = active_summary {
             format!(
                 "REPLAY {} · {} · IT {}/{} · {:?}",
                 hs.deployment_id, hs.artifact_digest, hs.it_passed, hs.it_total, hs.outcome
@@ -2017,6 +2705,22 @@ fn render_c6_delivery_gate(
             Some(format!("trace:{cd_trace_id}")),
             false,
         ));
+        if let Some((hi, hs)) = active_summary {
+            rows_data.push((
+                format!(
+                    "SELECTED HISTORY #{}: {} · commit @{} · verdict: {:?}",
+                    hi + 1,
+                    hs.deployment_id,
+                    hs.artifact_digest,
+                    hs.outcome
+                ),
+                SemanticTone::Info,
+                None,
+                false,
+                Some(format!("c6-history:{hi}")),
+                true,
+            ));
+        }
 
         let passed_it = g
             .tests
@@ -2181,7 +2885,7 @@ fn render_c6_delivery_gate(
                 ));
             }
         }
-    } else if view.is_some_and(|v| !v.repos.is_empty()) {
+    } else if let Some(v) = view.filter(|v| !v.repos.is_empty()) {
         let repo_label = state.route.repo.as_ref().map_or_else(
             || "SELECTED REPO".into(),
             |r| format!("{}/{}", r.owner, r.repo),
@@ -2210,6 +2914,50 @@ fn render_c6_delivery_gate(
             None,
             false,
         ));
+        let filtered_repos = state.filtered_repos();
+        for (repo_idx, r) in filtered_repos.iter().enumerate() {
+            if let Some(cd) = r.cd.as_ref() {
+                let tone = match cd.outcome {
+                    GateOutcome::Promoted => SemanticTone::Pass,
+                    GateOutcome::Pending => SemanticTone::Warn,
+                    GateOutcome::RolledBack | GateOutcome::Tainted => SemanticTone::Fail,
+                };
+                rows_data.push((
+                    format!(
+                        "  ▸ CLUSTER GATE: {}/{} · DEPLOY {} · SLOT {:?} · IT {}/{} · {:?}",
+                        r.id.owner,
+                        r.id.repo,
+                        cd.deployment_id,
+                        cd.active_slot,
+                        cd.it_passed,
+                        cd.it_total,
+                        cd.outcome
+                    ),
+                    tone,
+                    Some(SignalGlyph::BlockPassed),
+                    false,
+                    Some(format!("repo-select:{repo_idx}")),
+                    false,
+                ));
+            }
+        }
+        for c in &v.registry.canaries {
+            rows_data.push((
+                format!(
+                    "  ▸ CANARY GATE: {} ({}) · {}/{} · {} [OPEN GATE ↗]",
+                    c.bundle_id,
+                    c.deployment_id,
+                    c.repo.owner,
+                    c.repo.repo,
+                    c.state.label()
+                ),
+                SemanticTone::Info,
+                None,
+                false,
+                Some(format!("gate:{}", c.bundle_id)),
+                false,
+            ));
+        }
     } else {
         rows_data.push((
             "AWAITING DELIVERY GATE STREAM…".into(),
@@ -2974,12 +3722,77 @@ fn render_obs_smartscape(
         w,
         &Panel {
             id: "obs-smartscape-panel",
-            title: "MUOBSERVE SMARTSCAPE 3-TIER VERTICAL TOPOLOGY (SERVICES -> PROCESSES -> HOSTS)",
+            title: if rect.w < 680.0 {
+                "MUOBSERVE SMARTSCAPE TOPOLOGY"
+            } else {
+                "MUOBSERVE SMARTSCAPE 3-TIER VERTICAL TOPOLOGY (SERVICES -> PROCESSES -> HOSTS)"
+            },
             rect,
             role: Some("region"),
             aria_label: Some("MuObserve Smartscape Topology"),
         },
     );
+
+    if rect.w >= 560.0 {
+        let hdr_y = rect.y + 4.0;
+        let hdr_h = ((screen_rect.y - rect.y) - 8.0).clamp(16.0, 24.0);
+        let flt_w = 320.0_f64.min(rect.w * 0.48);
+        let flt_rect = clamp_rect(
+            Rect::new(
+                (rect.right() - flt_w - 6.0).max(rect.x),
+                hdr_y,
+                flt_w,
+                hdr_h,
+            ),
+            rect,
+        );
+        let flt_opts = [
+            SelectorOption {
+                id: "0",
+                label: "ALL",
+                badge: None,
+                tone: SemanticTone::Info,
+            },
+            SelectorOption {
+                id: "1",
+                label: "SERVICES",
+                badge: None,
+                tone: SemanticTone::Pass,
+            },
+            SelectorOption {
+                id: "2",
+                label: "PROCESSES",
+                badge: None,
+                tone: SemanticTone::Info,
+            },
+            SelectorOption {
+                id: "3",
+                label: "HOSTS",
+                badge: None,
+                tone: SemanticTone::Warn,
+            },
+        ];
+        skin.selector(
+            w,
+            &Selector {
+                control_id: "obs-smartscape-filter",
+                label: "Smartscape Layer Filter",
+                rect: flt_rect,
+                action: SwitchAction::Maintained,
+                options: &flt_opts,
+                selected: (state.obs_smartscape_filter as usize).min(3),
+                pulled: false,
+                horizontal: true,
+            },
+        );
+    }
+
+    let filter_label = match state.obs_smartscape_filter {
+        1 => "SERVICES",
+        2 => "PROCESSES",
+        3 => "HOSTS",
+        _ => "ALL",
+    };
 
     type OwnedRow = (
         String,
@@ -2988,6 +3801,15 @@ fn render_obs_smartscape(
         Option<String>,
         bool,
     );
+    let headers: Vec<OwnedRow> = vec![(
+        format!(
+            "LAYER FILTER: [{filter_label}] :: [ALL / SERVICES / PROCESSES / HOSTS] (CLICK TO CYCLE)"
+        ),
+        SemanticTone::Info,
+        None,
+        Some("obs-smartscape-filter".into()),
+        false,
+    )];
     let mut body: Vec<OwnedRow> = Vec::new();
     if let Some(v) = state.client.view() {
         for layer in [
@@ -2995,6 +3817,15 @@ fn render_obs_smartscape(
             SmartscapeLayer::Process,
             SmartscapeLayer::Host,
         ] {
+            let include_layer = match state.obs_smartscape_filter {
+                1 => layer == SmartscapeLayer::Service,
+                2 => layer == SmartscapeLayer::Process,
+                3 => layer == SmartscapeLayer::Host,
+                _ => true,
+            };
+            if !include_layer {
+                continue;
+            }
             body.push((
                 format!("── LAYER: {} ──", layer.label()),
                 SemanticTone::Info,
@@ -3073,7 +3904,7 @@ fn render_obs_smartscape(
     }
 
     let (rows, page, total_pages) =
-        paginate_with_headers(Vec::new(), body, panel.grid.rows, state.subview_page);
+        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, cid, sel)| ScreenRow {
@@ -3693,7 +4524,7 @@ fn render_obs_logs(
 }
 
 /// Render `OBS > Metrics`: Golden-signal SVG time-series charts + SpacemiT K3 (`X100` vs `A100`) benchmarks.
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn render_obs_metrics(
     skin: &dyn Skin,
     w: &mut SvgWriter,
@@ -3717,12 +4548,32 @@ fn render_obs_metrics(
         },
     );
 
-    let mut rows: Vec<(String, SemanticTone, Option<String>)> = Vec::new();
+    type MetricRow = (String, SemanticTone, Option<String>, bool);
+    let mut headers: Vec<MetricRow> = Vec::new();
+    let mut rows: Vec<MetricRow> = Vec::new();
+    let mut selected_idx = 0_usize;
+
     if let Some(v) = state.client.view() {
-        for m in &v.observe.metrics {
+        selected_idx = state
+            .selected_metric_idx
+            .min(v.observe.metrics.len().saturating_sub(1));
+        if let Some(sel_m) = v.observe.metrics.get(selected_idx) {
+            headers.push((
+                format!(
+                    "PLOTTED SERIES: {} [{}] · CLICK ANY SERIES ROW TO UPDATE SPARKLINE",
+                    sel_m.service, sel_m.hardware_class
+                ),
+                SemanticTone::Info,
+                Some(format!("obs-metric:{selected_idx}")),
+                true,
+            ));
+        }
+        for (idx, m) in v.observe.metrics.iter().enumerate() {
+            let is_sel = idx == selected_idx;
             rows.push((
                 format!(
-                    "{:<18} [{}] RPS:{:>3} p50:{:>2}ms p95:{:>2}ms p99:{:>2}ms [TRACE ↗ {}]",
+                    "{}{:<18} [{}] RPS:{:>3} p50:{:>2}ms p95:{:>2}ms p99:{:>2}ms [TRACE ↗ {}]",
+                    if is_sel { "▸ " } else { "  " },
                     m.service,
                     m.hardware_class,
                     m.rps,
@@ -3732,13 +4583,19 @@ fn render_obs_metrics(
                     m.exemplar_trace_id
                 ),
                 SemanticTone::Pass,
-                Some(format!("trace:{}", m.exemplar_trace_id)),
+                Some(format!("obs-metric:{idx}")),
+                is_sel,
             ));
             let samples_str: Vec<String> = m.samples.iter().map(u32::to_string).collect();
             rows.push((
-                format!("  └─ SERIES SAMPLES: [{}]", samples_str.join(", ")),
+                format!(
+                    "  └─ SERIES SAMPLES: [{}] · [TRACE ↗ {}]",
+                    samples_str.join(", "),
+                    m.exemplar_trace_id
+                ),
                 SemanticTone::Info,
                 Some(format!("trace:{}", m.exemplar_trace_id)),
+                false,
             ));
         }
         if rows.is_empty() {
@@ -3746,19 +4603,22 @@ fn render_obs_metrics(
                 "0 GOLDEN-SIGNAL OR HARDWARE BENCHMARK SERIES IN MUOBSERVE".into(),
                 SemanticTone::Neutral,
                 None,
+                false,
             ));
         }
     }
 
-    let screen_rows: Vec<ScreenRow<'_>> = rows
+    let (paged_rows, page, total_pages) =
+        paginate_with_headers(headers, rows, panel.grid.rows, state.subview_page);
+    let screen_rows: Vec<ScreenRow<'_>> = paged_rows
         .iter()
-        .map(|(txt, tone, cid)| ScreenRow {
+        .map(|(txt, tone, cid, sel)| ScreenRow {
             text: txt.as_str(),
             tone: *tone,
             signal: Some(SignalGlyph::BlockPassed),
             critical: false,
             control_id: cid.as_deref(),
-            selected: false,
+            selected: *sel,
         })
         .collect();
 
@@ -3776,26 +4636,41 @@ fn render_obs_metrics(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 
-    // Also emit an SVG polyline sparkline inside the bottom of `screen_rect` when space permits.
+    // Emit an SVG polyline sparkline for the selected metric series inside the bottom of `screen_rect` when space permits.
     if screen_rect.h >= 180.0 {
         if let Some(v) = state.client.view() {
-            if let Some(first) = v.observe.metrics.first() {
-                if first.samples.len() >= 2 {
+            if let Some(sel_m) = v.observe.metrics.get(selected_idx) {
+                if sel_m.samples.len() >= 2 {
                     let chart_w = (screen_rect.w - 32.0).max(40.0);
                     let chart_h = 36.0;
                     let chart_x = screen_rect.x + 16.0;
                     let chart_y = screen_rect.bottom() - chart_h - 12.0;
-                    let min_v = f64::from(*first.samples.iter().min().unwrap_or(&0));
+                    let lbl = truncate(
+                        &format!(
+                            "PLOTTED SERIES: {} [{}]",
+                            sel_m.service, sel_m.hardware_class
+                        ),
+                        panel.grid.cols,
+                    );
+                    w.tag("text")
+                        .attr("x", chart_x)
+                        .attr("y", (chart_y - 4.0).max(screen_rect.y + 12.0))
+                        .attr("fill", "#33f08a")
+                        .attr("font-family", font.family)
+                        .attr("font-size", 11.0)
+                        .attr("font-weight", "bold")
+                        .text(&lbl);
+                    let min_v = f64::from(*sel_m.samples.iter().min().unwrap_or(&0));
                     let max_v =
-                        f64::from(*first.samples.iter().max().unwrap_or(&1)).max(min_v + 1.0);
+                        f64::from(*sel_m.samples.iter().max().unwrap_or(&1)).max(min_v + 1.0);
                     let mut path = PathData::new();
-                    for (i, &val) in first.samples.iter().enumerate() {
-                        let px = chart_x + (i as f64 / (first.samples.len() - 1) as f64) * chart_w;
+                    for (i, &val) in sel_m.samples.iter().enumerate() {
+                        let px = chart_x + (i as f64 / (sel_m.samples.len() - 1) as f64) * chart_w;
                         let norm = (f64::from(val) - min_v) / (max_v - min_v);
                         let py = chart_y + chart_h - norm * chart_h;
                         if i == 0 {
@@ -3809,7 +4684,7 @@ fn render_obs_metrics(
                         .attr("fill", "none")
                         .attr("stroke", "#33f08a")
                         .attr("stroke-width", 1.8)
-                        .attr("data-metric-sparkline", first.service.as_str())
+                        .attr("data-metric-sparkline", sel_m.service.as_str())
                         .end();
                 }
             }
@@ -4142,6 +5017,7 @@ fn render_fleet_worker_nodes(
 }
 
 /// Render `FLT > Sandbox Profiles`: Declarative `MuIsolation` profiles (`KernelSandbox` & `HypervisorSandbox`).
+#[allow(clippy::too_many_lines)]
 fn render_fleet_sandbox_profiles(
     skin: &dyn Skin,
     w: &mut SvgWriter,
@@ -4165,16 +5041,27 @@ fn render_fleet_sandbox_profiles(
         },
     );
 
-    let mut lines_owned: Vec<(String, SemanticTone)> = Vec::new();
-    lines_owned.push((
+    type SbRow = (String, SemanticTone, Option<String>, bool);
+    let headers: Vec<SbRow> = vec![(
         "MONOTONIC SECURITY ATTENUATION: WORKFLOW OVERRIDES MAY ONLY TIGHTEN HOST CEILINGS".into(),
         SemanticTone::Info,
-    ));
+        None,
+        false,
+    )];
+    let mut body: Vec<SbRow> = Vec::new();
     if let Some(v) = state.client.view() {
-        for sb in &v.sandboxes {
-            lines_owned.push((
+        let total_items = v.sandboxes.len().max(v.nodes.len()).max(1);
+        let active_idx = state
+            .selected_sandbox_idx
+            .unwrap_or(0)
+            .min(total_items.saturating_sub(1));
+
+        for (idx, sb) in v.sandboxes.iter().enumerate() {
+            let is_sel = idx == active_idx;
+            body.push((
                 format!(
-                    "{:<28} BACKEND: {:<30} max_pids={} slots={} threads={} [{}]",
+                    "{}{:<26} BACKEND: {:<30} max_pids={} slots={} threads={} [{}]",
+                    if is_sel { "▸ " } else { "  " },
                     sb.profile_name,
                     sb.backend,
                     sb.max_pids,
@@ -4183,19 +5070,108 @@ fn render_fleet_sandbox_profiles(
                     sb.hardware_target
                 ),
                 SemanticTone::Pass,
+                Some(format!("flt-sandbox:{idx}")),
+                is_sel,
             ));
         }
+        if v.sandboxes.is_empty() {
+            for (idx, node) in v.nodes.iter().enumerate() {
+                let is_sel = idx == active_idx;
+                body.push((
+                    format!(
+                        "{}{:<26} BACKEND: KernelSandbox (Landlock + cgroupv2) max_pids=256 slots=1 [{}]",
+                        if is_sel { "▸ " } else { "  " },
+                        node.id,
+                        if node.arch.is_empty() { "x86_64" } else { node.arch.as_str() }
+                    ),
+                    SemanticTone::Pass,
+                    Some(format!("flt-sandbox:{idx}")),
+                    is_sel,
+                ));
+            }
+        }
+
+        let sel_sb = v.sandboxes.get(active_idx).or_else(|| v.sandboxes.first());
+        let sel_node = v.nodes.get(active_idx).or_else(|| v.nodes.first());
+        let target_label = sel_sb
+            .map(|s| s.profile_name.as_str())
+            .or_else(|| sel_node.map(|n| n.id.as_str()))
+            .unwrap_or("default-worker");
+        let is_kvm =
+            sel_sb.is_some_and(|s| s.backend.contains("Hypervisor") || s.backend.contains("kvm"));
+        let is_riscv = sel_sb.is_some_and(|s| {
+            let ht = s.hardware_target.to_ascii_lowercase();
+            let pn = s.profile_name.to_ascii_lowercase();
+            ht.contains("riscv64")
+                || ht.contains("rvv")
+                || ht.contains("a100")
+                || ht.contains("k3")
+                || pn.contains("riscv64")
+                || pn.contains("a100")
+        }) || sel_node.is_some_and(|n| {
+            n.arch.contains("riscv64")
+                || n.id.contains("riscv64")
+                || n.tags
+                    .iter()
+                    .any(|t| t.contains("rvv") || t.contains("A100") || t.contains("a100"))
+        });
+
+        body.push((
+            format!("── MUISOLATION SECURITY & HARDWARE INVARIANT INSPECTOR [{target_label}] ──"),
+            SemanticTone::Info,
+            Some(format!("flt-sandbox:{active_idx}")),
+            true,
+        ));
+        body.push((
+            if is_kvm {
+                "  ENGINE: HypervisorSandbox (/dev/kvm) · alt: KernelSandbox (Landlock + cgroupv2 + namespaces)"
+                    .into()
+            } else {
+                "  ENGINE: KernelSandbox (Landlock + cgroupv2 + namespaces) · alt: HypervisorSandbox (/dev/kvm)"
+                    .into()
+            },
+            SemanticTone::Pass,
+            Some(format!("flt-sandbox:{active_idx}")),
+            false,
+        ));
+        body.push((
+            "  CEILINGS: max_slots = 1 · max_pids = 256 · RLIMIT_MEMLOCK <= 28 GiB (bounded headroom)"
+                .into(),
+            SemanticTone::Info,
+            Some(format!("flt-sandbox:{active_idx}")),
+            false,
+        ));
+        body.push((
+            "  PATHS: read_paths / exec_paths: /usr/bin, /usr/local/bin, /bin, /var/lib/action-runner/.cargo/bin, /var/lib/action-runner/.rustup"
+                .into(),
+            SemanticTone::Neutral,
+            Some(format!("flt-sandbox:{active_idx}")),
+            false,
+        ));
+        body.push((
+            if is_riscv {
+                "  ARCH: SpacemiT K3 HMP: conditional /proc/set_ai_thread before sched_setaffinity(0xFF00)"
+                    .into()
+            } else {
+                "  ARCH: x86_64 VT-x (/dev/kvm) + bare-metal Landlock v3".into()
+            },
+            SemanticTone::Info,
+            Some(format!("flt-sandbox:{active_idx}")),
+            false,
+        ));
     }
 
-    let rows: Vec<ScreenRow<'_>> = lines_owned
+    let (paged_rows, page, total_pages) =
+        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
+    let rows: Vec<ScreenRow<'_>> = paged_rows
         .iter()
-        .map(|(txt, tone)| ScreenRow {
+        .map(|(txt, tone, cid, sel)| ScreenRow {
             text: txt.as_str(),
             tone: *tone,
             signal: Some(SignalGlyph::BlockPassed),
             critical: false,
-            control_id: None,
-            selected: false,
+            control_id: cid.as_deref(),
+            selected: *sel,
         })
         .collect();
 
@@ -4213,8 +5189,8 @@ fn render_fleet_sandbox_profiles(
             lines: &rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
@@ -4287,4 +5263,282 @@ pub fn render_html_shell(svg: &str, state: &ConsoleState) -> String {
         area = area_label(state.route.area),
         subview = state.route.subview.slug(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mu_console_protocol::{
+        encode, CanaryBundle, CanaryBundleState, CdScore, CiJobStage, CiJobSummary, DataEvent,
+        DeploymentSummary, FabricNode, HardwareMetricSeries, RepoId, SandboxProfileSummary,
+        SmartscapeNode, Station, Train, ViewModel,
+    };
+    use mu_console_theme::wireframe::WireframeSkin;
+
+    #[test]
+    fn paginate_with_headers_pins_headers_and_slices_body_pages() {
+        let headers = vec!["H1", "H2"];
+        let body = vec!["B1", "B2", "B3", "B4", "B5"];
+        let (p0, page0, total0) = paginate_with_headers(headers.clone(), body.clone(), 4, 0);
+        assert_eq!(page0, 0);
+        assert_eq!(total0, 3);
+        assert_eq!(p0, vec!["H1", "H2", "B1", "B2"]);
+
+        let (p2, page2, total2) = paginate_with_headers(headers, body, 4, 99);
+        assert_eq!(page2, 2);
+        assert_eq!(total2, 3);
+        assert_eq!(p2, vec!["H1", "H2", "B5"]);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn master_detail_queue_logs_trainway_inspector_and_cd_obs_flt_controls_render() {
+        let mut vm = ViewModel::default();
+        let repo_id = RepoId::new("LMA1980", "mu-console");
+        let mut repo_score = RepoScore::new(repo_id.clone());
+        repo_score.cd = Some(CdScore {
+            deployment_id: "dep-cluster-01".into(),
+            active_slot: mu_console_protocol::Slot::A,
+            outcome: GateOutcome::Promoted,
+            it_passed: 8,
+            it_total: 8,
+        });
+        vm.repos.push(repo_score);
+
+        let log_lines: Vec<String> = (1..=30)
+            .map(|i| format!("compiling crate step {i} on worker-riscv64"))
+            .collect();
+        vm.ci_jobs.push(CiJobSummary {
+            job_id: 1233,
+            job_id_str: "001233".into(),
+            repo: repo_id.clone(),
+            ref_name: "feat/master-detail".into(),
+            commit_sha: "e4f5a6b".into(),
+            queue_state: "Failed".into(),
+            quality_score: 91,
+            coverage_bp: 9410,
+            tests_passed: 118,
+            tests_total: 120,
+            elapsed_secs: 42,
+            wait_secs: 2,
+            benchmark_summary: "ok".into(),
+            stages: vec![
+                CiJobStage {
+                    id: "fmt".into(),
+                    name: "fmt".into(),
+                    state: StageState::Passed,
+                    assigned_node: Some("node-a".into()),
+                    threads: 4,
+                    duration_secs: 2,
+                    exit_code: 0,
+                },
+                CiJobStage {
+                    id: "clippy".into(),
+                    name: "clippy".into(),
+                    state: StageState::Failed,
+                    assigned_node: Some("worker-riscv64".into()),
+                    threads: 6,
+                    duration_secs: 9,
+                    exit_code: 101,
+                },
+            ],
+            raw_log_lines: log_lines,
+        });
+
+        vm.topology = Some(RepoTopology {
+            repo: repo_id.clone(),
+            submodule: None,
+            default_branch: "main".into(),
+            stations: vec![
+                Station {
+                    id: "fmt".into(),
+                    label: "FMT".into(),
+                },
+                Station {
+                    id: "clippy".into(),
+                    label: "CLIPPY".into(),
+                },
+            ],
+            branches: Vec::new(),
+            trains: vec![Train {
+                job_id: 1233,
+                ref_name: "feat/master-detail".into(),
+                stage: 1,
+                stage_states: vec![StageState::Passed, StageState::Failed],
+                node_id: Some("worker-riscv64".into()),
+                node_lost: false,
+            }],
+            submodules: Vec::new(),
+            fabric_rev: 1,
+            submodule_bump_pending: false,
+        });
+
+        vm.history.push(DeploymentSummary {
+            deployment_id: "dep-0041".into(),
+            artifact_digest: "sha256:9f8e7d".into(),
+            outcome: GateOutcome::Promoted,
+            it_passed: 12,
+            it_total: 12,
+        });
+        vm.registry.canaries.push(CanaryBundle {
+            bundle_id: "cny-01".into(),
+            repo: repo_id,
+            service: "muconsole".into(),
+            artifact_digest: "sha256:9f8e7d".into(),
+            deployment_id: "dep-0041".into(),
+            state: CanaryBundleState::Promoted,
+            taint_reason: None,
+            trace_id: "tr-cd-0041".into(),
+        });
+        vm.observe.metrics.push(HardwareMetricSeries {
+            service: "actionrunner-controller".into(),
+            hardware_class: "x86_64".into(),
+            rps: 140,
+            error_rate_bp: 0,
+            p50_ms: 4,
+            p95_ms: 11,
+            p99_ms: 19,
+            samples: vec![10, 12, 11, 15],
+            exemplar_trace_id: "tr-ci-1233".into(),
+        });
+        vm.observe.metrics.push(HardwareMetricSeries {
+            service: "k3-kernels-rvv".into(),
+            hardware_class: "SpacemiT K3 A100 VLEN=1024".into(),
+            rps: 85,
+            error_rate_bp: 0,
+            p50_ms: 7,
+            p95_ms: 14,
+            p99_ms: 22,
+            samples: vec![20, 24, 22, 19],
+            exemplar_trace_id: "tr-obs-rvv".into(),
+        });
+        vm.observe.smartscape_nodes.push(SmartscapeNode {
+            id: "svc:muconsole".into(),
+            label: "muconsole-web".into(),
+            layer: SmartscapeLayer::Service,
+            healthy: true,
+            req_per_sec_bp: 4200,
+            error_rate_bp: 0,
+            p95_ms: 8,
+        });
+        vm.observe.smartscape_nodes.push(SmartscapeNode {
+            id: "host:worker-riscv64".into(),
+            label: "worker-riscv64".into(),
+            layer: SmartscapeLayer::Host,
+            healthy: true,
+            req_per_sec_bp: 1800,
+            error_rate_bp: 0,
+            p95_ms: 12,
+        });
+        vm.sandboxes.push(SandboxProfileSummary {
+            profile_name: "actionrunner-x86".into(),
+            backend: "KernelSandbox (Landlock + cgroupv2)".into(),
+            max_pids: 256,
+            max_slots: 1,
+            thread_budget: 4,
+            hardware_target: "node-a (x86_64)".into(),
+        });
+        vm.sandboxes.push(SandboxProfileSummary {
+            profile_name: "k3-rvv-a100".into(),
+            backend: "KernelSandbox (Landlock + cgroupv2)".into(),
+            max_pids: 256,
+            max_slots: 1,
+            thread_budget: 6,
+            hardware_target: "worker-riscv64 (SpacemiT K3 A100)".into(),
+        });
+        vm.nodes.push(FabricNode {
+            id: "node-a".into(),
+            arch: "x86_64".into(),
+            online: true,
+            active_slots: 0,
+            max_slots: 1,
+            cpu_load_bp: 120,
+            ram_used_mb: 2048,
+            ram_total_mb: 16384,
+            last_seen_secs_ago: 1,
+            btrfs_enabled: true,
+            exclusive_locked: false,
+            tags: vec!["x86_64".into()],
+            toolchains: vec!["rust".into()],
+        });
+
+        let mut st = ConsoleState::new();
+        let snap = encode(&DataEvent::Snapshot(vm)).expect("encode");
+        st.on_worker_frame(&snap);
+
+        // 1. CI > Queue & Logs dual master-detail screens at 1440x900
+        st.select_subview(SubView::Ci(CiSubView::QueueLogs));
+        st.activate_target("ci-stage-select:0");
+        let svg_ql = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(svg_ql.contains("ci-queue-logs-screen"));
+        assert!(svg_ql.contains("ci-job-detail-screen"));
+        assert!(svg_ql.contains("ci-queue-filter:0"));
+        assert!(svg_ql.contains("ci-log-follow-toggle"));
+        assert!(svg_ql.contains("STAGE #1 INSPECTOR"));
+
+        // 2. CI > Trainway bottom branch & stage inspector
+        st.select_subview(SubView::Ci(CiSubView::Trainway));
+        st.activate_target("c5-track-feat/master-detail");
+        let svg_tw = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(svg_tw.contains("c5-selected-inspector"));
+        assert!(svg_tw.contains("SELECTED TRACK: feat/master-detail"));
+        assert!(svg_tw.contains("OPEN LOGS"));
+
+        // 3. CD > Integration Gate fallback cluster gate links when gate is None
+        st.select_subview(SubView::Cd(CdSubView::IntegrationGate));
+        let svg_cd = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(svg_cd.contains("repo-select:0"));
+        assert!(svg_cd.contains("gate:cny-01"));
+
+        // 4. OBS > Metrics sparkline series selection
+        st.select_subview(SubView::Observe(ObserveSubView::Metrics));
+        st.activate_target("obs-metric:1");
+        let svg_met = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(svg_met.contains("data-metric-sparkline=\"k3-kernels-rvv\""));
+        assert!(svg_met.contains("PLOTTED SERIES: k3-kernels-rvv"));
+
+        // 5. OBS > Smartscape layer filter & FLT > Sandbox Profiles inspector
+        st.select_subview(SubView::Observe(ObserveSubView::Smartscape));
+        st.activate_target("obs-smartscape-filter:1");
+        let svg_ss = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(svg_ss.contains("LAYER FILTER: [SERVICES]"));
+        assert!(!svg_ss.contains("host:worker-riscv64"));
+
+        st.select_subview(SubView::Fleet(FleetSubView::SandboxProfiles));
+        st.activate_target("flt-sandbox:1");
+        let svg_sb = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(svg_sb.contains("MUISOLATION SECURITY &amp; HARDWARE INVARIANT INSPECTOR"));
+        assert!(svg_sb.contains("/proc/set_ai_thread"));
+        assert!(svg_sb.contains("RLIMIT_MEMLOCK"));
+    }
 }
