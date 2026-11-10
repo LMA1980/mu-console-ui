@@ -35,7 +35,8 @@ pub const RESTART_ARM_WINDOW_MS: u64 = 3_000;
 pub const AREAS: [Area; 5] = Area::ALL;
 
 /// Action attributes checked on each DOM ancestor from innermost target to outermost container.
-pub const ACTION_ATTRS: [&str; 17] = [
+pub const ACTION_ATTRS: [&str; 18] = [
+    "data-action",
     "data-trace-id",
     "data-select-trace",
     "data-page-step",
@@ -54,6 +55,15 @@ pub const ACTION_ATTRS: [&str; 17] = [
     "data-span-id",
     "data-log-severity",
 ];
+
+/// Returns `true` if `branch` and `branch_ref` refer to the same Git branch name
+/// (comparing with or without a leading `refs/heads/` prefix).
+#[must_use]
+pub fn branch_matches_ref(branch: &str, branch_ref: &str) -> bool {
+    let a = branch.trim().trim_start_matches("refs/heads/");
+    let b = branch_ref.trim().trim_start_matches("refs/heads/");
+    !a.is_empty() && a == b
+}
 
 /// Returns `true` if `element_id` is a root layout container whose state attributes must
 /// never be interpreted as delegated click actions.
@@ -78,6 +88,7 @@ pub fn is_passive_container_control_id(control_id: &str) -> bool {
             | "obs-log-filter"
             | "c3-rotary"
             | "c4-page-dots"
+            | "c5-selected-inspector"
     ) || control_id.ends_with("-screen")
 }
 
@@ -306,6 +317,16 @@ pub struct ConsoleState {
     pub subview_page: u32,
     /// `CI > Queue & Logs` auto-follow newest log page while selected job is active/queued.
     pub follow_log: bool,
+    /// `CI > Queue & Logs` queue filter (`0 = ALL`, `1 = ACTIVE`, `2 = FAILED`, `3 = REPO`).
+    pub ci_queue_filter: u8,
+    /// `CI > Queue & Logs` selected stage index in the job detail inspector.
+    pub selected_stage_idx: Option<usize>,
+    /// `OBS > Metrics` selected metric series index for the SVG sparkline.
+    pub selected_metric_idx: usize,
+    /// `OBS > Smartscape` layer filter (`0 = ALL`, `1 = SERVICES`, `2 = PROCESSES`, `3 = HOSTS`).
+    pub obs_smartscape_filter: u8,
+    /// `FLT > Sandbox Profiles` selected sandbox profile index for the security drawer.
+    pub selected_sandbox_idx: Option<usize>,
     /// `REG > Packages` ecosystem filter (`None` = `ALL`).
     pub reg_ecosystem_filter: Option<PackageEcosystem>,
     /// `REG > Packages` selected package name for the version/dependency drawer.
@@ -378,6 +399,11 @@ impl ConsoleState {
             fleet_page: 0,
             subview_page: 0,
             follow_log: true,
+            ci_queue_filter: 0,
+            selected_stage_idx: None,
+            selected_metric_idx: 0,
+            obs_smartscape_filter: 0,
+            selected_sandbox_idx: None,
             reg_ecosystem_filter: None,
             selected_package: None,
             selected_entity_id: None,
@@ -948,6 +974,11 @@ impl ConsoleState {
         }
     }
 
+    /// Activate an interactive control target by ID (`data-control-id` / `data-action`).
+    pub fn activate_target(&mut self, target: &str) -> Vec<UiCommand> {
+        self.on_dom_action("data-control-id", target, false, 0)
+    }
+
     /// Handle a DOM click on an interactive control or semantic `data-*` attribute.
     #[allow(clippy::too_many_lines)]
     pub fn on_dom_action(
@@ -1074,7 +1105,9 @@ impl ConsoleState {
                 self.subview_page = 0;
                 self.route.filter = self.log_severity_filter.map(|s| s.label().to_owned());
             }
-            "data-control-id" => return self.on_control_id(attr_val, shift, now_ms),
+            "data-action" | "data-control-id" => {
+                return self.on_control_id(attr_val, shift, now_ms)
+            }
             _ => {}
         }
         Vec::new()
@@ -1113,6 +1146,94 @@ impl ConsoleState {
             .or_else(|| id.strip_prefix("logsev:"))
         {
             return self.on_dom_action("data-log-severity", sev, shift, now_ms);
+        }
+        if id == "ci-queue-filter" {
+            self.ci_queue_filter = (self.ci_queue_filter + 1) % 4;
+            self.subview_page = 0;
+            self.aria_polite = format!("CI queue filter {}", self.ci_queue_filter);
+            return Vec::new();
+        }
+        if let Some(flt_str) = id.strip_prefix("ci-queue-filter:") {
+            self.ci_queue_filter = match flt_str.trim().to_ascii_lowercase().as_str() {
+                "0" | "all" => 0,
+                "1" | "active" => 1,
+                "2" | "failed" => 2,
+                "3" | "repo" => 3,
+                _ => (self.ci_queue_filter + 1) % 4,
+            };
+            self.subview_page = 0;
+            self.aria_polite = format!("CI queue filter {}", self.ci_queue_filter);
+            return Vec::new();
+        }
+        if let Some(st_str) = id.strip_prefix("ci-stage-select:") {
+            if let Ok(idx) = st_str.parse::<usize>() {
+                if self.selected_stage_idx == Some(idx) {
+                    self.selected_stage_idx = None;
+                } else {
+                    self.selected_stage_idx = Some(idx);
+                }
+                self.aria_polite = format!("Selected CI stage #{}", idx + 1);
+                return Vec::new();
+            }
+        }
+        if id == "obs-smartscape-filter" {
+            self.obs_smartscape_filter = (self.obs_smartscape_filter + 1) % 4;
+            self.subview_page = 0;
+            self.aria_polite = format!("Smartscape layer filter {}", self.obs_smartscape_filter);
+            return Vec::new();
+        }
+        if let Some(flt_str) = id.strip_prefix("obs-smartscape-filter:") {
+            self.obs_smartscape_filter = match flt_str.trim().to_ascii_lowercase().as_str() {
+                "0" | "all" => 0,
+                "1" | "services" | "service" => 1,
+                "2" | "processes" | "process" => 2,
+                "3" | "hosts" | "host" => 3,
+                _ => (self.obs_smartscape_filter + 1) % 4,
+            };
+            self.subview_page = 0;
+            self.aria_polite = format!("Smartscape layer filter {}", self.obs_smartscape_filter);
+            return Vec::new();
+        }
+        if let Some(m_str) = id.strip_prefix("obs-metric:") {
+            if let Ok(idx) = m_str.parse::<usize>() {
+                self.selected_metric_idx = idx;
+                self.aria_polite = format!("Selected metric series #{idx}");
+                return Vec::new();
+            }
+        }
+        if let Some(sb_str) = id.strip_prefix("flt-sandbox:") {
+            if let Ok(idx) = sb_str.parse::<usize>() {
+                self.selected_sandbox_idx = Some(idx);
+                self.aria_polite = format!("Selected sandbox profile #{idx}");
+                return Vec::new();
+            }
+        }
+        if let Some(hist_str) = id.strip_prefix("c6-history:") {
+            if let Ok(idx) = hist_str.parse::<usize>() {
+                self.selected_history_idx = idx + 1;
+                self.aria_polite = format!("Selected deployment history #{}", idx + 1);
+                return Vec::new();
+            }
+        }
+        if let Some(repo_idx_str) = id.strip_prefix("repo-select:") {
+            if let Ok(idx) = repo_idx_str.parse::<usize>() {
+                let repos = self.filtered_repos();
+                if let Some(chosen) = repos.get(idx) {
+                    let rid = chosen.id.clone();
+                    self.outer_index = idx;
+                    self.inner_index = 0;
+                    self.carousel_page = 0;
+                    self.route.repo = Some(rid.clone());
+                    self.route.submodule = None;
+                    self.route.branch = None;
+                    self.route.job = None;
+                    self.aria_polite = format!("Selected repository {}/{}", rid.owner, rid.repo);
+                    return vec![UiCommand::SelectRepo {
+                        repo: rid,
+                        submodule: None,
+                    }];
+                }
+            }
         }
         if let Some(repo_str) = id.strip_prefix("c4-card-select:") {
             if let Some((owner, repo)) = repo_str.split_once('/') {
@@ -1184,10 +1305,45 @@ impl ConsoleState {
                 return cmds;
             }
         }
-        if let Some(branch_ref) = id.strip_prefix("c5-track-") {
+        if let Some(branch_ref) = id
+            .strip_prefix("c5-track-")
+            .or_else(|| id.strip_prefix("ci-train:"))
+        {
             self.route.branch = Some(branch_ref.to_owned());
+            let matched_job = self.client.view().and_then(|v| {
+                v.topology
+                    .as_ref()
+                    .and_then(|t| {
+                        t.trains
+                            .iter()
+                            .find(|tr| branch_matches_ref(&tr.ref_name, branch_ref))
+                            .map(|tr| tr.job_id)
+                            .filter(|&jid| jid > 0)
+                            .or_else(|| {
+                                t.branches
+                                    .iter()
+                                    .find(|b| branch_matches_ref(&b.ref_name, branch_ref))
+                                    .and_then(|b| b.last_job)
+                                    .filter(|&jid| jid > 0)
+                            })
+                    })
+                    .or_else(|| {
+                        v.ci_jobs
+                            .iter()
+                            .find(|j| branch_matches_ref(&j.ref_name, branch_ref))
+                            .map(|j| j.job_id)
+                            .filter(|&jid| jid > 0)
+                    })
+            });
             self.aria_polite = format!("Selected branch {branch_ref}");
-            return vec![UiCommand::Subscribe(self.route.clone())];
+            let mut cmds = vec![UiCommand::Subscribe(self.route.clone())];
+            if let Some(job_id) = matched_job {
+                self.route.job = Some(job_id);
+                self.selected_stage_idx = None;
+                self.log_page = 0;
+                cmds.push(UiCommand::SelectJob { job_id });
+            }
+            return cmds;
         }
         if let Some(sig_rest) = id.strip_prefix("c5-signal:") {
             if let Some((branch_ref, _st_idx)) = sig_rest.rsplit_once(':') {
@@ -1196,12 +1352,18 @@ impl ConsoleState {
                     .client
                     .view()
                     .and_then(|v| v.topology.as_ref())
-                    .and_then(|t| t.trains.iter().find(|tr| tr.ref_name == branch_ref))
+                    .and_then(|t| {
+                        t.trains
+                            .iter()
+                            .find(|tr| branch_matches_ref(&tr.ref_name, branch_ref))
+                    })
                     .map(|tr| tr.job_id)
                     .filter(|&jid| jid > 0)
                     .or_else(|| self.active_job_id());
                 self.follow_log = true;
                 self.subview_page = 0;
+                self.selected_stage_idx = None;
+                self.log_page = 0;
                 let mut cmds = self.select_subview(SubView::Ci(CiSubView::QueueLogs));
                 if let Some(job_id) = matched_job {
                     self.route.job = Some(job_id);
@@ -1214,6 +1376,8 @@ impl ConsoleState {
             let matched_job = self.active_job_id();
             self.follow_log = true;
             self.subview_page = 0;
+            self.selected_stage_idx = None;
+            self.log_page = 0;
             let mut cmds = self.select_subview(SubView::Ci(CiSubView::QueueLogs));
             if let Some(job_id) = matched_job.filter(|&jid| jid > 0) {
                 self.route.job = Some(job_id);
@@ -1228,6 +1392,8 @@ impl ConsoleState {
         {
             if let Ok(job_id) = job_str.parse::<u64>() {
                 self.route.job = Some(job_id);
+                self.selected_stage_idx = None;
+                self.log_page = 0;
                 self.follow_log = true;
                 self.subview_page = 0;
                 let mut cmds = self.select_subview(SubView::Ci(CiSubView::QueueLogs));
@@ -1238,6 +1404,8 @@ impl ConsoleState {
         if let Some(job_str) = id.strip_prefix("ci-job:") {
             if let Ok(job_id) = job_str.parse::<u64>() {
                 self.route.job = Some(job_id);
+                self.selected_stage_idx = None;
+                self.log_page = 0;
                 self.follow_log = true;
                 self.subview_page = 0;
                 self.aria_polite = format!("Selected CI job #{job_id}");
@@ -1374,6 +1542,26 @@ impl ConsoleState {
             }
             "ci-log-follow-toggle" => {
                 self.follow_log = !self.follow_log;
+                if self.follow_log {
+                    self.log_page = u32::MAX;
+                }
+                Vec::new()
+            }
+            "ci-log-page-prev" | "ci-job-detail-screen:prev" => {
+                self.log_page = self.log_page.saturating_sub(1);
+                self.follow_log = false;
+                Vec::new()
+            }
+            "ci-log-page-next" | "ci-job-detail-screen:next" => {
+                self.log_page = self.log_page.saturating_add(1);
+                Vec::new()
+            }
+            "screen-page-prev" | "ci-queue-logs-screen:prev" => {
+                self.subview_page = self.subview_page.saturating_sub(1);
+                Vec::new()
+            }
+            "screen-page-next" | "ci-queue-logs-screen:next" => {
+                self.subview_page = self.subview_page.saturating_add(1);
                 Vec::new()
             }
             "c5-open-logs" => self.select_subview(SubView::Ci(CiSubView::QueueLogs)),
@@ -1542,5 +1730,160 @@ impl ConsoleState {
             }
         }
         cmds
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mu_console_protocol::{
+        encode, CiJobStage, CiJobSummary, DataEvent, DeploymentSummary, GateOutcome, RepoTopology,
+        StageState, Station, Train, ViewModel,
+    };
+
+    #[test]
+    fn activate_target_handles_queue_filter_stage_selector_and_log_pager() {
+        let mut st = ConsoleState::new();
+        assert_eq!(st.ci_queue_filter, 0);
+        assert_eq!(st.selected_stage_idx, None);
+
+        st.subview_page = 3;
+        st.activate_target("ci-queue-filter");
+        assert_eq!(st.ci_queue_filter, 1);
+        assert_eq!(st.subview_page, 0);
+
+        st.activate_target("ci-queue-filter:failed");
+        assert_eq!(st.ci_queue_filter, 2);
+
+        st.activate_target("ci-stage-select:0");
+        assert_eq!(st.selected_stage_idx, Some(0));
+        st.activate_target("ci-stage-select:0");
+        assert_eq!(st.selected_stage_idx, None);
+        st.activate_target("ci-stage-select:1");
+        assert_eq!(st.selected_stage_idx, Some(1));
+
+        st.follow_log = false;
+        st.log_page = 0;
+        st.activate_target("ci-log-follow-toggle");
+        assert!(st.follow_log);
+        assert_eq!(st.log_page, u32::MAX);
+
+        st.log_page = 4;
+        st.activate_target("ci-log-page-prev");
+        assert!(!st.follow_log);
+        assert_eq!(st.log_page, 3);
+
+        st.activate_target("ci-log-page-next");
+        assert_eq!(st.log_page, 4);
+
+        let cmds = st.activate_target("ci-job:777");
+        assert_eq!(st.route.job, Some(777));
+        assert_eq!(st.selected_stage_idx, None);
+        assert_eq!(st.log_page, 0);
+        assert_eq!(cmds, vec![UiCommand::SelectJob { job_id: 777 }]);
+    }
+
+    #[test]
+    fn track_selection_hydrates_matching_job_and_interactive_cd_obs_flt_targets() {
+        let mut vm = ViewModel::default();
+        let repo_id = RepoId::new("LMA1980", "mu-console");
+        vm.repos.push(RepoScore::new(repo_id.clone()));
+        vm.ci_jobs.push(CiJobSummary {
+            job_id: 4242,
+            job_id_str: "004242".into(),
+            repo: repo_id.clone(),
+            ref_name: "feat/inspector".into(),
+            commit_sha: "a1b2c3d".into(),
+            queue_state: "Failed".into(),
+            quality_score: 88,
+            coverage_bp: 9250,
+            tests_passed: 41,
+            tests_total: 42,
+            elapsed_secs: 19,
+            wait_secs: 1,
+            benchmark_summary: "ok".into(),
+            stages: vec![CiJobStage {
+                id: "clippy".into(),
+                name: "clippy".into(),
+                state: StageState::Failed,
+                assigned_node: Some("node-a".into()),
+                threads: 4,
+                duration_secs: 5,
+                exit_code: 101,
+            }],
+            raw_log_lines: vec!["error: clippy warning".into()],
+        });
+        vm.topology = Some(RepoTopology {
+            repo: repo_id,
+            submodule: None,
+            default_branch: "main".into(),
+            stations: vec![
+                Station {
+                    id: "fmt".into(),
+                    label: "FMT".into(),
+                },
+                Station {
+                    id: "clippy".into(),
+                    label: "CLIPPY".into(),
+                },
+            ],
+            branches: Vec::new(),
+            trains: vec![Train {
+                job_id: 4242,
+                ref_name: "refs/heads/feat/inspector".into(),
+                stage: 1,
+                stage_states: vec![StageState::Passed, StageState::Failed],
+                node_id: Some("node-a".into()),
+                node_lost: false,
+            }],
+            submodules: Vec::new(),
+            fabric_rev: 1,
+            submodule_bump_pending: false,
+        });
+        vm.history.push(DeploymentSummary {
+            deployment_id: "dep-0099".into(),
+            artifact_digest: "sha256:abcd".into(),
+            outcome: GateOutcome::Promoted,
+            it_passed: 8,
+            it_total: 8,
+        });
+
+        let mut st = ConsoleState::new();
+        let snap = encode(&DataEvent::Snapshot(vm)).expect("encode");
+        st.on_worker_frame(&snap);
+
+        let cmds = st.activate_target("c5-track-refs/heads/feat/inspector");
+        assert_eq!(
+            st.route.branch.as_deref(),
+            Some("refs/heads/feat/inspector")
+        );
+        assert_eq!(st.route.job, Some(4242));
+        assert!(cmds.contains(&UiCommand::SelectJob { job_id: 4242 }));
+
+        st.activate_target("c6-history:0");
+        assert_eq!(st.selected_history_idx, 1);
+        st.activate_target("c6-history-strip");
+        assert_eq!(st.selected_history_idx, 0);
+
+        st.activate_target("obs-metric:1");
+        assert_eq!(st.selected_metric_idx, 1);
+
+        st.activate_target("obs-smartscape-filter:hosts");
+        assert_eq!(st.obs_smartscape_filter, 3);
+        st.activate_target("obs-smartscape-filter");
+        assert_eq!(st.obs_smartscape_filter, 0);
+
+        st.activate_target("flt-sandbox:2");
+        assert_eq!(st.selected_sandbox_idx, Some(2));
+
+        let repo_cmds = st.activate_target("repo-select:0");
+        assert_eq!(st.route.repo, Some(RepoId::new("LMA1980", "mu-console")));
+        assert_eq!(
+            repo_cmds,
+            vec![UiCommand::SelectRepo {
+                repo: RepoId::new("LMA1980", "mu-console"),
+                submodule: None,
+            }]
+        );
     }
 }

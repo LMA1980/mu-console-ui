@@ -1927,3 +1927,115 @@ fn u21_compact_trainway_band_pitch_and_dynamic_scorecard_page_capacity() {
         "Merged siding path must have left turnout and right merge-back quadratic curves: {merged_path}"
     );
 }
+
+#[test]
+fn u22_master_detail_ci_queue_logs_trainway_inspector_and_interactive_cd_obs_flt_controls() {
+    use mu_console_protocol::{FleetSubView, ObserveSubView};
+
+    // 1. CI > Queue & Logs dual master-detail screens at 1440x900
+    let mut st = state_for_scenario(
+        Scenario::StageFailure,
+        SubView::Ci(CiSubView::QueueLogs),
+        CrtFont::Hurmit,
+    );
+    let svg_ql = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_ql.contains("ci-queue-logs-screen"));
+    assert!(svg_ql.contains("ci-job-detail-screen"));
+    assert!(svg_ql.contains("ci-queue-filter:0"));
+    assert!(svg_ql.contains("ci-log-follow-toggle"));
+    assert_svg_zero_overflow(&svg_ql, 1440.0, 900.0, "u22_ci_queue_logs_1440x900");
+
+    st.activate_target("ci-stage-select:0");
+    assert_eq!(st.selected_stage_idx, Some(0));
+    let svg_stage = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_stage.contains("STAGE #1 INSPECTOR"));
+    assert_svg_zero_overflow(&svg_stage, 1440.0, 900.0, "u22_ci_stage_inspector");
+
+    st.log_page = 2;
+    st.follow_log = true;
+    st.activate_target("ci-log-page-prev");
+    assert!(!st.follow_log);
+    assert_eq!(st.log_page, 1);
+    st.activate_target("ci-log-page-next");
+    assert_eq!(st.log_page, 2);
+
+    // 2. CI > Trainway track-to-job selection & c5-selected-inspector
+    st.select_subview(SubView::Ci(CiSubView::Trainway));
+    let track_cmds = st.activate_target("c5-track-main");
+    assert_eq!(st.route.branch.as_deref(), Some("main"));
+    assert!(st.route.job.is_some());
+    assert!(track_cmds
+        .iter()
+        .any(|c| matches!(c, UiCommand::SelectJob { .. })));
+    let svg_tw = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_tw.contains("c5-selected-inspector"));
+    assert!(svg_tw.contains("SELECTED TRACK:"));
+    assert!(svg_tw.contains("OPEN LOGS"));
+    assert_svg_zero_overflow(&svg_tw, 1440.0, 900.0, "u22_trainway_inspector");
+
+    // 3. CD > Integration Gate history pill selection
+    st.select_subview(SubView::Cd(CdSubView::IntegrationGate));
+    st.activate_target("c6-history:0");
+    assert_eq!(st.selected_history_idx, 1);
+    let svg_cd = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_cd.contains("SELECTED HISTORY #1:"));
+    assert_svg_zero_overflow(&svg_cd, 1440.0, 900.0, "u22_cd_history");
+
+    // 4. OBS > Metrics sparkline selector & OBS > Smartscape layer filter & FLT > Sandbox Profiles
+    st.select_subview(SubView::Observe(ObserveSubView::Metrics));
+    st.activate_target("obs-metric:1");
+    assert_eq!(st.selected_metric_idx, 1);
+    let svg_met = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_met.contains("PLOTTED SERIES:"));
+    assert_svg_zero_overflow(&svg_met, 1440.0, 900.0, "u22_obs_metrics");
+
+    st.select_subview(SubView::Observe(ObserveSubView::Smartscape));
+    st.activate_target("obs-smartscape-filter:1");
+    assert_eq!(st.obs_smartscape_filter, 1);
+    let svg_ss = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_ss.contains("LAYER FILTER: [SERVICES]"));
+    assert_svg_zero_overflow(&svg_ss, 1440.0, 900.0, "u22_obs_smartscape");
+
+    st.select_subview(SubView::Fleet(FleetSubView::SandboxProfiles));
+    st.activate_target("flt-sandbox:0");
+    assert_eq!(st.selected_sandbox_idx, Some(0));
+    let svg_sb = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_sb.contains("MUISOLATION SECURITY &amp; HARDWARE INVARIANT INSPECTOR"));
+    assert!(svg_sb.contains("RLIMIT_MEMLOCK"));
+    assert_svg_zero_overflow(&svg_sb, 1440.0, 900.0, "u22_flt_sandboxes");
+}
