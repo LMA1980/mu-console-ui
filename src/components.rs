@@ -279,7 +279,7 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
         + if show_sub { 88.0 } else { 0.0 }
         + active_lamps.len() as f64 * 60.0
         + 12.0
-        + 114.0
+        + 120.0
         + 8.0;
     let right_reserve = if frames.breakpoint == Breakpoint::Phone {
         218.0_f64.min(inner.w * 0.58)
@@ -367,7 +367,7 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
                 interactive: true,
             },
         );
-        let font_w = 114.0_f64.min((r.right() - trigger_rect.right() - 16.0).max(48.0));
+        let font_w = 120.0_f64.min((r.right() - trigger_rect.right() - 16.0).max(48.0));
         let font_x = (r.right() - 12.0 - font_w).max(trigger_rect.right() + 4.0);
         let font_rect = clamp_rect(
             Rect::new(
@@ -475,8 +475,8 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
         }
 
         let font_margin = 12.0;
-        let font_w = 114.0;
-        let font_h = (r.h - 16.0).clamp(24.0, 28.0);
+        let font_w = 120.0;
+        let font_h = 24.0_f64.min((r.h - 12.0).max(20.0));
         let font_x = (r.right() - font_margin - font_w).max(cur_x + font_margin);
         let font_y = r.y + (r.h - font_h) * 0.5;
         let font_rect = clamp_rect(Rect::new(font_x, font_y, font_w, font_h), r);
