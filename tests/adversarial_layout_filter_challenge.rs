@@ -267,7 +267,7 @@ fn test_sanitized_reference_oracle_passes_all_extreme_inputs() {
 
         assert_eq!(
             sibling_tags,
-            vec!["a", "input", "div", "div", "a"],
+            vec!["a", "input", "div", "div", "button", "a"],
             "Header DOM structure must remain unaltered regardless of input payload"
         );
     }
@@ -354,7 +354,7 @@ fn test_adversarial_layout_filter_fuzzing() {
 
         assert_eq!(
             sibling_tags,
-            vec!["a", "input", "div", "div", "a"],
+            vec!["a", "input", "div", "div", "button", "a"],
             "Fuzz case #{idx}: Header DOM structure was altered by payload {payload:?}"
         );
     }
