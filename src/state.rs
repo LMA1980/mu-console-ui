@@ -794,12 +794,27 @@ impl ConsoleState {
         }
     }
 
+    fn prune_unused_route_params(&mut self, sv: SubView) {
+        if !matches!(sv, SubView::Ci(CiSubView::Trainway | CiSubView::QueueLogs)) {
+            self.route.branch = None;
+            self.route.job = None;
+        }
+        if !matches!(sv, SubView::Observe(ObserveSubView::PurePath)) {
+            self.route.trace_id = None;
+        }
+        if !matches!(sv, SubView::Ci(CiSubView::Scorecards | CiSubView::Trainway)) {
+            self.route.submodule = None;
+            self.inner_index = 0;
+        }
+    }
+
     /// Select an area on C1 (`CI`, `CD`, `REG`, `OBS`, `FLT`).
     pub fn select_area(&mut self, area: Area) -> UiCommand {
         self.route.area = area;
         if self.route.subview.area() != area {
             self.route.subview = SubView::default_for(area);
         }
+        self.prune_unused_route_params(self.route.subview);
         self.subview_page = 0;
         self.follow_log = true;
         self.aria_polite = format!(
@@ -814,6 +829,7 @@ impl ConsoleState {
     pub fn select_subview(&mut self, subview: SubView) -> Vec<UiCommand> {
         self.route.area = subview.area();
         self.route.subview = subview;
+        self.prune_unused_route_params(subview);
         self.subview_page = 0;
         self.follow_log = true;
         self.aria_polite = format!(

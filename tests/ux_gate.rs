@@ -836,8 +836,9 @@ fn u8_operator_auth_states_invite_capture_and_log_restart_gating() {
         SafeArea::ZERO,
     );
     let html_anon = render_html_shell(&svg_anon, &st);
-    assert!(svg_anon.contains("c2-auth-status"));
-    assert!(svg_anon.contains("READ-ONLY · SIGN IN"));
+    assert!(!svg_anon.contains("c2-auth-status"));
+    assert!(html_anon.contains("muconsole-auth-link"));
+    assert!(html_anon.contains("READ-ONLY · SIGN IN"));
     assert!(svg_anon.contains("c6-log-auth-gate"));
     assert!(svg_anon.contains("RAW LOGS &amp; RESTART REQUIRE OPERATOR SESSION"));
     assert!(html_anon.contains("href=\"/oauth2/start?rd=/\""));
@@ -878,7 +879,8 @@ fn u8_operator_auth_states_invite_capture_and_log_restart_gating() {
         SafeArea::ZERO,
     );
     let html_uninv = render_html_shell(&svg_uninv, &st);
-    assert!(svg_uninv.contains("INVITE REQ (@guest-user)"));
+    assert!(!svg_uninv.contains("c2-auth-status"));
+    assert!(html_uninv.contains("INVITE REQ (@guest-user)"));
     assert!(html_uninv.contains("data-auth-state=\"invite_required\""));
     assert!(html_uninv.contains("href=\"/oauth2/sign_out?rd=/\""));
     assert_svg_zero_overflow(&svg_uninv, 1512.0, 860.0, "u8_invite_required");
@@ -899,7 +901,8 @@ fn u8_operator_auth_states_invite_capture_and_log_restart_gating() {
         SafeArea::ZERO,
     );
     let html_op = render_html_shell(&svg_op, &st);
-    assert!(svg_op.contains("@LMA1980 · OPERATOR"));
+    assert!(!svg_op.contains("c2-auth-status"));
+    assert!(html_op.contains("@LMA1980 · OPERATOR"));
     assert!(!svg_op.contains("c6-log-auth-gate"));
     assert!(html_op.contains("data-auth-state=\"operator\""));
     assert_svg_zero_overflow(&svg_op, 1512.0, 860.0, "u8_operator");
@@ -2038,4 +2041,110 @@ fn u22_master_detail_ci_queue_logs_trainway_inspector_and_interactive_cd_obs_flt
     assert!(svg_sb.contains("MUISOLATION SECURITY &amp; HARDWARE INVARIANT INSPECTOR"));
     assert!(svg_sb.contains("RLIMIT_MEMLOCK"));
     assert_svg_zero_overflow(&svg_sb, 1440.0, 900.0, "u22_flt_sandboxes");
+}
+
+#[test]
+fn u23_c2_top_bar_declutter_header_skin_toggle_and_compact_dyslexia_switch() {
+    use mu_console_protocol::FleetSubView;
+
+    let mut st = state_for_scenario(
+        Scenario::StageFailure,
+        SubView::Ci(CiSubView::Trainway),
+        CrtFont::Hurmit,
+    );
+    st.route.branch = Some("feat/test-branch".into());
+
+    // 1. In CI > Trainway, c2-branch (REF) and c2-sub-next (SUB) are visible, and lamp-stop is lit.
+    let svg_tw = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    let html_tw = render_html_shell(&svg_tw, &st);
+    let doc_html = roxmltree::Document::parse(&html_tw).expect("valid shell XML");
+
+    // #muconsole-skin-toggle lives inside #muconsole-header (never position:fixed;bottom:8px).
+    let header = doc_html
+        .descendants()
+        .find(|n| n.attribute("id") == Some("muconsole-header"))
+        .expect("#muconsole-header");
+    let skin_btn = header
+        .children()
+        .find(|n| n.attribute("id") == Some("muconsole-skin-toggle"))
+        .expect("#muconsole-skin-toggle inside #muconsole-header");
+    let style = skin_btn.attribute("style").unwrap_or("");
+    assert!(style.contains("font-size:10px"));
+    assert!(style.contains("padding:2px 6px"));
+    assert!(!style.contains("position:fixed"));
+
+    assert!(!svg_tw.contains("c2-auth-status"));
+    assert!(svg_tw.contains("c2-branch"));
+    assert!(svg_tw.contains("c2-sub-next"));
+    assert!(svg_tw.contains("lamp-stop"));
+    assert!(!svg_tw.contains("lamp-stale"));
+    assert!(!svg_tw.contains("lamp-offline"));
+
+    // Verify c2-font-switch has compact width (<= 116.0) and 12px right margin from c2-top-bar right edge.
+    let doc_tw = roxmltree::Document::parse(&svg_tw).expect("valid SVG XML");
+    let top_bar_rect = doc_tw
+        .descendants()
+        .find(|n| n.attribute("data-panel-id") == Some("c2-top-bar"))
+        .and_then(|g| g.children().find(|c| c.has_tag_name("rect")))
+        .expect("c2-top-bar rect");
+    let bar_x: f64 = top_bar_rect
+        .attribute("x")
+        .and_then(|v| v.parse().ok())
+        .unwrap();
+    let bar_w: f64 = top_bar_rect
+        .attribute("width")
+        .and_then(|v| v.parse().ok())
+        .unwrap();
+    let bar_right = bar_x + bar_w;
+
+    let font_sw = doc_tw
+        .descendants()
+        .find(|n| n.attribute("data-control-id") == Some("c2-font-switch"))
+        .expect("c2-font-switch");
+    let fw: f64 = font_sw
+        .attribute("data-bbox-w")
+        .and_then(|v| v.parse().ok())
+        .unwrap();
+    let fx: f64 = font_sw
+        .attribute("data-bbox-x")
+        .and_then(|v| v.parse().ok())
+        .unwrap();
+    assert!(
+        fw <= 116.0,
+        "c2-font-switch width {fw} must fit tightly around content (<= 116px)"
+    );
+    assert!(
+        ((bar_right - (fx + fw)) - 12.0).abs() <= 0.5,
+        "c2-font-switch right margin {} must be 12px",
+        bar_right - (fx + fw)
+    );
+
+    // 2. Switching to OBS > Metrics, CD > Deployments & Slots, or FLT > Worker Nodes hides
+    // unused c2-sub-next (SUB), c2-branch (REF), and lamp-stop.
+    for sv in [
+        SubView::Observe(ObserveSubView::Metrics),
+        SubView::Cd(CdSubView::DeploymentsSlots),
+        SubView::Fleet(FleetSubView::WorkerNodes),
+    ] {
+        st.select_subview(sv);
+        assert!(st.route.branch.is_none());
+        assert!(st.route.submodule.is_none());
+        let svg = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1512.0, 860.0),
+            SafeArea::ZERO,
+        );
+        assert!(!svg.contains("c2-sub-next"), "SUB must be hidden on {sv:?}");
+        assert!(!svg.contains("c2-branch"), "REF must be hidden on {sv:?}");
+        assert!(
+            !svg.contains("lamp-stop"),
+            "lamp-stop must be hidden on {sv:?}"
+        );
+    }
 }

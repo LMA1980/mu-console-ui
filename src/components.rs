@@ -237,14 +237,73 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
     );
 
     let inner = clamp_rect(r.inset(4.0, 6.0, 4.0, 6.0), r);
+    let active_sv = if state.route.subview.area() == state.route.area {
+        state.route.subview
+    } else {
+        SubView::default_for(state.route.area)
+    };
+    let repos = state.filtered_repos();
+    let repo_total = repos.len();
+    let current_repo = repos.get(state.outer_index);
+    let show_sub = matches!(
+        active_sv,
+        SubView::Ci(CiSubView::Scorecards | CiSubView::Trainway)
+    ) && (current_repo.is_some_and(|x| !x.submodules.is_empty())
+        || state.inner_index > 0
+        || state.route.submodule.is_some());
+
+    let view = state.client.view();
+    let stale = view.is_some_and(|v| v.stale_since_epoch_ms.is_some());
+    let offline = matches!(state.client.conn(), Some(ConnState::Offline));
+    let stop = matches!(active_sv, SubView::Ci(CiSubView::Trainway))
+        && view
+            .and_then(|v| v.topology.as_ref())
+            .is_some_and(RepoTopology::stop);
+    let reload = state.client.reload_required().is_some();
+    let all_lamps = [
+        (
+            "lamp-stale",
+            if reload { "RELOAD" } else { "STALE" },
+            stale || reload,
+            SemanticTone::Warn,
+        ),
+        ("lamp-offline", "OFFLINE", offline, SemanticTone::Fail),
+        ("lamp-stop", "STOP", stop, SemanticTone::Fail),
+    ];
+    let active_lamps: Vec<_> = all_lamps
+        .into_iter()
+        .filter(|(_, _, lit, _)| *lit)
+        .collect();
+
+    let base_right = 198.0
+        + if show_sub { 88.0 } else { 0.0 }
+        + active_lamps.len() as f64 * 60.0
+        + 12.0
+        + 114.0
+        + 8.0;
     let right_reserve = if frames.breakpoint == Breakpoint::Phone {
         218.0_f64.min(inner.w * 0.58)
     } else {
-        760.0_f64.min(inner.w * 0.72)
+        base_right.min(inner.w * 0.68)
     };
 
-    // Breadcrumb segments on the left.
-    let crumbs = breadcrumb_segments(&state.route, frames.breakpoint);
+    // Breadcrumb segments on the left, filtered to the active view context.
+    let crumbs: Vec<_> = breadcrumb_segments(&state.route, frames.breakpoint)
+        .into_iter()
+        .filter(|c| match c.id {
+            "c2-submodule" => matches!(
+                active_sv,
+                SubView::Ci(CiSubView::Scorecards | CiSubView::Trainway)
+            ),
+            "c2-branch" => matches!(active_sv, SubView::Ci(CiSubView::Trainway)),
+            "c2-job" => matches!(
+                active_sv,
+                SubView::Ci(CiSubView::QueueLogs | CiSubView::Trainway)
+            ),
+            "c2-trace" => matches!(active_sv, SubView::Observe(ObserveSubView::PurePath)),
+            _ => true,
+        })
+        .collect();
     let crumb_area_w = (inner.w - right_reserve - 6.0).max(40.0);
     let n_crumbs = crumbs.len().max(1);
     let cw = (crumb_area_w / n_crumbs as f64).max(24.0);
@@ -308,21 +367,20 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
                 interactive: true,
             },
         );
+        let font_w = 114.0_f64.min((r.right() - trigger_rect.right() - 16.0).max(48.0));
+        let font_x = (r.right() - 12.0 - font_w).max(trigger_rect.right() + 4.0);
         let font_rect = clamp_rect(
             Rect::new(
-                (trigger_rect.right() + 4.0).min(r.right() - 48.0),
+                font_x,
                 r.y,
-                (r.right() - trigger_rect.right() - 4.0).max(48.0),
+                font_w,
                 r.h.max(44.0).min(frames.canvas.bottom() - r.y),
             ),
             frames.canvas,
         );
         render_font_switch(skin, w, state, font_rect);
     } else {
-        // Compact C2 Repository & Submodule Stepper (`[<] REPO [>] SUB`).
-        let repos = state.filtered_repos();
-        let repo_total = repos.len();
-        let current_repo = repos.get(state.outer_index);
+        // Compact C2 Repository & Submodule Stepper (`[<] REPO [>]` + optional `SUB`).
         let repo_label = current_repo.map_or("ALL REPOS", |x| x.id.repo.as_str());
         let repo_display = if repo_total == 0 {
             "ALL REPOS".to_owned()
@@ -338,8 +396,8 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
                 .map_or("PARENT", |s| s.path.as_str())
         };
         let step_w = 26.0;
-        let repo_w = 136.0_f64.min(right_reserve * 0.22).max(68.0);
-        let sub_w = 82.0_f64.min(right_reserve * 0.13).max(52.0);
+        let repo_w = 136.0_f64.min(right_reserve * 0.42).max(68.0);
+        let sub_w = 82.0_f64.min(right_reserve * 0.22).max(52.0);
         let mut cur_x = rx;
 
         let prev_rect = clamp_rect(Rect::new(cur_x, inner.y, step_w, inner.h), inner);
@@ -384,53 +442,25 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
         );
         cur_x = next_rect.right() + 4.0;
 
-        let sub_rect = clamp_rect(Rect::new(cur_x, inner.y, sub_w, inner.h), inner);
-        skin.readout(
-            w,
-            &Readout {
-                control_id: "c2-sub-next",
-                label: "SUB",
-                value: sub_label,
-                rect: sub_rect,
-                tone: SemanticTone::Neutral,
-                interactive: true,
-            },
-        );
-        cur_x = sub_rect.right() + 6.0;
-
-        let view = state.client.view();
-        let stale = view.is_some_and(|v| v.stale_since_epoch_ms.is_some());
-        let offline = matches!(state.client.conn(), Some(ConnState::Offline));
-        let stop = view
-            .and_then(|v| v.topology.as_ref())
-            .is_some_and(RepoTopology::stop);
-        let reload = state.client.reload_required().is_some();
-
-        let rem = (inner.right() - cur_x).max(200.0);
-        let font_w = 186.0_f64.min(rem * 0.36).max(80.0);
-        let auth_w = 128.0_f64.min(rem * 0.24).max(64.0);
-        let lamp_avail = (rem - font_w - auth_w - 16.0).max(114.0);
-        let lamp_w = (lamp_avail / 3.0 - 4.0).clamp(36.0, 64.0);
-        let lamps = [
-            (
-                "lamp-stale",
-                if reload { "RELOAD" } else { "STALE" },
-                stale || reload,
-                SemanticTone::Warn,
-            ),
-            ("lamp-offline", "OFFLINE", offline, SemanticTone::Fail),
-            ("lamp-stop", "STOP", stop, SemanticTone::Fail),
-        ];
-        for (idx, (id, lbl, lit, tone)) in lamps.into_iter().enumerate() {
-            let lr = clamp_rect(
-                Rect::new(
-                    cur_x + idx as f64 * (lamp_w + 4.0),
-                    inner.y,
-                    lamp_w,
-                    inner.h,
-                ),
-                inner,
+        if show_sub {
+            let sub_rect = clamp_rect(Rect::new(cur_x, inner.y, sub_w, inner.h), inner);
+            skin.readout(
+                w,
+                &Readout {
+                    control_id: "c2-sub-next",
+                    label: "SUB",
+                    value: sub_label,
+                    rect: sub_rect,
+                    tone: SemanticTone::Neutral,
+                    interactive: true,
+                },
             );
+            cur_x = sub_rect.right() + 6.0;
+        }
+
+        let lamp_w = 56.0;
+        for (id, lbl, lit, tone) in active_lamps {
+            let lr = clamp_rect(Rect::new(cur_x, inner.y, lamp_w, inner.h), inner);
             skin.lamp(
                 w,
                 &Lamp {
@@ -441,37 +471,15 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
                     tone,
                 },
             );
+            cur_x = lr.right() + 4.0;
         }
 
-        let auth = state.auth();
-        let (auth_val, auth_tone) = match &auth {
-            AuthState::Anonymous => ("READ-ONLY · SIGN IN".to_owned(), SemanticTone::Neutral),
-            AuthState::InviteRequired { github_login } => {
-                (format!("INVITE REQ (@{github_login})"), SemanticTone::Warn)
-            }
-            AuthState::Operator { github_login, .. } => {
-                (format!("@{github_login} · OPERATOR"), SemanticTone::Pass)
-            }
-        };
-        let auth_x = cur_x + 3.0 * (lamp_w + 4.0);
-        let auth_rect = clamp_rect(Rect::new(auth_x, inner.y, auth_w, inner.h), inner);
-        skin.readout(
-            w,
-            &Readout {
-                control_id: "c2-auth-status",
-                label: "AUTH",
-                value: &auth_val,
-                rect: auth_rect,
-                tone: auth_tone,
-                interactive: true,
-            },
-        );
-
-        let font_x = (inner.right() - font_w).max(auth_rect.right() + 4.0);
-        let font_rect = clamp_rect(
-            Rect::new(font_x, inner.y, (inner.right() - font_x).max(48.0), inner.h),
-            inner,
-        );
+        let font_margin = 12.0;
+        let font_w = 114.0;
+        let font_h = (r.h - 16.0).clamp(24.0, 28.0);
+        let font_x = (r.right() - font_margin - font_w).max(cur_x + font_margin);
+        let font_y = r.y + (r.h - font_h) * 0.5;
+        let font_rect = clamp_rect(Rect::new(font_x, font_y, font_w, font_h), r);
         render_font_switch(skin, w, state, font_rect);
     }
 }
@@ -5248,16 +5256,16 @@ pub fn render_html_shell(svg: &str, state: &ConsoleState) -> String {
 
     format!(
         "<div id=\"muconsole-shell\" data-crt-font=\"{font_attr}\" data-skin=\"{skin_attr}\" data-lazy-dyslexic=\"{lazy_dyslexic}\" data-area=\"{area}\" data-subview=\"{subview}\" data-auth-state=\"{auth_slug}\">\
-         <style>{dyslexic_face}#muconsole-filter{{font-size:16px;}}</style>\
+         <style>{dyslexic_face}#muconsole-filter{{font-size:16px;}}#muconsole-auth-link{{margin-left:0;}}</style>\
          <header id=\"muconsole-header\" role=\"banner\">\
          <a href=\"#muconsole-dashboard\" class=\"skip-link\">Skip to dashboard</a>\
          <input id=\"muconsole-filter\" type=\"search\" placeholder=\"Filter repositories...\" aria-label=\"Type-ahead repository filter\" style=\"font-size:16px\" value=\"{escaped_filter_query}\"/>\
          <div id=\"muconsole-aria-polite\" role=\"status\" aria-live=\"polite\" aria-atomic=\"true\">{escaped_aria_polite}</div>\
          <div id=\"muconsole-aria-assertive\" role=\"alert\" aria-live=\"assertive\" aria-atomic=\"true\">{escaped_aria_assertive}</div>\
+         <button id=\"muconsole-skin-toggle\" type=\"button\" data-skin-toggle=\"true\" aria-label=\"Toggle visual skin\" style=\"margin-left:auto;font-family:var(--font-crt);font-size:10px;line-height:1.1;color:var(--accent-neon-cyan);background:rgba(5,10,14,0.85);border:1px solid var(--accent-neon-cyan);border-radius:3px;padding:2px 6px;cursor:pointer;white-space:nowrap\">{skin_label}</button>\
          <a id=\"muconsole-auth-link\" href=\"{escaped_auth_href}\" data-auth-state=\"{auth_slug}\">{escaped_auth_label}</a>\
          </header>\
          <main id=\"muconsole-dashboard\" role=\"main\" aria-label=\"MuConsole Unified CI/CD Dashboard\" tabindex=\"-1\">{svg}</main>\
-         <button id=\"muconsole-skin-toggle\" type=\"button\" data-skin-toggle=\"true\" aria-label=\"Toggle visual skin\" style=\"position:fixed;bottom:8px;right:12px;z-index:20;font-family:var(--font-crt);font-size:11px;color:var(--accent-neon-cyan);background:rgba(5,10,14,0.85);border:1px solid var(--accent-neon-cyan);border-radius:3px;padding:3px 8px;cursor:pointer;white-space:nowrap\">{skin_label}</button>\
          </div>",
         lazy_dyslexic = state.lazy_dyslexic_loaded,
         area = area_label(state.route.area),
