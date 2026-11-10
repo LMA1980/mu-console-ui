@@ -2085,7 +2085,7 @@ fn u23_c2_top_bar_declutter_header_skin_toggle_and_compact_dyslexia_switch() {
     assert!(!svg_tw.contains("lamp-stale"));
     assert!(!svg_tw.contains("lamp-offline"));
 
-    // Verify c2-font-switch has compact width (<= 116.0) and 12px right margin from c2-top-bar right edge.
+    // Verify c2-font-switch has 120x24 size and 12px top/bottom/right margin inside c2-top-bar.
     let doc_tw = roxmltree::Document::parse(&svg_tw).expect("valid SVG XML");
     let top_bar_rect = doc_tw
         .descendants()
@@ -2096,8 +2096,16 @@ fn u23_c2_top_bar_declutter_header_skin_toggle_and_compact_dyslexia_switch() {
         .attribute("x")
         .and_then(|v| v.parse().ok())
         .unwrap();
+    let bar_y: f64 = top_bar_rect
+        .attribute("y")
+        .and_then(|v| v.parse().ok())
+        .unwrap();
     let bar_w: f64 = top_bar_rect
         .attribute("width")
+        .and_then(|v| v.parse().ok())
+        .unwrap();
+    let bar_h: f64 = top_bar_rect
+        .attribute("height")
         .and_then(|v| v.parse().ok())
         .unwrap();
     let bar_right = bar_x + bar_w;
@@ -2110,18 +2118,34 @@ fn u23_c2_top_bar_declutter_header_skin_toggle_and_compact_dyslexia_switch() {
         .attribute("data-bbox-w")
         .and_then(|v| v.parse().ok())
         .unwrap();
+    let fh: f64 = font_sw
+        .attribute("data-bbox-h")
+        .and_then(|v| v.parse().ok())
+        .unwrap();
     let fx: f64 = font_sw
         .attribute("data-bbox-x")
         .and_then(|v| v.parse().ok())
         .unwrap();
+    let fy: f64 = font_sw
+        .attribute("data-bbox-y")
+        .and_then(|v| v.parse().ok())
+        .unwrap();
     assert!(
-        fw <= 116.0,
-        "c2-font-switch width {fw} must fit tightly around content (<= 116px)"
+        (fw - 120.0).abs() <= 0.5,
+        "c2-font-switch width {fw} must be 120px"
+    );
+    assert!(
+        (fh - 24.0).abs() <= 0.5,
+        "c2-font-switch height {fh} must be 24px"
     );
     assert!(
         ((bar_right - (fx + fw)) - 12.0).abs() <= 0.5,
         "c2-font-switch right margin {} must be 12px",
         bar_right - (fx + fw)
+    );
+    assert!(
+        ((fy - bar_y) - (bar_h - fh) * 0.5).abs() <= 0.5,
+        "c2-font-switch must be vertically centered in c2-top-bar"
     );
 
     // 2. Switching to OBS > Metrics, CD > Deployments & Slots, or FLT > Worker Nodes hides
@@ -2147,4 +2171,44 @@ fn u23_c2_top_bar_declutter_header_skin_toggle_and_compact_dyslexia_switch() {
             "lamp-stop must be hidden on {sv:?}"
         );
     }
+
+    // 3. Default unfiltered state (route.repo == None) displays "* All repositories" in c2-repo-select,
+    // and rotate_outer(1) / rotate_outer(-1) transitions cleanly between "* All repositories" and 1/N.
+    st.select_subview(SubView::Ci(CiSubView::Scorecards));
+    st.route.repo = None;
+    st.route.submodule = None;
+    let svg_all = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_all.contains("* All repositories"));
+    assert!(!svg_all.contains("c2-sub-next"));
+
+    st.rotate_outer(1, 3_000);
+    assert_eq!(st.outer_index, 0);
+    assert!(st.route.repo.is_some());
+    let svg_first = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    let first_expected = format!(
+        "1/{} {}",
+        st.filtered_repos().len(),
+        st.filtered_repos()[0].id.repo
+    );
+    assert!(svg_first.contains(&first_expected));
+
+    st.rotate_outer(-1, 3_100);
+    assert!(st.route.repo.is_none());
+    let svg_back = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1512.0, 860.0),
+        SafeArea::ZERO,
+    );
+    assert!(svg_back.contains("* All repositories"));
 }

@@ -617,7 +617,15 @@ impl ConsoleState {
             ClientUpdate::View => {
                 if let Some(v) = self.client.view() {
                     if let Some(sel) = v.selection.as_ref() {
-                        if self.route.repo.is_none() {
+                        let single_repo_view = matches!(
+                            self.route.subview,
+                            SubView::Ci(CiSubView::Trainway)
+                                | SubView::Cd(CdSubView::IntegrationGate)
+                        );
+                        if self.route.repo.is_none()
+                            && (v.source != mu_console_protocol::DataSource::Live
+                                || single_repo_view)
+                        {
                             self.route.repo = Some(sel.repo.clone());
                             self.route.submodule.clone_from(&sel.submodule);
                         }
@@ -727,20 +735,43 @@ impl ConsoleState {
     /// 350 ms settle timer.
     pub fn rotate_outer(&mut self, delta: isize, now_ms: u64) {
         let repos = self.filtered_repos();
-        if repos.is_empty() {
+        if repos.is_empty() || delta == 0 {
             return;
         }
         let len = isize::try_from(repos.len()).unwrap_or(1);
-        let cur = isize::try_from(self.outer_index).unwrap_or(0);
-        let next = (cur + delta).rem_euclid(len);
-        self.outer_index = usize::try_from(next).unwrap_or(0);
         self.inner_index = 0;
         self.carousel_page = 0;
-        let chosen = &repos[self.outer_index];
-        self.route.repo = Some(chosen.id.clone());
         self.route.submodule = None;
         self.route.branch = None;
         self.route.job = None;
+
+        if self.route.repo.is_none() {
+            let next = if delta > 0 {
+                (delta - 1).rem_euclid(len)
+            } else {
+                (len + delta).rem_euclid(len)
+            };
+            self.outer_index = usize::try_from(next).unwrap_or(0);
+            let chosen = &repos[self.outer_index];
+            self.route.repo = Some(chosen.id.clone());
+            self.pending_select_at_ms = Some(now_ms.saturating_add(ROTARY_SETTLE_MS));
+            self.aria_polite =
+                format!("Selected repository {}/{}", chosen.id.owner, chosen.id.repo);
+            return;
+        }
+
+        let cur = isize::try_from(self.outer_index).unwrap_or(0);
+        if (cur == 0 && delta == -1) || (cur + 1 == len && delta == 1) {
+            self.outer_index = 0;
+            self.route.repo = None;
+            self.pending_select_at_ms = None;
+            self.aria_polite = "Selected * All repositories".to_owned();
+            return;
+        }
+        let next = (cur + delta).rem_euclid(len);
+        self.outer_index = usize::try_from(next).unwrap_or(0);
+        let chosen = &repos[self.outer_index];
+        self.route.repo = Some(chosen.id.clone());
         self.pending_select_at_ms = Some(now_ms.saturating_add(ROTARY_SETTLE_MS));
         self.aria_polite = format!("Selected repository {}/{}", chosen.id.owner, chosen.id.repo);
     }
@@ -778,18 +809,27 @@ impl ConsoleState {
     }
 
     /// Update the `/` type-ahead filter and snap `outer_index` to the first
-    /// matching repository.
+    /// matching repository (or return to `* All repositories` when cleared on overview views).
     pub fn set_filter_query(&mut self, query: &str, now_ms: u64) {
         self.filter_query = query.to_owned();
         self.outer_index = 0;
         self.inner_index = 0;
         self.carousel_page = 0;
+        self.route.submodule = None;
+        self.route.branch = None;
+        self.route.job = None;
+        let single_repo_view = matches!(
+            self.route.subview,
+            SubView::Ci(CiSubView::Trainway) | SubView::Cd(CdSubView::IntegrationGate)
+        );
+        if query.trim().is_empty() && !single_repo_view {
+            self.route.repo = None;
+            self.pending_select_at_ms = None;
+            return;
+        }
         let repos = self.filtered_repos();
         if let Some(first) = repos.first() {
             self.route.repo = Some(first.id.clone());
-            self.route.submodule = None;
-            self.route.branch = None;
-            self.route.job = None;
             self.pending_select_at_ms = Some(now_ms.saturating_add(ROTARY_SETTLE_MS));
         }
     }
@@ -805,6 +845,17 @@ impl ConsoleState {
         if !matches!(sv, SubView::Ci(CiSubView::Scorecards | CiSubView::Trainway)) {
             self.route.submodule = None;
             self.inner_index = 0;
+        }
+        if self.route.repo.is_none()
+            && matches!(
+                sv,
+                SubView::Ci(CiSubView::Trainway) | SubView::Cd(CdSubView::IntegrationGate)
+            )
+        {
+            if let Some(first) = self.filtered_repos().first() {
+                self.route.repo = Some(first.id.clone());
+                self.outer_index = 0;
+            }
         }
     }
 
