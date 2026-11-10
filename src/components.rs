@@ -245,12 +245,14 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
     let repos = state.filtered_repos();
     let repo_total = repos.len();
     let current_repo = repos.get(state.outer_index);
-    let show_sub = matches!(
-        active_sv,
-        SubView::Ci(CiSubView::Scorecards | CiSubView::Trainway)
-    ) && (current_repo.is_some_and(|x| !x.submodules.is_empty())
-        || state.inner_index > 0
-        || state.route.submodule.is_some());
+    let show_sub = state.route.repo.is_some()
+        && matches!(
+            active_sv,
+            SubView::Ci(CiSubView::Scorecards | CiSubView::Trainway)
+        )
+        && (current_repo.is_some_and(|x| !x.submodules.is_empty())
+            || state.inner_index > 0
+            || state.route.submodule.is_some());
 
     let view = state.client.view();
     let stale = view.is_some_and(|v| v.stale_since_epoch_ms.is_some());
@@ -275,7 +277,7 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
         .filter(|(_, _, lit, _)| *lit)
         .collect();
 
-    let base_right = 198.0
+    let base_right = 218.0
         + if show_sub { 88.0 } else { 0.0 }
         + active_lamps.len() as f64 * 60.0
         + 12.0
@@ -291,6 +293,7 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
     let crumbs: Vec<_> = breadcrumb_segments(&state.route, frames.breakpoint)
         .into_iter()
         .filter(|c| match c.id {
+            "c2-repo" => frames.breakpoint == Breakpoint::Phone,
             "c2-submodule" => matches!(
                 active_sv,
                 SubView::Ci(CiSubView::Scorecards | CiSubView::Trainway)
@@ -381,9 +384,9 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
         render_font_switch(skin, w, state, font_rect);
     } else {
         // Compact C2 Repository & Submodule Stepper (`[<] REPO [>]` + optional `SUB`).
-        let repo_label = current_repo.map_or("ALL REPOS", |x| x.id.repo.as_str());
-        let repo_display = if repo_total == 0 {
-            "ALL REPOS".to_owned()
+        let repo_label = current_repo.map_or("* All repositories", |x| x.id.repo.as_str());
+        let repo_display = if state.route.repo.is_none() || repo_total == 0 {
+            "* All repositories".to_owned()
         } else {
             let idx = state.outer_index.min(repo_total - 1) + 1;
             format!("{idx}/{repo_total} {repo_label}")
@@ -396,7 +399,7 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
                 .map_or("PARENT", |s| s.path.as_str())
         };
         let step_w = 26.0;
-        let repo_w = 136.0_f64.min(right_reserve * 0.42).max(68.0);
+        let repo_w = 156.0_f64.min(right_reserve * 0.45).max(96.0);
         let sub_w = 82.0_f64.min(right_reserve * 0.22).max(52.0);
         let mut cur_x = rx;
 
