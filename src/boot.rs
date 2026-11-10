@@ -229,10 +229,7 @@ fn find_action_attribute(target: &Element) -> Option<(&'static str, String)> {
             break;
         }
         if let Some(val) = el.get_attribute("data-control-id") {
-            if matches!(
-                val.as_str(),
-                "ci-job-detail-screen:prev" | "ci-job-detail-screen:next"
-            ) {
+            if val.ends_with(":prev") || val.ends_with(":next") {
                 return Some(("data-control-id", val));
             }
         }

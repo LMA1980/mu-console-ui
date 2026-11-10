@@ -2150,7 +2150,6 @@ fn render_ci_queue_logs(
         let mut left_rows: Vec<QueueRow> = Vec::new();
         let mut detail_headers: Vec<QueueRow> = Vec::new();
         let mut detail_rows: Vec<QueueRow> = Vec::new();
-        let mut selected_job_running = false;
 
         if let Some(v) = state.client.view() {
             let filtered_jobs: Vec<&mu_console_protocol::CiJobSummary> = v
@@ -2209,9 +2208,6 @@ fn render_ci_queue_logs(
                         .and_then(|r| v.ci_jobs.iter().find(|j| &j.repo == r))
                 })
                 .or_else(|| v.ci_jobs.first());
-
-            selected_job_running =
-                active_job.is_some_and(|j| j.queue_state == "Active" || j.queue_state == "Queued");
 
             if filtered_jobs.is_empty() {
                 left_rows.push((
@@ -2514,18 +2510,18 @@ fn render_ci_queue_logs(
         let avail_log_rows = panel.grid.rows.saturating_sub(detail_headers.len()).max(1);
         let total_log_pages =
             u32::try_from(detail_rows.len().div_ceil(avail_log_rows).max(1)).unwrap_or(1);
-        let effective_log_page =
-            if state.follow_log && (selected_job_running || state.log_page == u32::MAX) {
-                total_log_pages.saturating_sub(1)
-            } else {
-                state.log_page.min(total_log_pages.saturating_sub(1))
-            };
+        let effective_log_page = if state.follow_log {
+            total_log_pages.saturating_sub(1)
+        } else {
+            state.log_page.min(total_log_pages.saturating_sub(1))
+        };
         let (right_paged, right_page, right_total_pages) = paginate_with_headers(
             detail_headers,
             detail_rows,
             panel.grid.rows,
             effective_log_page,
         );
+        state.rendered_ci_log_page.set(right_page);
         let right_screen_rows: Vec<ScreenRow<'_>> = right_paged
             .iter()
             .map(|(txt, tone, sig, cid, sel)| ScreenRow {
@@ -2636,6 +2632,19 @@ fn render_ci_queue_logs(
                     false,
                 ));
             }
+            if headers.len() < max_headers {
+                headers.push((
+                    format!(
+                        "BUILD LOG STREAM ({} LINES) · FOLLOW: {}",
+                        sel_job.raw_log_lines.len(),
+                        if state.follow_log { "ON" } else { "OFF" }
+                    ),
+                    SemanticTone::Info,
+                    None,
+                    Some("ci-log-follow-toggle".into()),
+                    state.follow_log,
+                ));
+            }
         }
 
         for job in &filtered_jobs {
@@ -2678,8 +2687,14 @@ fn render_ci_queue_logs(
         ));
     }
 
+    let effective_compact_page = if state.follow_log {
+        u32::MAX
+    } else {
+        state.subview_page
+    };
     let (rows, page, total_pages) =
-        paginate_with_headers(headers, body, panel.grid.rows, state.subview_page);
+        paginate_with_headers(headers, body, panel.grid.rows, effective_compact_page);
+    state.rendered_ci_log_page.set(page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, sig, cid, sel)| ScreenRow {
@@ -4624,16 +4639,54 @@ fn render_obs_logs(
     let active_sev = state.log_severity_filter.map_or("ALL", LogSeverity::label);
     let hdr_y = rect.y + 4.0;
     let hdr_h = ((screen_rect.y - rect.y) - 8.0).clamp(16.0, 24.0);
-    let flt_w = 248.0_f64.min(rect.w * 0.48);
-    let flt_rect = clamp_rect(
-        Rect::new(
-            (rect.right() - flt_w - 6.0).max(rect.x),
-            hdr_y,
-            flt_w,
-            hdr_h,
-        ),
-        rect,
-    );
+    let flt_rect = if rect.w >= 520.0 {
+        let right = rect.right() - 6.0;
+        let follow_w = 114.0_f64.min(rect.w * 0.22);
+        let follow_rect = clamp_rect(
+            Rect::new((right - follow_w).max(rect.x), hdr_y, follow_w, hdr_h),
+            rect,
+        );
+        skin.readout(
+            w,
+            &Readout {
+                control_id: "obs-log-follow-toggle",
+                label: "",
+                value: if state.follow_log {
+                    "● FOLLOW ON"
+                } else {
+                    "○ FOLLOW OFF"
+                },
+                rect: follow_rect,
+                tone: if state.follow_log {
+                    SemanticTone::Pass
+                } else {
+                    SemanticTone::Neutral
+                },
+                interactive: true,
+            },
+        );
+        let flt_w = 248.0_f64.min((follow_rect.x - rect.x - 16.0).max(120.0));
+        clamp_rect(
+            Rect::new(
+                (follow_rect.x - flt_w - 6.0).max(rect.x),
+                hdr_y,
+                flt_w,
+                hdr_h,
+            ),
+            rect,
+        )
+    } else {
+        let flt_w = 248.0_f64.min(rect.w * 0.48);
+        clamp_rect(
+            Rect::new(
+                (rect.right() - flt_w - 6.0).max(rect.x),
+                hdr_y,
+                flt_w,
+                hdr_h,
+            ),
+            rect,
+        )
+    };
     let sev_opts = [
         SelectorOption {
             id: "ALL",
@@ -4690,7 +4743,10 @@ fn render_obs_logs(
     if let Some(v) = state.client.view() {
         total_logs = v.observe.logs.len();
         let q = state.filter_query.trim().to_ascii_lowercase();
-        for log in &v.observe.logs {
+        let mut chronological_logs: Vec<&mu_console_protocol::OtelLogEntry> =
+            v.observe.logs.iter().collect();
+        chronological_logs.sort_by_key(|l| l.timestamp_ms);
+        for log in chronological_logs {
             if let Some(svc) = state.obs_service_filter.as_deref() {
                 if !service_filter_matches(svc, &log.service) {
                     continue;
@@ -4780,18 +4836,19 @@ fn render_obs_logs(
     let headers: Vec<LogRow> = vec![
         (
             format!(
-                "OTEL LOG STREAM [SEVERITY: {active_sev}] · SCOPE: [{scope_label}] · {}/{total_logs} ENTRIES (ERR:{err_cnt} WARN:{warn_cnt} INFO:{info_cnt})",
-                body.len()
+                "OTEL LOG STREAM [SEVERITY: {active_sev}] · SCOPE: [{scope_label}] · {}/{total_logs} ENTRIES (ERR:{err_cnt} WARN:{warn_cnt} INFO:{info_cnt}) · FOLLOW: {}",
+                body.len(),
+                if state.follow_log { "ON" } else { "OFF" }
             ),
             SemanticTone::Info,
-            Some("c2-obs-service-select".into()),
-            state.obs_service_filter.is_some(),
+            Some("obs-log-follow-toggle".into()),
+            state.follow_log,
         ),
         (
             format!("ACTIVE SERVICES, CRATES & SIDECARS: [ * ALL ] · {services_summary}"),
             SemanticTone::Info,
             Some("c2-obs-service-select".into()),
-            false,
+            state.obs_service_filter.is_some(),
         ),
     ];
 
@@ -4814,8 +4871,16 @@ fn render_obs_logs(
     let obs_rows =
         (((screen_rect.h - 16.0) / (obs_font_px * 1.35)).floor() as usize).max(panel.grid.rows);
 
+    let avail_obs_rows = obs_rows.saturating_sub(headers.len()).max(1);
+    let total_obs_pages = u32::try_from(body.len().div_ceil(avail_obs_rows).max(1)).unwrap_or(1);
+    let effective_obs_page = if state.follow_log {
+        total_obs_pages.saturating_sub(1)
+    } else {
+        state.subview_page.min(total_obs_pages.saturating_sub(1))
+    };
     let (rows, page, total_pages) =
-        paginate_with_headers(headers, body, obs_rows, state.subview_page);
+        paginate_with_headers(headers, body, obs_rows, effective_obs_page);
+    state.rendered_obs_log_page.set(page);
     let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, cid, sel)| ScreenRow {
