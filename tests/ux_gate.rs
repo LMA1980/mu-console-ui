@@ -2242,4 +2242,36 @@ fn u23_c2_top_bar_declutter_header_skin_toggle_and_compact_dyslexia_switch() {
     assert!(!svg_logs.contains("2026-11-10T02:37:19.728991+00:00"));
     assert!(!svg_logs.contains("[stdout]"));
     assert_svg_zero_overflow(&svg_logs, 1440.0, 900.0, "u23_compact_ci_build_logs");
+
+    // 5. Clicking data-subview="logs" while in Area::Observe stays in OBS > Logs (#/obs/logs)
+    // and never redirects to CI > Queue & Logs; top bar replaces repo stepper with c2-obs-service-select.
+    st.select_area(Area::Observe);
+    assert_eq!(st.route.area, Area::Observe);
+    assert!(st.route.repo.is_none());
+    st.on_dom_action("data-subview", "logs", false, 3_500);
+    assert_eq!(st.route.area, Area::Observe);
+    assert_eq!(st.route.subview, SubView::Observe(ObserveSubView::Logs));
+    assert_eq!(format_hash(&st.route), "#/obs/logs");
+
+    let svg_obs_logs = render_console(
+        &WireframeSkin,
+        &st,
+        Viewport::new(1440.0, 900.0),
+        SafeArea::ZERO,
+    );
+    let html_obs_logs = render_html_shell(&svg_obs_logs, &st);
+    assert!(html_obs_logs.contains("placeholder=\"Filter services, crates, sidecars, logs...\""));
+    assert!(svg_obs_logs.contains("c2-obs-service-select"));
+    assert!(svg_obs_logs.contains("* All services"));
+    assert!(!svg_obs_logs.contains("c2-repo-select"));
+    assert!(svg_obs_logs.contains("ACTIVE SERVICES &amp; SIDECARS:"));
+    assert_svg_zero_overflow(&svg_obs_logs, 1440.0, 900.0, "u23_obs_logs_multi_service");
+
+    // Stepping service selector filters Observe logs by service and cycles back to * All services.
+    let services = st.observed_services();
+    assert!(!services.is_empty());
+    st.activate_target("c2-obs-service-next");
+    assert_eq!(st.obs_service_filter.as_deref(), Some(services[0].as_str()));
+    st.activate_target("c2-obs-service-prev");
+    assert!(st.obs_service_filter.is_none());
 }

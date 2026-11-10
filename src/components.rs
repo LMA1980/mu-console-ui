@@ -277,7 +277,8 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
         .filter(|(_, _, lit, _)| *lit)
         .collect();
 
-    let base_right = 218.0
+    let has_top_stepper = state.route.area != Area::Fleet;
+    let base_right = if has_top_stepper { 218.0 } else { 0.0 }
         + if show_sub { 88.0 } else { 0.0 }
         + active_lamps.len() as f64 * 60.0
         + 12.0
@@ -364,7 +365,11 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
             &Readout {
                 control_id: "c2-phone-rotary-trigger",
                 label: "",
-                value: "▾ REPO",
+                value: if state.route.area == Area::Observe {
+                    "▾ SVC"
+                } else {
+                    "▾ REPO"
+                },
                 rect: trigger_rect,
                 tone: SemanticTone::Warn,
                 interactive: true,
@@ -383,82 +388,139 @@ fn render_c2_top_bar(skin: &dyn Skin, w: &mut SvgWriter, state: &ConsoleState, f
         );
         render_font_switch(skin, w, state, font_rect);
     } else {
-        // Compact C2 Repository & Submodule Stepper (`[<] REPO [>]` + optional `SUB`).
-        let repo_label = current_repo.map_or("* All repositories", |x| x.id.repo.as_str());
-        let repo_display = if state.route.repo.is_none() || repo_total == 0 {
-            "* All repositories".to_owned()
-        } else {
-            let idx = state.outer_index.min(repo_total - 1) + 1;
-            format!("{idx}/{repo_total} {repo_label}")
-        };
-        let sub_label = if state.inner_index == 0 {
-            "PARENT"
-        } else {
-            current_repo
-                .and_then(|x| x.submodules.get(state.inner_index - 1))
-                .map_or("PARENT", |s| s.path.as_str())
-        };
         let step_w = 26.0;
         let repo_w = 156.0_f64.min(right_reserve * 0.45).max(96.0);
         let sub_w = 82.0_f64.min(right_reserve * 0.22).max(52.0);
         let mut cur_x = rx;
 
-        let prev_rect = clamp_rect(Rect::new(cur_x, inner.y, step_w, inner.h), inner);
-        skin.readout(
-            w,
-            &Readout {
-                control_id: "c2-repo-prev",
-                label: "",
-                value: "◀",
-                rect: prev_rect,
-                tone: SemanticTone::Info,
-                interactive: true,
-            },
-        );
-        cur_x = prev_rect.right() + 3.0;
-
-        let sel_rect = clamp_rect(Rect::new(cur_x, inner.y, repo_w, inner.h), inner);
-        skin.readout(
-            w,
-            &Readout {
-                control_id: "c2-repo-select",
-                label: "",
-                value: &repo_display,
-                rect: sel_rect,
-                tone: SemanticTone::Info,
-                interactive: true,
-            },
-        );
-        cur_x = sel_rect.right() + 3.0;
-
-        let next_rect = clamp_rect(Rect::new(cur_x, inner.y, step_w, inner.h), inner);
-        skin.readout(
-            w,
-            &Readout {
-                control_id: "c2-repo-next",
-                label: "",
-                value: "▶",
-                rect: next_rect,
-                tone: SemanticTone::Info,
-                interactive: true,
-            },
-        );
-        cur_x = next_rect.right() + 4.0;
-
-        if show_sub {
-            let sub_rect = clamp_rect(Rect::new(cur_x, inner.y, sub_w, inner.h), inner);
+        if state.route.area == Area::Observe {
+            let services = state.observed_services();
+            let svc_total = services.len();
+            let svc_display = match state.obs_service_filter.as_deref() {
+                None => "* All services".to_owned(),
+                Some(sel) => {
+                    let idx = services
+                        .iter()
+                        .position(|s| s.eq_ignore_ascii_case(sel))
+                        .map_or(1, |i| i + 1);
+                    format!("{idx}/{} {sel}", svc_total.max(1))
+                }
+            };
+            let prev_rect = clamp_rect(Rect::new(cur_x, inner.y, step_w, inner.h), inner);
             skin.readout(
                 w,
                 &Readout {
-                    control_id: "c2-sub-next",
-                    label: "SUB",
-                    value: sub_label,
-                    rect: sub_rect,
-                    tone: SemanticTone::Neutral,
+                    control_id: "c2-obs-service-prev",
+                    label: "",
+                    value: "◀",
+                    rect: prev_rect,
+                    tone: SemanticTone::Info,
                     interactive: true,
                 },
             );
-            cur_x = sub_rect.right() + 6.0;
+            cur_x = prev_rect.right() + 3.0;
+
+            let sel_rect = clamp_rect(Rect::new(cur_x, inner.y, repo_w, inner.h), inner);
+            skin.readout(
+                w,
+                &Readout {
+                    control_id: "c2-obs-service-select",
+                    label: "",
+                    value: &svc_display,
+                    rect: sel_rect,
+                    tone: SemanticTone::Info,
+                    interactive: true,
+                },
+            );
+            cur_x = sel_rect.right() + 3.0;
+
+            let next_rect = clamp_rect(Rect::new(cur_x, inner.y, step_w, inner.h), inner);
+            skin.readout(
+                w,
+                &Readout {
+                    control_id: "c2-obs-service-next",
+                    label: "",
+                    value: "▶",
+                    rect: next_rect,
+                    tone: SemanticTone::Info,
+                    interactive: true,
+                },
+            );
+            cur_x = next_rect.right() + 4.0;
+        } else if state.route.area != Area::Fleet {
+            // Compact C2 Repository & Submodule Stepper (`[<] REPO [>]` + optional `SUB`).
+            let repo_label = current_repo.map_or("* All repositories", |x| x.id.repo.as_str());
+            let repo_display = if state.route.repo.is_none() || repo_total == 0 {
+                "* All repositories".to_owned()
+            } else {
+                let idx = state.outer_index.min(repo_total - 1) + 1;
+                format!("{idx}/{repo_total} {repo_label}")
+            };
+            let sub_label = if state.inner_index == 0 {
+                "PARENT"
+            } else {
+                current_repo
+                    .and_then(|x| x.submodules.get(state.inner_index - 1))
+                    .map_or("PARENT", |s| s.path.as_str())
+            };
+
+            let prev_rect = clamp_rect(Rect::new(cur_x, inner.y, step_w, inner.h), inner);
+            skin.readout(
+                w,
+                &Readout {
+                    control_id: "c2-repo-prev",
+                    label: "",
+                    value: "◀",
+                    rect: prev_rect,
+                    tone: SemanticTone::Info,
+                    interactive: true,
+                },
+            );
+            cur_x = prev_rect.right() + 3.0;
+
+            let sel_rect = clamp_rect(Rect::new(cur_x, inner.y, repo_w, inner.h), inner);
+            skin.readout(
+                w,
+                &Readout {
+                    control_id: "c2-repo-select",
+                    label: "",
+                    value: &repo_display,
+                    rect: sel_rect,
+                    tone: SemanticTone::Info,
+                    interactive: true,
+                },
+            );
+            cur_x = sel_rect.right() + 3.0;
+
+            let next_rect = clamp_rect(Rect::new(cur_x, inner.y, step_w, inner.h), inner);
+            skin.readout(
+                w,
+                &Readout {
+                    control_id: "c2-repo-next",
+                    label: "",
+                    value: "▶",
+                    rect: next_rect,
+                    tone: SemanticTone::Info,
+                    interactive: true,
+                },
+            );
+            cur_x = next_rect.right() + 4.0;
+
+            if show_sub {
+                let sub_rect = clamp_rect(Rect::new(cur_x, inner.y, sub_w, inner.h), inner);
+                skin.readout(
+                    w,
+                    &Readout {
+                        control_id: "c2-sub-next",
+                        label: "SUB",
+                        value: sub_label,
+                        rect: sub_rect,
+                        tone: SemanticTone::Neutral,
+                        interactive: true,
+                    },
+                );
+                cur_x = sub_rect.right() + 6.0;
+            }
         }
 
         let lamp_w = 56.0;
@@ -4142,15 +4204,45 @@ fn render_obs_purepath(
     let mut body: Vec<OwnedCritRow> = Vec::new();
 
     if let Some(v) = state.client.view() {
+        let q = state.filter_query.trim().to_ascii_lowercase();
         let filtered_traces: Vec<_> = v
             .observe
             .traces
             .iter()
-            .filter(|t| match state.purepath_filter.as_str() {
-                "ERRORS" => t.error,
-                "SLOW P99" => t.slow_p99,
-                "CI" | "CD" | "REGISTRY" => t.domain.eq_ignore_ascii_case(&state.purepath_filter),
-                _ => true,
+            .filter(|t| {
+                let pill_ok = match state.purepath_filter.as_str() {
+                    "ERRORS" => t.error,
+                    "SLOW P99" => t.slow_p99,
+                    "CI" | "CD" | "REGISTRY" => {
+                        t.domain.eq_ignore_ascii_case(&state.purepath_filter)
+                    }
+                    _ => true,
+                };
+                if !pill_ok {
+                    return false;
+                }
+                if let Some(svc) = state.obs_service_filter.as_deref() {
+                    let svc_match = t.root_service.eq_ignore_ascii_case(svc)
+                        || t.spans
+                            .iter()
+                            .any(|sp| sp.service.eq_ignore_ascii_case(svc));
+                    if !svc_match {
+                        return false;
+                    }
+                }
+                if !q.is_empty() {
+                    let q_match = t.trace_id.to_ascii_lowercase().contains(&q)
+                        || t.root_service.to_ascii_lowercase().contains(&q)
+                        || t.root_operation.to_ascii_lowercase().contains(&q)
+                        || t.spans.iter().any(|sp| {
+                            sp.service.to_ascii_lowercase().contains(&q)
+                                || sp.operation.to_ascii_lowercase().contains(&q)
+                        });
+                    if !q_match {
+                        return false;
+                    }
+                }
+                true
             })
             .collect();
 
@@ -4393,7 +4485,23 @@ fn render_obs_problems_slos(
     )];
     let mut body: Vec<ProblemRow> = Vec::new();
     if let Some(v) = state.client.view() {
+        let q = state.filter_query.trim().to_ascii_lowercase();
         for p in &v.observe.problems {
+            if let Some(svc) = state.obs_service_filter.as_deref() {
+                let svc_lc = svc.to_ascii_lowercase();
+                if !p.impacted_entity.to_ascii_lowercase().contains(&svc_lc)
+                    && !p.title.to_ascii_lowercase().contains(&svc_lc)
+                {
+                    continue;
+                }
+            }
+            if !q.is_empty()
+                && !p.problem_id.to_ascii_lowercase().contains(&q)
+                && !p.impacted_entity.to_ascii_lowercase().contains(&q)
+                && !p.title.to_ascii_lowercase().contains(&q)
+            {
+                continue;
+            }
             let tone = if p.severity == "ERROR" {
                 SemanticTone::Fail
             } else {
@@ -4464,6 +4572,18 @@ fn render_obs_problems_slos(
             total_pages,
         },
     );
+}
+
+fn format_utc_time_ms(ts_ms: u64) -> String {
+    if ts_ms == 0 {
+        return "--:--:--.---".to_owned();
+    }
+    let day_ms = ts_ms % 86_400_000;
+    let hh = day_ms / 3_600_000;
+    let mm = (day_ms % 3_600_000) / 60_000;
+    let ss = (day_ms % 60_000) / 1_000;
+    let mmm = day_ms % 1_000;
+    format!("{hh:02}:{mm:02}:{ss:02}.{mmm:03}")
 }
 
 /// Render `OBS > Logs`: Sanitized OTel log stream with severity pills and `[TRACE ↗]` links.
@@ -4551,32 +4671,46 @@ fn render_obs_logs(
     );
 
     type LogRow = (String, SemanticTone, Option<String>, bool);
-    let headers: Vec<LogRow> = vec![(
-        format!("OTEL LOG STREAM [SEVERITY: {active_sev}] :: PUBLIC PRIVACY BOUNDARY ENFORCED"),
-        SemanticTone::Info,
-        None,
-        false,
-    )];
     let mut body: Vec<LogRow> = Vec::new();
+    let mut total_logs = 0_usize;
 
     if let Some(v) = state.client.view() {
+        total_logs = v.observe.logs.len();
+        let q = state.filter_query.trim().to_ascii_lowercase();
         for log in &v.observe.logs {
+            if let Some(svc) = state.obs_service_filter.as_deref() {
+                if !log.service.eq_ignore_ascii_case(svc) {
+                    continue;
+                }
+            }
             if let Some(flt) = state.log_severity_filter {
                 if log.severity != flt {
                     continue;
                 }
+            }
+            if !q.is_empty()
+                && !log.service.to_ascii_lowercase().contains(&q)
+                && !log.message.to_ascii_lowercase().contains(&q)
+                && !log.trace_id.to_ascii_lowercase().contains(&q)
+            {
+                continue;
             }
             let tone = match log.severity {
                 LogSeverity::Error => SemanticTone::Fail,
                 LogSeverity::Warn => SemanticTone::Warn,
                 LogSeverity::Info => SemanticTone::Neutral,
             };
+            let ts_str = format_utc_time_ms(log.timestamp_ms);
+            let sev_tag = match log.severity {
+                LogSeverity::Error => "ERROR",
+                LogSeverity::Warn => "WARN ",
+                LogSeverity::Info => "INFO ",
+            };
             let has_trace = !log.trace_id.is_empty() && !log.trace_id.chars().all(|c| c == '0');
             if has_trace {
                 body.push((
                     format!(
-                        "[{}] {:<18} {} [TRACE ↗ {}]",
-                        log.severity.label(),
+                        "{ts_str} [{sev_tag}] {:<20} {} [TRACE ↗ {}]",
                         log.service,
                         sanitize_public_log(&log.message),
                         log.trace_id
@@ -4588,8 +4722,7 @@ fn render_obs_logs(
             } else {
                 body.push((
                     format!(
-                        "[{}] {:<18} {}",
-                        log.severity.label(),
+                        "{ts_str} [{sev_tag}] {:<20} {}",
                         log.service,
                         sanitize_public_log(&log.message)
                     ),
@@ -4599,6 +4732,59 @@ fn render_obs_logs(
                 ));
             }
         }
+    }
+
+    let scope_label = state
+        .obs_service_filter
+        .as_deref()
+        .unwrap_or("* ALL SERVICES");
+    let services = state.observed_services();
+    let services_summary = if services.is_empty() {
+        "awaiting telemetry".to_owned()
+    } else {
+        services
+            .iter()
+            .take(6)
+            .map(|s| {
+                if state
+                    .obs_service_filter
+                    .as_deref()
+                    .is_some_and(|sel| sel.eq_ignore_ascii_case(s))
+                {
+                    format!("[*{s}]")
+                } else {
+                    format!("[{s}]")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    let headers: Vec<LogRow> = vec![
+        (
+            format!(
+                "OTEL LOG STREAM [SEVERITY: {active_sev}] · SCOPE: [{scope_label}] · {}/{total_logs} ENTRIES",
+                body.len()
+            ),
+            SemanticTone::Info,
+            Some("c2-obs-service-select".into()),
+            state.obs_service_filter.is_some(),
+        ),
+        (
+            format!("ACTIVE SERVICES & SIDECARS: [ * ALL ] · {services_summary}"),
+            SemanticTone::Info,
+            Some("c2-obs-service-select".into()),
+            false,
+        ),
+    ];
+
+    if body.is_empty() && total_logs > 0 {
+        body.push((
+            "0 MUOBSERVE LOG ENTRIES MATCHING CURRENT SERVICE / SEVERITY FILTER — CLICK TO RESET [* ALL SERVICES]"
+                .into(),
+            SemanticTone::Neutral,
+            Some("obs-service-reset".into()),
+            false,
+        ));
     }
 
     let (rows, page, total_pages) =
@@ -4680,7 +4866,19 @@ fn render_obs_metrics(
                 true,
             ));
         }
+        let q = state.filter_query.trim().to_ascii_lowercase();
         for (idx, m) in v.observe.metrics.iter().enumerate() {
+            if let Some(svc) = state.obs_service_filter.as_deref() {
+                if !m.service.eq_ignore_ascii_case(svc) {
+                    continue;
+                }
+            }
+            if !q.is_empty()
+                && !m.service.to_ascii_lowercase().contains(&q)
+                && !m.hardware_class.to_ascii_lowercase().contains(&q)
+            {
+                continue;
+            }
             let is_sel = idx == selected_idx;
             rows.push((
                 format!(
@@ -5314,6 +5512,17 @@ fn escape_html(s: &str) -> String {
     out
 }
 
+/// Context-sensitive placeholder text for the `#muconsole-filter` search input.
+#[must_use]
+pub const fn filter_placeholder(area: Area) -> &'static str {
+    match area {
+        Area::Observe => "Filter services, crates, sidecars, logs...",
+        Area::Fleet => "Filter worker nodes, sandbox profiles...",
+        Area::Registry => "Filter crates, packages, canaries...",
+        Area::Ci | Area::Cd => "Filter repositories...",
+    }
+}
+
 /// Render the accessible HTML shell wrapping `svg` with:
 /// - Skip-to-dashboard link (`#muconsole-dashboard`);
 /// - Operator authentication link (`#muconsole-auth-link`);
@@ -5357,13 +5566,14 @@ pub fn render_html_shell(svg: &str, state: &ConsoleState) -> String {
     let escaped_aria_assertive = escape_html(&state.aria_assertive);
     let escaped_auth_href = escape_html(auth_href);
     let escaped_auth_label = escape_html(&auth_label);
+    let placeholder = filter_placeholder(state.route.area);
 
     format!(
         "<div id=\"muconsole-shell\" data-crt-font=\"{font_attr}\" data-skin=\"{skin_attr}\" data-lazy-dyslexic=\"{lazy_dyslexic}\" data-area=\"{area}\" data-subview=\"{subview}\" data-auth-state=\"{auth_slug}\">\
          <style>{dyslexic_face}#muconsole-filter{{font-size:16px;}}#muconsole-auth-link{{margin-left:0;}}</style>\
          <header id=\"muconsole-header\" role=\"banner\">\
          <a href=\"#muconsole-dashboard\" class=\"skip-link\">Skip to dashboard</a>\
-         <input id=\"muconsole-filter\" type=\"search\" placeholder=\"Filter repositories...\" aria-label=\"Type-ahead repository filter\" style=\"font-size:16px\" value=\"{escaped_filter_query}\"/>\
+         <input id=\"muconsole-filter\" type=\"search\" placeholder=\"{placeholder}\" aria-label=\"Type-ahead repository filter\" style=\"font-size:16px\" value=\"{escaped_filter_query}\"/>\
          <div id=\"muconsole-aria-polite\" role=\"status\" aria-live=\"polite\" aria-atomic=\"true\">{escaped_aria_polite}</div>\
          <div id=\"muconsole-aria-assertive\" role=\"alert\" aria-live=\"assertive\" aria-atomic=\"true\">{escaped_aria_assertive}</div>\
          <button id=\"muconsole-skin-toggle\" type=\"button\" data-skin-toggle=\"true\" aria-label=\"Toggle visual skin\" style=\"margin-left:auto;font-family:var(--font-crt);font-size:10px;line-height:1.1;color:var(--accent-neon-cyan);background:rgba(5,10,14,0.85);border:1px solid var(--accent-neon-cyan);border-radius:3px;padding:2px 6px;cursor:pointer;white-space:nowrap\">{skin_label}</button>\

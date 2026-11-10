@@ -297,12 +297,14 @@ pub fn breadcrumb_segments(route: &Route, bp: Breakpoint) -> Vec<BreadcrumbCrumb
             value: sv.label().to_owned(),
         },
     ];
-    if let Some(repo) = route.repo.as_ref() {
-        crumbs.push(BreadcrumbCrumb {
-            id: "c2-repo",
-            label: "REPO",
-            value: format!("{}/{}", repo.owner, repo.repo),
-        });
+    if !matches!(route.area, Area::Observe | Area::Fleet) {
+        if let Some(repo) = route.repo.as_ref() {
+            crumbs.push(BreadcrumbCrumb {
+                id: "c2-repo",
+                label: "REPO",
+                value: format!("{}/{}", repo.owner, repo.repo),
+            });
+        }
     }
     if let Some(sub) = route.submodule.as_ref() {
         crumbs.push(BreadcrumbCrumb {

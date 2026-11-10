@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use mu_console_layout::{scorecard_page_capacity, solve, SafeArea, Viewport};
 use mu_console_protocol::{
     Area, AuthState, CdSubView, CiSubView, ConsoleSkin, CrtFont, LogSeverity, ObserveSubView,
-    PackageEcosystem, PanelId, RegistrySubView, RepoId, RepoScore, Route, SubView, SubmoduleId,
-    UiCommand,
+    PackageEcosystem, PanelId, RegistrySubView, RepoId, RepoScore, Route, SmartscapeLayer, SubView,
+    SubmoduleId, UiCommand,
 };
 use mu_console_theme::instruments::switch::SwitchAction;
 use mu_console_theme::interaction::{SwitchEvent, SwitchOutcome, SwitchState};
@@ -343,6 +343,8 @@ pub struct ConsoleState {
     pub selected_node_id: Option<String>,
     /// `OBS > Logs` severity filter (`None` = `ALL`).
     pub log_severity_filter: Option<LogSeverity>,
+    /// `OBS` multi-service filter (`None` = `* All services`, `Some(service)` = single service/sidecar).
+    pub obs_service_filter: Option<String>,
     /// Polite `aria-live` announcement text.
     pub aria_polite: String,
     /// Assertive `aria-live` alert text.
@@ -412,6 +414,7 @@ impl ConsoleState {
             selected_span_id: None,
             selected_node_id: None,
             log_severity_filter: None,
+            obs_service_filter: None,
             aria_polite: String::new(),
             aria_assertive: String::new(),
             pending_invite: None,
@@ -472,7 +475,12 @@ impl ConsoleState {
 
     /// Restore active repository from `localStorage` (`muconsole.active_repo`) when URL has none.
     pub fn restore_stored_repo(&mut self, stored_repo: Option<&str>) {
-        if self.route.repo.is_some() {
+        if self.route.repo.is_some()
+            || !matches!(
+                self.route.subview,
+                SubView::Ci(CiSubView::Trainway) | SubView::Cd(CdSubView::IntegrationGate)
+            )
+        {
             return;
         }
         let Some(raw) = stored_repo.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -808,9 +816,95 @@ impl ConsoleState {
         self.aria_polite = format!("Selected submodule {label}");
     }
 
+    /// Distinct sorted services, crates, and sidecar components observed in `MuObserve`.
+    #[must_use]
+    pub fn observed_services(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(v) = self.client.view() {
+            for log in &v.observe.logs {
+                let s = log.service.trim();
+                if !s.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(s)) {
+                    out.push(s.to_owned());
+                }
+            }
+            for m in &v.observe.metrics {
+                let s = m.service.trim();
+                if !s.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(s)) {
+                    out.push(s.to_owned());
+                }
+            }
+            for t in &v.observe.traces {
+                let rs = t.root_service.trim();
+                if !rs.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(rs)) {
+                    out.push(rs.to_owned());
+                }
+                for sp in &t.spans {
+                    let s = sp.service.trim();
+                    if !s.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(s)) {
+                        out.push(s.to_owned());
+                    }
+                }
+            }
+            for n in &v.observe.smartscape_nodes {
+                if n.layer == SmartscapeLayer::Service {
+                    let s = n.id.strip_prefix("svc:").unwrap_or(&n.label).trim();
+                    if !s.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(s)) {
+                        out.push(s.to_owned());
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|a| a.to_ascii_lowercase());
+        out
+    }
+
+    /// Step the `OBS` service filter (`* All services` <-> `1/N <service>`).
+    pub fn rotate_obs_service(&mut self, delta: isize) {
+        let services = self.observed_services();
+        if services.is_empty() || delta == 0 {
+            self.obs_service_filter = None;
+            return;
+        }
+        let len = isize::try_from(services.len()).unwrap_or(1);
+        let Some(cur_svc) = self.obs_service_filter.as_deref() else {
+            let next_idx = if delta > 0 {
+                0_usize
+            } else {
+                services.len() - 1
+            };
+            let chosen = services[next_idx].clone();
+            self.obs_service_filter = Some(chosen.clone());
+            self.subview_page = 0;
+            self.aria_polite = format!("Filtered Observe by service {chosen}");
+            return;
+        };
+        let cur = services
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(cur_svc))
+            .and_then(|i| isize::try_from(i).ok())
+            .unwrap_or(0);
+        if (cur == 0 && delta < 0) || (cur + 1 == len && delta > 0) {
+            self.obs_service_filter = None;
+            self.subview_page = 0;
+            self.aria_polite = "Selected * All services".to_owned();
+            return;
+        }
+        let next = usize::try_from((cur + delta).rem_euclid(len)).unwrap_or(0);
+        let chosen = services[next].clone();
+        self.obs_service_filter = Some(chosen.clone());
+        self.subview_page = 0;
+        self.aria_polite = format!("Filtered Observe by service {chosen}");
+    }
+
     /// Update the `/` type-ahead filter and snap `outer_index` to the first
     /// matching repository (or return to `* All repositories` when cleared on overview views).
     pub fn set_filter_query(&mut self, query: &str, now_ms: u64) {
+        if matches!(self.route.area, Area::Observe | Area::Fleet) {
+            self.filter_query = query.to_owned();
+            self.subview_page = 0;
+            self.fleet_page = 0;
+            return;
+        }
         self.filter_query = query.to_owned();
         self.outer_index = 0;
         self.inner_index = 0;
@@ -835,6 +929,13 @@ impl ConsoleState {
     }
 
     fn prune_unused_route_params(&mut self, sv: SubView) {
+        if matches!(sv.area(), Area::Observe | Area::Fleet) {
+            self.route.repo = None;
+            self.route.submodule = None;
+            self.route.branch = None;
+            self.route.job = None;
+            self.inner_index = 0;
+        }
         if !matches!(sv, SubView::Ci(CiSubView::Trainway | CiSubView::QueueLogs)) {
             self.route.branch = None;
             self.route.job = None;
@@ -1063,19 +1164,32 @@ impl ConsoleState {
                 }
             }
             "data-subview" => {
+                if let Some(sv) = parse_subview(self.route.area, attr_val) {
+                    return self.select_subview(sv);
+                }
                 for area in Area::ALL {
                     if let Some(sv) = parse_subview(area, attr_val) {
                         return self.select_subview(sv);
                     }
                 }
             }
-            "data-repo-step" => match attr_val {
-                "prev" => self.rotate_outer(-1, now_ms),
-                "next" => self.rotate_outer(1, now_ms),
-                "sub-prev" => self.rotate_inner(-1, now_ms),
-                "sub-next" => self.rotate_inner(1, now_ms),
-                _ => {}
-            },
+            "data-repo-step" => {
+                if self.route.area == Area::Observe {
+                    match attr_val {
+                        "prev" => self.rotate_obs_service(-1),
+                        "next" => self.rotate_obs_service(1),
+                        _ => {}
+                    }
+                } else {
+                    match attr_val {
+                        "prev" => self.rotate_outer(-1, now_ms),
+                        "next" => self.rotate_outer(1, now_ms),
+                        "sub-prev" => self.rotate_inner(-1, now_ms),
+                        "sub-next" => self.rotate_inner(1, now_ms),
+                        _ => {}
+                    }
+                }
+            }
             "data-page-step" => match attr_val {
                 "prev" => self.step_active_page(-1),
                 "next" => self.step_active_page(1),
@@ -1213,6 +1327,24 @@ impl ConsoleState {
             .or_else(|| id.strip_prefix("logsev:"))
         {
             return self.on_dom_action("data-log-severity", sev, shift, now_ms);
+        }
+        if let Some(svc) = id.strip_prefix("obs-service:") {
+            let trimmed = svc.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("ALL") || trimmed == "*" {
+                self.obs_service_filter = None;
+                self.aria_polite = "Selected * All services".to_owned();
+            } else {
+                self.obs_service_filter = Some(trimmed.to_owned());
+                self.aria_polite = format!("Filtered Observe by service {trimmed}");
+            }
+            self.subview_page = 0;
+            return Vec::new();
+        }
+        if id == "obs-service-reset" {
+            self.obs_service_filter = None;
+            self.subview_page = 0;
+            self.aria_polite = "Selected * All services".to_owned();
+            return Vec::new();
         }
         if id == "ci-queue-filter" {
             self.ci_queue_filter = (self.ci_queue_filter + 1) % 4;
@@ -1583,6 +1715,14 @@ impl ConsoleState {
                 self.rotate_outer(1, now_ms);
                 Vec::new()
             }
+            "c2-obs-service-prev" => {
+                self.rotate_obs_service(-1);
+                Vec::new()
+            }
+            "c2-obs-service-next" | "c2-obs-service-select" => {
+                self.rotate_obs_service(1);
+                Vec::new()
+            }
             "c2-sub-prev" | "c3-rotary:inner-prev" => {
                 self.rotate_inner(-1, now_ms);
                 Vec::new()
@@ -1740,7 +1880,9 @@ impl ConsoleState {
                 None
             }
             "ArrowUp" | "<" | "," => {
-                if shift {
+                if self.route.area == Area::Observe {
+                    self.rotate_obs_service(-1);
+                } else if shift {
                     self.rotate_inner(-1, now_ms);
                 } else {
                     self.rotate_outer(-1, now_ms);
@@ -1748,7 +1890,9 @@ impl ConsoleState {
                 None
             }
             "ArrowDown" | ">" | "." => {
-                if shift {
+                if self.route.area == Area::Observe {
+                    self.rotate_obs_service(1);
+                } else if shift {
                     self.rotate_inner(1, now_ms);
                 } else {
                     self.rotate_outer(1, now_ms);
