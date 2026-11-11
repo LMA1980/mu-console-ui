@@ -4519,19 +4519,35 @@ fn render_obs_problems_slos(
         for p in &v.observe.problems {
             if let Some(svc) = state.obs_service_filter.as_deref() {
                 let svc_lc = svc.to_ascii_lowercase();
-                if !service_filter_matches(svc, &p.impacted_entity)
-                    && !p.impacted_entity.to_ascii_lowercase().contains(&svc_lc)
-                    && !p.title.to_ascii_lowercase().contains(&svc_lc)
-                {
+                let matches_impacted = service_filter_matches(svc, &p.impacted_entity)
+                    || p.impacted_entity.to_ascii_lowercase().contains(&svc_lc);
+                let matches_root = service_filter_matches(svc, &p.root_cause_service)
+                    || p.root_cause_service.to_ascii_lowercase().contains(&svc_lc);
+                let matches_affected = p.affected_services.iter().any(|s| {
+                    service_filter_matches(svc, s) || s.to_ascii_lowercase().contains(&svc_lc)
+                });
+                let matches_title = p.title.to_ascii_lowercase().contains(&svc_lc);
+                if !matches_impacted && !matches_root && !matches_affected && !matches_title {
                     continue;
                 }
             }
-            if !q.is_empty()
-                && !p.problem_id.to_ascii_lowercase().contains(&q)
-                && !p.impacted_entity.to_ascii_lowercase().contains(&q)
-                && !p.title.to_ascii_lowercase().contains(&q)
-            {
-                continue;
+            if !q.is_empty() {
+                let matches_id = p.problem_id.to_ascii_lowercase().contains(&q);
+                let matches_impacted = p.impacted_entity.to_ascii_lowercase().contains(&q);
+                let matches_root = p.root_cause_service.to_ascii_lowercase().contains(&q);
+                let matches_affected = p
+                    .affected_services
+                    .iter()
+                    .any(|s| s.to_ascii_lowercase().contains(&q));
+                let matches_title = p.title.to_ascii_lowercase().contains(&q);
+                if !matches_id
+                    && !matches_impacted
+                    && !matches_root
+                    && !matches_affected
+                    && !matches_title
+                {
+                    continue;
+                }
             }
             let is_critical = p.severity.eq_ignore_ascii_case("critical")
                 || p.severity.eq_ignore_ascii_case("error");
@@ -4578,6 +4594,17 @@ fn render_obs_problems_slos(
                     format!(
                         "     CAUSAL CHAIN: [{}] · CONFIDENCE: {}%",
                         chain, p.confidence_score
+                    ),
+                    SemanticTone::Info,
+                    None,
+                    None,
+                ));
+            }
+            if !p.affected_services.is_empty() {
+                body.push((
+                    format!(
+                        "     AFFECTED SERVICES: [{}]",
+                        p.affected_services.join(", ")
                     ),
                     SemanticTone::Info,
                     None,
@@ -6327,5 +6354,45 @@ mod tests {
         );
         assert!(svg_rca.contains("CORRELATED ERROR: Connection reset by peer"));
         assert!(svg_rca.contains("AI DIAGNOSIS: Root cause is payment gateway socket exhaustion"));
+        assert!(svg_rca.contains("AFFECTED SERVICES: [svc:checkout, svc:frontend]"));
+
+        // Filter by affected service matches problem
+        st.obs_service_filter = Some("frontend".into());
+        let svg_filtered = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(svg_filtered.contains("PRB-CANARY-01"));
+
+        // Filter by query text matches affected service
+        st.obs_service_filter = None;
+        st.filter_query = "frontend".into();
+        let svg_q_filtered = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(svg_q_filtered.contains("PRB-CANARY-01"));
+
+        // Filter by unrelated service filters out problem
+        st.obs_service_filter = Some("unrelated-service".into());
+        st.filter_query.clear();
+        let svg_unrelated = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(!svg_unrelated.contains("PRB-CANARY-01"));
+        assert!(svg_unrelated.contains("0 ACTIVE CAUSAL PROBLEMS DETECTED"));
+
+        // Verify observed_services harvested affected services and root cause service
+        let observed = st.observed_services();
+        assert!(observed.contains(&"checkout".to_string()));
+        assert!(observed.contains(&"frontend".to_string()));
+        assert!(observed.contains(&"payment-gw".to_string()));
     }
 }
