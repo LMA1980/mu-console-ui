@@ -6322,7 +6322,9 @@ mod tests {
         );
         assert!(svg_rca.contains("PRB-CANARY-01"));
         assert!(svg_rca.contains("ROOT CAUSE: svc:payment-gw [SPAN sp-gw-42]"));
-        assert!(svg_rca.contains("CAUSAL CHAIN: [svc:checkout -&gt; svc:payment-gw] · CONFIDENCE: 95%"));
+        assert!(
+            svg_rca.contains("CAUSAL CHAIN: [svc:checkout -&gt; svc:payment-gw] · CONFIDENCE: 95%")
+        );
         assert!(svg_rca.contains("CORRELATED ERROR: Connection reset by peer"));
         assert!(svg_rca.contains("AI DIAGNOSIS: Root cause is payment gateway socket exhaustion"));
     }
