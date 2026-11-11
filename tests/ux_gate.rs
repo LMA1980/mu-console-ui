@@ -2374,3 +2374,137 @@ fn u23_c2_top_bar_declutter_header_skin_toggle_and_compact_dyslexia_switch() {
     assert!(!svg_ci_prev.contains("ci-tail-line-069"));
     assert!(!svg_ci_prev.contains("ci-tail-line-000"));
 }
+
+#[test]
+fn u24_dist_freshness_and_submodule_alignment() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = if manifest_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == "code")
+    {
+        manifest_dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    } else {
+        manifest_dir.parent().unwrap().join("mu-console")
+    };
+    let dist_dir = repo_root.join("dist");
+
+    // 1. Core WASM binaries exist and have non-trivial size (> 100KB)
+    let ui_wasm = dist_dir.join("muconsole-ui_bg.wasm");
+    assert!(
+        ui_wasm.exists(),
+        "dist/muconsole-ui_bg.wasm missing; run scripts/build-dist.sh"
+    );
+    let ui_size = std::fs::metadata(&ui_wasm).expect("metadata ui_wasm").len();
+    assert!(
+        ui_size > 100_000,
+        "dist/muconsole-ui_bg.wasm size {ui_size} is suspiciously small (<100KB)"
+    );
+
+    let data_wasm = dist_dir.join("muconsole-data_bg.wasm");
+    assert!(
+        data_wasm.exists(),
+        "dist/muconsole-data_bg.wasm missing; run scripts/build-dist.sh"
+    );
+    let data_size = std::fs::metadata(&data_wasm)
+        .expect("metadata data_wasm")
+        .len();
+    assert!(
+        data_size > 100_000,
+        "dist/muconsole-data_bg.wasm size {data_size} is suspiciously small (<100KB)"
+    );
+
+    // 2. JS bindings and loader shim exist
+    let ui_js = dist_dir.join("muconsole-ui.js");
+    assert!(ui_js.exists(), "dist/muconsole-ui.js missing");
+    let ui_js_content = std::fs::read_to_string(&ui_js).expect("read ui.js");
+    assert!(
+        ui_js_content.contains("wasm_bindgen"),
+        "ui.js missing wasm_bindgen"
+    );
+
+    let data_js = dist_dir.join("muconsole-data.js");
+    assert!(data_js.exists(), "dist/muconsole-data.js missing");
+
+    let loader_js = dist_dir.join("muconsole-data_loader.js");
+    assert!(loader_js.exists(), "dist/muconsole-data_loader.js missing");
+    let loader_content = std::fs::read_to_string(&loader_js).expect("read data_loader.js");
+    assert!(
+        loader_content.contains("importScripts(\"/muconsole-data.js?v="),
+        "loader missing versioned data.js import"
+    );
+    assert!(
+        loader_content.contains("wasm_bindgen(\"/muconsole-data_bg.wasm?v="),
+        "loader missing versioned data_bg.wasm import"
+    );
+
+    // 3. index.html contains versioned asset queries
+    let index_html = dist_dir.join("index.html");
+    assert!(index_html.exists(), "dist/index.html missing");
+    let index_content = std::fs::read_to_string(&index_html).expect("read index.html");
+    assert!(
+        index_content.contains("href=\"/tokens.css?v="),
+        "index.html missing versioned tokens.css"
+    );
+    assert!(
+        index_content.contains("from '/muconsole-ui.js?v="),
+        "index.html missing versioned muconsole-ui.js"
+    );
+    assert!(
+        index_content.contains("init('/muconsole-ui_bg.wasm?v="),
+        "index.html missing versioned muconsole-ui_bg.wasm"
+    );
+
+    // 4. Git history timestamp comparison if in git repository
+    if let Ok(output) = std::process::Command::new("git")
+        .args([
+            "-C",
+            repo_root.to_str().unwrap(),
+            "rev-parse",
+            "--is-inside-work-tree",
+        ])
+        .output()
+    {
+        if output.status.success() {
+            let get_ts = |path: &str| -> Option<u64> {
+                let out = std::process::Command::new("git")
+                    .args([
+                        "-C",
+                        repo_root.to_str().unwrap(),
+                        "log",
+                        "-1",
+                        "--format=%ct",
+                        "--",
+                        path,
+                    ])
+                    .output()
+                    .ok()?;
+                if out.status.success() {
+                    String::from_utf8_lossy(&out.stdout)
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                } else {
+                    None
+                }
+            };
+
+            if let (Some(dist_ts), Some(ui_ts), Some(data_ts)) = (
+                get_ts("dist/muconsole-ui_bg.wasm"),
+                get_ts("code/ui"),
+                get_ts("code/data"),
+            ) {
+                assert!(
+                    dist_ts >= ui_ts && dist_ts >= data_ts,
+                    "dist/muconsole-ui_bg.wasm ({dist_ts}) is older than code/ui ({ui_ts}) or code/data ({data_ts}) git commit!\n\
+                     Run scripts/build-dist.sh and commit updated dist/ artifacts."
+                );
+            }
+        }
+    }
+}

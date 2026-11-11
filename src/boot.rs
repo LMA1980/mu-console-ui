@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use js_sys::{Array, ArrayBuffer, Date, Uint8Array};
 use mu_console_layout::{SafeArea, Viewport};
-use mu_console_protocol::{AuthState, ConsoleSkin, UiCommand, WorkerConfig};
+use mu_console_protocol::{AuthState, UiCommand, WorkerConfig};
 use mu_console_theme::skin::Skin;
 use mu_console_theme::wireframe::WireframeSkin;
 use wasm_bindgen::prelude::*;
