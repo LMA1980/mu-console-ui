@@ -1543,10 +1543,10 @@ fn u18_avionics_skin_switcher_and_operator_job_restart_actions() {
     use mu_console_theme::wireframe::AvionicsSkin;
     use mu_console_ui::state::parse_skin_pref;
 
-    // 1. Skin query parameter and storage preference parsing.
+    // 1. Skin preference parsing enforces WireframeSkin invariant strictly.
     assert_eq!(
         parse_skin_pref("?skin=avionics", None),
-        ConsoleSkin::Avionics
+        ConsoleSkin::Wireframe
     );
     assert_eq!(
         parse_skin_pref("?skin=wireframe", Some("avionics")),
@@ -1554,7 +1554,7 @@ fn u18_avionics_skin_switcher_and_operator_job_restart_actions() {
     );
     assert_eq!(
         parse_skin_pref("", Some("skeuomorphic")),
-        ConsoleSkin::Avionics
+        ConsoleSkin::Wireframe
     );
 
     let mut st = state_for_scenario(
@@ -1564,15 +1564,14 @@ fn u18_avionics_skin_switcher_and_operator_job_restart_actions() {
     );
     assert_eq!(st.skin, ConsoleSkin::Wireframe);
 
-    // 2. Toggle skin via 's' hotkey and via data-skin-toggle button.
+    // 2. WireframeSkin invariant: 's' hotkey is disabled and data-skin-toggle button is locked to Wireframe.
     let key_cmd = st.on_key("s", false, 50);
-    assert_eq!(st.skin, ConsoleSkin::Avionics);
-    assert_eq!(key_cmd, Some(UiCommand::SetSkin(ConsoleSkin::Avionics)));
-    assert!(st.aria_polite.contains("avionics"));
+    assert_eq!(st.skin, ConsoleSkin::Wireframe);
+    assert_eq!(key_cmd, None);
 
-    let shell_av = render_html_shell("<svg id=\"canvas\"></svg>", &st);
-    assert!(shell_av.contains("data-skin=\"avionics\""));
-    assert!(shell_av.contains("SKIN: AVIONICS [S]"));
+    let shell_wf = render_html_shell("<svg id=\"canvas\"></svg>", &st);
+    assert!(shell_wf.contains("data-skin=\"wireframe\""));
+    assert!(shell_wf.contains("SKIN: WIREFRAME"));
 
     let btn_cmds = st.on_dom_action("data-skin-toggle", "true", false, 100);
     assert_eq!(st.skin, ConsoleSkin::Wireframe);
