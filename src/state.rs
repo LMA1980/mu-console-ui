@@ -875,6 +875,13 @@ impl ConsoleState {
                     push_observed_service(&mut out, s);
                 }
             }
+            for p in &v.observe.problems {
+                push_observed_service(&mut out, &p.impacted_entity);
+                push_observed_service(&mut out, &p.root_cause_service);
+                for aff in &p.affected_services {
+                    push_observed_service(&mut out, aff);
+                }
+            }
         }
         out.sort_by_key(|a| a.to_ascii_lowercase());
         out
