@@ -4533,7 +4533,9 @@ fn render_obs_problems_slos(
             {
                 continue;
             }
-            let tone = if p.severity == "ERROR" {
+            let is_critical = p.severity.eq_ignore_ascii_case("critical")
+                || p.severity.eq_ignore_ascii_case("error");
+            let tone = if is_critical {
                 SemanticTone::Fail
             } else {
                 SemanticTone::Warn
@@ -4551,15 +4553,53 @@ fn render_obs_problems_slos(
                 Some(SignalGlyph::BlockFailed),
                 Some(format!("trace:{}", p.root_cause_trace_id)),
             ));
+            let root_svc = if p.root_cause_service.is_empty() {
+                "unknown".to_string()
+            } else {
+                p.root_cause_service.clone()
+            };
+            let span_id_str = p.root_cause_span_id.as_deref().unwrap_or("none");
             body.push((
                 format!(
-                    "  └─ IMPACTED: {} · ROOT CAUSE TRACE: {} (CLICK TO INSPECT WATERFALL)",
-                    p.impacted_entity, p.root_cause_trace_id
+                    "  └─ IMPACTED: {} · ROOT CAUSE: {} [SPAN {}] · TRACE: {}",
+                    p.impacted_entity, root_svc, span_id_str, p.root_cause_trace_id
                 ),
                 SemanticTone::Info,
                 None,
                 Some(format!("trace:{}", p.root_cause_trace_id)),
             ));
+            if !p.causal_chain.is_empty() || p.confidence_score > 0 {
+                let chain = if p.causal_chain.is_empty() {
+                    root_svc
+                } else {
+                    p.causal_chain.join(" -> ")
+                };
+                body.push((
+                    format!(
+                        "     CAUSAL CHAIN: [{}] · CONFIDENCE: {}%",
+                        chain, p.confidence_score
+                    ),
+                    SemanticTone::Info,
+                    None,
+                    None,
+                ));
+            }
+            if let Some(ref err) = p.root_cause_error_message {
+                body.push((
+                    format!("     CORRELATED ERROR: {}", err),
+                    SemanticTone::Fail,
+                    None,
+                    None,
+                ));
+            }
+            if let Some(ref diag) = p.ai_diagnosis {
+                body.push((
+                    format!("     AI DIAGNOSIS: {}", diag),
+                    SemanticTone::Info,
+                    None,
+                    None,
+                ));
+            }
         }
         if body.is_empty() {
             body.push((
@@ -5266,6 +5306,8 @@ fn render_obs_ingress(
             ));
         }
 
+        let q = state.filter_query.trim().to_ascii_lowercase();
+
         // 2. Dynamic Ingress Routes Table
         body.push((
             "── ACTIVE INGRESS ROUTES ──────────────────────────────────────────────────────────"
@@ -5277,7 +5319,7 @@ fn render_obs_ingress(
         ));
         if v.observe.ingress_routes.is_empty() {
             body.push((
-                "  No active ingress routes registered. Listening on HTTP/2 & HTTP/3 QUIC.".into(),
+                "  No active ingress routes registered. Listening on HTTP/1.1 TCP.".into(),
                 SemanticTone::Neutral,
                 None,
                 None,
@@ -5285,6 +5327,14 @@ fn render_obs_ingress(
             ));
         } else {
             for r in &v.observe.ingress_routes {
+                if !q.is_empty()
+                    && !r.route_id.to_ascii_lowercase().contains(&q)
+                    && !r.path_prefix.to_ascii_lowercase().contains(&q)
+                    && !r.upstream_url.to_ascii_lowercase().contains(&q)
+                    && !r.service_name.to_ascii_lowercase().contains(&q)
+                {
+                    continue;
+                }
                 let tone = if r.error_rate_pct > 5.0 {
                     SemanticTone::Fail
                 } else if r.error_rate_pct > 1.0 {
@@ -5331,6 +5381,14 @@ fn render_obs_ingress(
             ));
         } else {
             for u in &v.observe.ingress_upstreams {
+                if !q.is_empty()
+                    && !u.upstream_id.to_ascii_lowercase().contains(&q)
+                    && !u.target_url.to_ascii_lowercase().contains(&q)
+                    && !u.service_name.to_ascii_lowercase().contains(&q)
+                    && !u.health_state.to_ascii_lowercase().contains(&q)
+                {
+                    continue;
+                }
                 let tone = match u.health_state.to_ascii_uppercase().as_str() {
                     "HEALTHY" => SemanticTone::Pass,
                     "DEGRADED" => SemanticTone::Warn,
@@ -5355,7 +5413,9 @@ fn render_obs_ingress(
         }
     }
 
-    let screen_rows: Vec<ScreenRow<'_>> = body
+    let (rows, page, total_pages) =
+        paginate_with_headers(Vec::new(), body, panel.grid.rows, state.subview_page);
+    let screen_rows: Vec<ScreenRow<'_>> = rows
         .iter()
         .map(|(txt, tone, glyph, c_id, sel)| ScreenRow {
             text: txt.as_str(),
@@ -5381,8 +5441,8 @@ fn render_obs_ingress(
             lines: &screen_rows,
             stations: &[],
             tracks: &[],
-            page: 0,
-            total_pages: 1,
+            page,
+            total_pages,
         },
     );
 }
@@ -6170,5 +6230,100 @@ mod tests {
         assert!(shell.contains("id=\"muconsole-skin-toggle\""));
         assert!(shell.contains("disabled"));
         assert!(shell.contains("SKIN: WIREFRAME"));
+    }
+
+    #[test]
+    fn test_obs_ingress_filtering_and_causal_rca_rendering() {
+        use mu_console_protocol::dto::{IngressRouteDto, IngressUpstreamDto};
+        use mu_console_protocol::view::SloProblem;
+        use mu_console_protocol::ProblemCategory;
+
+        let mut vm = ViewModel::default();
+        vm.observe.ingress_routes.push(IngressRouteDto {
+            route_id: "route-cd".into(),
+            path_prefix: "/api/cd/".into(),
+            upstream_url: "http://127.0.0.1:8444".into(),
+            auth_required: true,
+            strip_prefix: true,
+            service_name: "mu-cd-controller".into(),
+            request_count: 100,
+            request_rate_rps: 42.5,
+            error_rate_pct: 0.0,
+            p95_latency_ms: 12.0,
+        });
+        vm.observe.ingress_routes.push(IngressRouteDto {
+            route_id: "route-obs".into(),
+            path_prefix: "/api/obs/".into(),
+            upstream_url: "http://127.0.0.1:9480".into(),
+            auth_required: false,
+            strip_prefix: false,
+            service_name: "mu-observable-hub".into(),
+            request_count: 500,
+            request_rate_rps: 120.0,
+            error_rate_pct: 0.1,
+            p95_latency_ms: 4.0,
+        });
+        vm.observe.ingress_upstreams.push(IngressUpstreamDto {
+            upstream_id: "upstream-cd-main".into(),
+            target_url: "http://127.0.0.1:8444".into(),
+            service_name: "mu-cd-controller".into(),
+            health_state: "HEALTHY".into(),
+            last_check_ms: 0,
+            latency_ms: 12.0,
+            active_connections: 5,
+            success_rate_pct: 100.0,
+        });
+        vm.observe.problems.push(SloProblem {
+            problem_id: "PRB-CANARY-01".into(),
+            title: "Latency regression on checkout".into(),
+            category: ProblemCategory::LatencyRegression,
+            severity: "CRITICAL".into(),
+            burn_rate_bp: 450,
+            impacted_entity: "svc:checkout".into(),
+            root_cause_trace_id: "tr-test-rca-01".into(),
+            active: true,
+            causal_chain: vec!["svc:checkout".into(), "svc:payment-gw".into()],
+            confidence_score: 95,
+            root_cause_service: "svc:payment-gw".into(),
+            root_cause_span_id: Some("sp-gw-42".into()),
+            root_cause_error_message: Some("Connection reset by peer".into()),
+            summary: "Upstream payment gateway timeout".into(),
+            affected_services: vec!["svc:checkout".into(), "svc:frontend".into()],
+            ai_diagnosis: Some("Root cause is payment gateway socket exhaustion".into()),
+        });
+
+        let mut st = ConsoleState::new();
+        let snap = encode(&DataEvent::Snapshot(vm)).expect("encode");
+        st.on_worker_frame(&snap);
+
+        // Ingress route selection sets filter query
+        st.select_subview(SubView::Observe(ObserveSubView::Ingress));
+        st.activate_target("ingress-route:route-cd");
+        assert_eq!(st.filter_query, "route-cd");
+        assert_eq!(st.aria_polite, "Selected Ingress route route-cd");
+
+        let svg = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(svg.contains("ROUTE route-cd"));
+        assert!(!svg.contains("ROUTE route-obs")); // Filtered out
+
+        // Problems & SLOs RCA details rendering
+        st.filter_query.clear();
+        st.select_subview(SubView::Observe(ObserveSubView::ProblemsSlos));
+        let svg_rca = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(svg_rca.contains("PRB-CANARY-01"));
+        assert!(svg_rca.contains("ROOT CAUSE: svc:payment-gw [SPAN sp-gw-42]"));
+        assert!(svg_rca.contains("CAUSAL CHAIN: [svc:checkout -&gt; svc:payment-gw] · CONFIDENCE: 95%"));
+        assert!(svg_rca.contains("CORRELATED ERROR: Connection reset by peer"));
+        assert!(svg_rca.contains("AI DIAGNOSIS: Root cause is payment gateway socket exhaustion"));
     }
 }

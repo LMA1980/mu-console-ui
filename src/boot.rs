@@ -428,6 +428,11 @@ pub fn start() {
                     .and_then(|t| t.dyn_into::<Element>().ok())
                     .is_some_and(|el| el.id() == "muconsole-filter");
                 if target_is_input && key != "Escape" {
+                    if key == "Enter" {
+                        let mut st = state_for_key.borrow_mut();
+                        st.pending_filter_at_ms = None;
+                        send(&worker_for_key, &UiCommand::Subscribe(st.route.clone()));
+                    }
                     return;
                 }
                 if key == "/" && !target_is_input {
