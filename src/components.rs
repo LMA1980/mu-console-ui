@@ -10,9 +10,9 @@ use mu_console_layout::{
 };
 use mu_console_protocol::{
     format_job_id, sanitize_public_log, Area, AuthState, CanaryBundleState, CdSubView, CiSubView,
-    ConnState, ConsoleSkin, CrtFont, FleetSubView, GateOutcome, GateTest, LogSeverity,
-    ObserveSubView, PackageEcosystem, PrState, RegistrySubView, RepoScore, RepoStatus,
-    RepoTopology, SidingPhase, SmartscapeLayer, StageState, SubView, TestState,
+    ConnState, CrtFont, FleetSubView, GateOutcome, GateTest, LogSeverity, ObserveSubView,
+    PackageEcosystem, PrState, RegistrySubView, RepoScore, RepoStatus, RepoTopology, SidingPhase,
+    SmartscapeLayer, StageState, SubView, TestState,
 };
 use mu_console_theme::instruments::switch::SwitchAction;
 use mu_console_theme::instruments::Rect;
@@ -681,6 +681,9 @@ fn render_active_subview(
         }
         SubView::Observe(ObserveSubView::DataStore) => {
             render_obs_datastore(skin, w, state, frames, panel);
+        }
+        SubView::Observe(ObserveSubView::Ingress) => {
+            render_obs_ingress(skin, w, state, frames, panel);
         }
         SubView::Fleet(FleetSubView::WorkerNodes) => {
             render_fleet_worker_nodes(skin, w, state, frames, panel);
@@ -4836,14 +4839,29 @@ fn render_obs_logs(
             .collect::<Vec<_>>()
             .join(" · ")
     };
+    let follow_status = if state.follow_log { "ON" } else { "OFF" };
+    let follow_label = if state.follow_log {
+        "● LIVE FOLLOW [ON]"
+    } else {
+        "○ FOLLOW PAUSED"
+    };
+    let follow_tone = if state.follow_log {
+        SemanticTone::Pass
+    } else {
+        SemanticTone::Neutral
+    };
+    let q_tag = if state.filter_query.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" · QUERY: \"{}\"", state.filter_query.trim())
+    };
     let headers: Vec<LogRow> = vec![
         (
             format!(
-                "OTEL LOG STREAM [SEVERITY: {active_sev}] · SCOPE: [{scope_label}] · {}/{total_logs} ENTRIES (ERR:{err_cnt} WARN:{warn_cnt} INFO:{info_cnt}) · FOLLOW: {}",
-                body.len(),
-                if state.follow_log { "ON" } else { "OFF" }
+                "OTEL LOG STREAM [SEVERITY: {active_sev}] · SCOPE: [{scope_label}]{q_tag} · {}/{total_logs} ENTRIES (ERR:{err_cnt} WARN:{warn_cnt} INFO:{info_cnt}) · {follow_label} · FOLLOW: {follow_status}",
+                body.len()
             ),
-            SemanticTone::Info,
+            follow_tone,
             Some("obs-log-follow-toggle".into()),
             state.follow_log,
         ),
@@ -5173,6 +5191,188 @@ fn render_obs_datastore(
         &Screen {
             control_id: "obs-datastore-screen",
             title: "MuObserve Data Store Health",
+            rect: screen_rect,
+            font_family: font.family,
+            font_px: panel.grid.font_px,
+            cols: panel.grid.cols,
+            rows: panel.grid.rows,
+            lines: &screen_rows,
+            stations: &[],
+            tracks: &[],
+            page: 0,
+            total_pages: 1,
+        },
+    );
+}
+
+/// Render `OBS > Ingress`: Dynamic reverse proxy routes, upstream health, and TLS termination.
+#[allow(clippy::too_many_lines)]
+fn render_obs_ingress(
+    skin: &dyn Skin,
+    w: &mut SvgWriter,
+    state: &ConsoleState,
+    frames: &Frames,
+    panel: &LayoutPanel,
+) {
+    let rect = clamp_rect(panel.plate, frames.canvas);
+    let screen_rect = clamp_rect(panel.crt, rect);
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return;
+    }
+    skin.panel(
+        w,
+        &Panel {
+            id: "obs-ingress-panel",
+            title: "MUOBSERVE DYNAMIC INGRESS REVERSE-PROXY & EDGE TRAFFIC HEALTH",
+            rect,
+            role: Some("region"),
+            aria_label: Some("MuObserve Ingress and Edge Health"),
+        },
+    );
+
+    type IngressRow = (
+        String,
+        SemanticTone,
+        Option<SignalGlyph>,
+        Option<String>,
+        bool,
+    );
+    let mut body: Vec<IngressRow> = Vec::new();
+
+    if let Some(v) = state.client.view() {
+        // 1. TLS & Edge Certificate Health
+        if let Some(ref tls) = v.observe.tls_health {
+            let days_tone = if tls.days_remaining > 30 {
+                SemanticTone::Pass
+            } else if tls.days_remaining > 7 {
+                SemanticTone::Warn
+            } else {
+                SemanticTone::Fail
+            };
+            body.push((
+                format!(
+                    "TLS TERMINATION: {} :: ISSUER: {} :: EXPIRES: {} DAYS :: ALPN: [{}] :: OCSP: {} :: mTLS: {}",
+                    tls.domain,
+                    tls.certificate_issuer,
+                    tls.days_remaining,
+                    tls.alpn_protocols.join(", "),
+                    if tls.ocsp_stapling { "STAPLED" } else { "OFF" },
+                    if tls.mutual_tls { "VERIFIED" } else { "DISABLED" },
+                ),
+                days_tone,
+                Some(if tls.days_remaining > 7 { SignalGlyph::BlockPassed } else { SignalGlyph::BlockFailed }),
+                None,
+                false,
+            ));
+        }
+
+        // 2. Dynamic Ingress Routes Table
+        body.push((
+            "── ACTIVE INGRESS ROUTES ──────────────────────────────────────────────────────────"
+                .into(),
+            SemanticTone::Info,
+            None,
+            None,
+            false,
+        ));
+        if v.observe.ingress_routes.is_empty() {
+            body.push((
+                "  No active ingress routes registered. Listening on HTTP/2 & HTTP/3 QUIC.".into(),
+                SemanticTone::Neutral,
+                None,
+                None,
+                false,
+            ));
+        } else {
+            for r in &v.observe.ingress_routes {
+                let tone = if r.error_rate_pct > 5.0 {
+                    SemanticTone::Fail
+                } else if r.error_rate_pct > 1.0 {
+                    SemanticTone::Warn
+                } else {
+                    SemanticTone::Pass
+                };
+                body.push((
+                    format!(
+                        "ROUTE {:<12} PREFIX:{:<16} -> {:<24} RPS:{:<6.1} ERR:{:<4.1}% P95:{:<4.0}ms [AUTH:{}] [STRIP:{}]",
+                        r.route_id,
+                        r.path_prefix,
+                        r.upstream_url,
+                        r.request_rate_rps,
+                        r.error_rate_pct,
+                        r.p95_latency_ms,
+                        if r.auth_required { "YES" } else { "NO " },
+                        if r.strip_prefix { "YES" } else { "NO " },
+                    ),
+                    tone,
+                    Some(SignalGlyph::BlockPassed),
+                    Some(format!("ingress-route:{}", r.route_id)),
+                    false,
+                ));
+            }
+        }
+
+        // 3. Upstream Health Status
+        body.push((
+            "── UPSTREAM POOL HEALTH ───────────────────────────────────────────────────────────"
+                .into(),
+            SemanticTone::Info,
+            None,
+            None,
+            false,
+        ));
+        if v.observe.ingress_upstreams.is_empty() {
+            body.push((
+                "  No upstream targets configured.".into(),
+                SemanticTone::Neutral,
+                None,
+                None,
+                false,
+            ));
+        } else {
+            for u in &v.observe.ingress_upstreams {
+                let tone = match u.health_state.to_ascii_uppercase().as_str() {
+                    "HEALTHY" => SemanticTone::Pass,
+                    "DEGRADED" => SemanticTone::Warn,
+                    _ => SemanticTone::Fail,
+                };
+                body.push((
+                    format!(
+                        "UPSTREAM {:<16} TARGET:{:<28} STATE:{:<10} LATENCY:{:<4.1}ms CONNS:{} SUCCESS:{:.1}%",
+                        u.upstream_id,
+                        u.target_url,
+                        u.health_state,
+                        u.latency_ms,
+                        u.active_connections,
+                        u.success_rate_pct,
+                    ),
+                    tone,
+                    Some(if tone == SemanticTone::Pass { SignalGlyph::BlockPassed } else { SignalGlyph::BlockFailed }),
+                    Some(format!("ingress-upstream:{}", u.upstream_id)),
+                    false,
+                ));
+            }
+        }
+    }
+
+    let screen_rows: Vec<ScreenRow<'_>> = body
+        .iter()
+        .map(|(txt, tone, glyph, c_id, sel)| ScreenRow {
+            text: txt.as_str(),
+            tone: *tone,
+            signal: *glyph,
+            critical: *tone == SemanticTone::Fail,
+            control_id: c_id.as_deref(),
+            selected: *sel,
+        })
+        .collect();
+
+    let font = state.font_metrics();
+    skin.screen(
+        w,
+        &Screen {
+            control_id: "obs-ingress-screen",
+            title: "MuObserve Ingress & Edge Traffic",
             rect: screen_rect,
             font_family: font.family,
             font_px: panel.grid.font_px,
@@ -5627,10 +5827,7 @@ pub const fn filter_placeholder(area: Area) -> &'static str {
 pub fn render_html_shell(svg: &str, state: &ConsoleState) -> String {
     let font_attr = font_slug(state.font);
     let skin_attr = skin_slug(state.skin);
-    let skin_label = match state.skin {
-        ConsoleSkin::Wireframe => "SKIN: WIREFRAME [S]",
-        ConsoleSkin::Avionics => "SKIN: AVIONICS [S]",
-    };
+    let skin_label = "SKIN: WIREFRAME";
     let dyslexic_face = if state.lazy_dyslexic_loaded {
         "@font-face{font-family:'OpenDyslexicM Nerd Font Mono';src:url('/fonts/OpenDyslexicMNerdFontMono-Regular.woff2') format('woff2');font-display:swap;}"
     } else {
@@ -5670,7 +5867,7 @@ pub fn render_html_shell(svg: &str, state: &ConsoleState) -> String {
          <input id=\"muconsole-filter\" type=\"search\" placeholder=\"{placeholder}\" aria-label=\"Type-ahead repository filter\" style=\"font-size:16px\" value=\"{escaped_filter_query}\"/>\
          <div id=\"muconsole-aria-polite\" role=\"status\" aria-live=\"polite\" aria-atomic=\"true\">{escaped_aria_polite}</div>\
          <div id=\"muconsole-aria-assertive\" role=\"alert\" aria-live=\"assertive\" aria-atomic=\"true\">{escaped_aria_assertive}</div>\
-         <button id=\"muconsole-skin-toggle\" type=\"button\" data-skin-toggle=\"true\" aria-label=\"Toggle visual skin\" style=\"margin-left:auto;font-family:var(--font-crt);font-size:10px;line-height:1.1;color:var(--accent-neon-cyan);background:rgba(5,10,14,0.85);border:1px solid var(--accent-neon-cyan);border-radius:3px;padding:2px 6px;cursor:pointer;white-space:nowrap\">{skin_label}</button>\
+         <button id=\"muconsole-skin-toggle\" type=\"button\" disabled=\"disabled\" data-skin-toggle=\"true\" aria-label=\"Visual skin locked to Wireframe\" style=\"margin-left:auto;font-family:var(--font-crt);font-size:10px;line-height:1.1;color:var(--accent-neon-cyan);background:rgba(5,10,14,0.85);border:1px solid var(--accent-neon-cyan);border-radius:3px;padding:2px 6px;cursor:default;white-space:nowrap\">{skin_label}</button>\
          <a id=\"muconsole-auth-link\" href=\"{escaped_auth_href}\" data-auth-state=\"{auth_slug}\">{escaped_auth_label}</a>\
          </header>\
          <main id=\"muconsole-dashboard\" role=\"main\" aria-label=\"MuConsole Unified CI/CD Dashboard\" tabindex=\"-1\">{svg}</main>\
@@ -5956,5 +6153,22 @@ mod tests {
         assert!(svg_sb.contains("MUISOLATION SECURITY &amp; HARDWARE INVARIANT INSPECTOR"));
         assert!(svg_sb.contains("/proc/set_ai_thread"));
         assert!(svg_sb.contains("RLIMIT_MEMLOCK"));
+
+        // 6. OBS > Ingress reverse proxy & TLS health
+        st.select_subview(SubView::Observe(ObserveSubView::Ingress));
+        let svg_ing = render_console(
+            &WireframeSkin,
+            &st,
+            Viewport::new(1440.0, 900.0),
+            SafeArea::ZERO,
+        );
+        assert!(svg_ing.contains("MUOBSERVE DYNAMIC INGRESS REVERSE-PROXY"));
+        assert!(svg_ing.contains("obs-ingress-panel"));
+
+        // 7. WireframeSkin invariant locked in shell
+        let shell = render_html_shell(&svg_ing, &st);
+        assert!(shell.contains("id=\"muconsole-skin-toggle\""));
+        assert!(shell.contains("disabled"));
+        assert!(shell.contains("SKIN: WIREFRAME"));
     }
 }

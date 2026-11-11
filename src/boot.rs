@@ -11,8 +11,7 @@ use js_sys::{Array, ArrayBuffer, Date, Uint8Array};
 use mu_console_layout::{SafeArea, Viewport};
 use mu_console_protocol::{AuthState, ConsoleSkin, UiCommand, WorkerConfig};
 use mu_console_theme::skin::Skin;
-use mu_console_theme::tokens::Effects;
-use mu_console_theme::wireframe::{AvionicsSkin, WireframeSkin};
+use mu_console_theme::wireframe::WireframeSkin;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
@@ -130,13 +129,7 @@ fn repaint(st: &ConsoleState) {
         return;
     };
     let vp = window_viewport(&win);
-    let av_skin = AvionicsSkin {
-        effects: Effects::FULL,
-    };
-    let skin: &dyn Skin = match st.skin {
-        ConsoleSkin::Wireframe => &WireframeSkin,
-        ConsoleSkin::Avionics => &av_skin,
-    };
+    let skin: &dyn Skin = &WireframeSkin;
     let svg = render_console(skin, st, vp, SafeArea::ZERO);
 
     if let Some(dash) = doc.get_element_by_id("muconsole-dashboard") {
@@ -184,11 +177,7 @@ fn repaint(st: &ConsoleState) {
             };
             let _ = shell.set_attribute("data-auth-state", auth_slug);
             if let Some(skin_btn) = doc.get_element_by_id("muconsole-skin-toggle") {
-                let skin_label = match st.skin {
-                    ConsoleSkin::Wireframe => "SKIN: WIREFRAME [S]",
-                    ConsoleSkin::Avionics => "SKIN: AVIONICS [S]",
-                };
-                skin_btn.set_text_content(Some(skin_label));
+                skin_btn.set_text_content(Some("SKIN: WIREFRAME"));
             }
             if let Some(auth_link) = doc.get_element_by_id("muconsole-auth-link") {
                 let _ = auth_link.set_attribute("href", &auth_href);

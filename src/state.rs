@@ -276,30 +276,9 @@ pub const fn font_slug(font: CrtFont) -> &'static str {
 }
 
 /// Parse `?skin=avionics|wireframe` or stored `localStorage` value.
+/// Enforces `ConsoleSkin::Wireframe` invariant strictly per M1 requirements.
 #[must_use]
-pub fn parse_skin_pref(query: &str, stored: Option<&str>) -> ConsoleSkin {
-    for pair in query.trim_start_matches('?').split('&') {
-        if let Some(("skin", val)) = pair.split_once('=') {
-            if val.eq_ignore_ascii_case("avionics")
-                || val.eq_ignore_ascii_case("skeuomorphic")
-                || val.eq_ignore_ascii_case("tactile")
-            {
-                return ConsoleSkin::Avionics;
-            }
-            if val.eq_ignore_ascii_case("wireframe") || val.eq_ignore_ascii_case("flat") {
-                return ConsoleSkin::Wireframe;
-            }
-        }
-    }
-    if let Some(s) = stored {
-        let s = s.trim();
-        if s.eq_ignore_ascii_case("avionics")
-            || s.eq_ignore_ascii_case("skeuomorphic")
-            || s.eq_ignore_ascii_case("tactile")
-        {
-            return ConsoleSkin::Avionics;
-        }
-    }
+pub fn parse_skin_pref(_query: &str, _stored: Option<&str>) -> ConsoleSkin {
     ConsoleSkin::Wireframe
 }
 
@@ -622,19 +601,16 @@ impl ConsoleState {
     }
 
     /// Set the active visual skin (`Wireframe` or `Avionics`).
-    pub fn set_skin(&mut self, skin: ConsoleSkin) -> UiCommand {
-        self.skin = skin;
-        self.aria_polite = format!("Visual skin set to {}", skin_slug(skin));
-        UiCommand::SetSkin(skin)
+    pub fn set_skin(&mut self, _skin: ConsoleSkin) -> UiCommand {
+        self.skin = ConsoleSkin::Wireframe;
+        self.aria_polite = "Wireframe technical skin active".into();
+        UiCommand::SetSkin(ConsoleSkin::Wireframe)
     }
 
-    /// Toggle between `Wireframe` and `Avionics` skins.
+    /// Toggle between visual skins (neutralized to WireframeSkin invariant).
     pub fn toggle_skin(&mut self) -> UiCommand {
-        let next = match self.skin {
-            ConsoleSkin::Wireframe => ConsoleSkin::Avionics,
-            ConsoleSkin::Avionics => ConsoleSkin::Wireframe,
-        };
-        self.set_skin(next)
+        self.skin = ConsoleSkin::Wireframe;
+        UiCommand::SetSkin(ConsoleSkin::Wireframe)
     }
 
     /// Active or latest job ID for the selected repository/topology.
@@ -2037,7 +2013,7 @@ impl ConsoleState {
                 Some(self.step_carousel(1, per_page))
             }
             "d" | "D" | "f" | "F" => Some(self.toggle_font()),
-            "s" | "S" => Some(self.toggle_skin()),
+            // "s" | "S" hotkey disabled to strictly enforce WireframeSkin invariant
             "r" | "R" => {
                 self.aria_polite = "Stream reset and resynchronized".into();
                 Some(UiCommand::ResetStream)
