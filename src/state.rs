@@ -313,6 +313,8 @@ pub struct ConsoleState {
     pub filter_focused: bool,
     /// Pending rotary selection waiting for the 350 ms settle window (`due_ms`).
     pub pending_select_at_ms: Option<u64>,
+    /// Pending filter subscription query debounce waiting for 300 ms.
+    pub pending_filter_at_ms: Option<u64>,
     /// Phone bottom-sheet repo selector visibility.
     pub phone_rotary_open: bool,
     /// C4 Scorecard page index.
@@ -415,6 +417,7 @@ impl ConsoleState {
             filter_query: String::new(),
             filter_focused: false,
             pending_select_at_ms: None,
+            pending_filter_at_ms: None,
             phone_rotary_open: false,
             carousel_page: 0,
             trainway_lanes: BTreeMap::new(),
@@ -928,6 +931,13 @@ impl ConsoleState {
             if self.route.subview == SubView::Observe(ObserveSubView::Logs) {
                 self.follow_log = true;
             }
+            let trimmed = query.trim();
+            self.route.filter = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            };
+            self.pending_filter_at_ms = Some(now_ms.saturating_add(300));
             return;
         }
         self.filter_query = query.to_owned();
@@ -1434,6 +1444,18 @@ impl ConsoleState {
             self.subview_page = 0;
             self.follow_log = true;
             self.aria_polite = format!("CI queue filter {}", self.ci_queue_filter);
+            return Vec::new();
+        }
+        if let Some(r_id) = id.strip_prefix("ingress-route:") {
+            self.filter_query = r_id.to_string();
+            self.subview_page = 0;
+            self.aria_polite = format!("Selected Ingress route {r_id}");
+            return Vec::new();
+        }
+        if let Some(u_id) = id.strip_prefix("ingress-upstream:") {
+            self.filter_query = u_id.to_string();
+            self.subview_page = 0;
+            self.aria_polite = format!("Selected Ingress upstream {u_id}");
             return Vec::new();
         }
         if let Some(st_str) = id.strip_prefix("ci-stage-select:") {
@@ -2029,6 +2051,12 @@ impl ConsoleState {
         if let Some(until) = self.restart_armed_until_ms {
             if now_ms > until {
                 self.restart_armed_until_ms = None;
+            }
+        }
+        if let Some(due) = self.pending_filter_at_ms {
+            if now_ms >= due {
+                self.pending_filter_at_ms = None;
+                cmds.push(UiCommand::Subscribe(self.route.clone()));
             }
         }
         if let Some(due) = self.pending_select_at_ms {
