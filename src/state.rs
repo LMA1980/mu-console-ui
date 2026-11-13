@@ -20,7 +20,7 @@ use crate::router::{area_label, escape_up, parse_area, parse_hash, parse_subview
 
 /// `localStorage` key persisting the user's selected CRT reading font.
 pub const FONT_STORAGE_KEY: &str = "muconsole.dyslexia_font";
-/// `localStorage` key persisting the user's selected visual skin (`wireframe` or `avionics`).
+/// `localStorage` key persisting the user's selected visual skin (`wireframe`).
 pub const SKIN_STORAGE_KEY: &str = "muconsole.skin";
 /// `localStorage` key persisting the user's active repository/submodule selection.
 pub const REPO_STORAGE_KEY: &str = "muconsole.active_repo";
@@ -275,7 +275,7 @@ pub const fn font_slug(font: CrtFont) -> &'static str {
     }
 }
 
-/// Parse `?skin=avionics|wireframe` or stored `localStorage` value.
+/// Parse `?skin=wireframe` or stored `localStorage` value.
 /// Enforces `ConsoleSkin::Wireframe` invariant strictly per M1 requirements.
 #[must_use]
 pub fn parse_skin_pref(_query: &str, _stored: Option<&str>) -> ConsoleSkin {
@@ -287,7 +287,6 @@ pub fn parse_skin_pref(_query: &str, _stored: Option<&str>) -> ConsoleSkin {
 pub const fn skin_slug(skin: ConsoleSkin) -> &'static str {
     match skin {
         ConsoleSkin::Wireframe => "wireframe",
-        ConsoleSkin::Avionics => "avionics",
     }
 }
 
@@ -603,7 +602,7 @@ impl ConsoleState {
         self.set_font(next)
     }
 
-    /// Set the active visual skin (`Wireframe` or `Avionics`).
+    /// Set the active visual skin (`Wireframe`).
     pub fn set_skin(&mut self, _skin: ConsoleSkin) -> UiCommand {
         self.skin = ConsoleSkin::Wireframe;
         self.aria_polite = "Wireframe technical skin active".into();

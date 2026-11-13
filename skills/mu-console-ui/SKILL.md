@@ -1,12 +1,12 @@
 ______________________________________________________________________
 
-## name: mu-console-ui description: "Implement, test, and consume the mu-console-ui crate for avionics terminal frontend rendering, WireframeSkin, accessibility shell, and WASM bootstrapping."
+## name: mu-console-ui description: "Implement, test, and consume the mu-console-ui crate for unified console frontend rendering, WireframeSkin, accessibility shell, and WASM bootstrapping."
 
 # `mu-console-ui` Architecture & Guidelines
 
-Use these guidelines when developing or integrating `mu-console-ui`, the avionics terminal web frontend for MuConsole:
+Use these guidelines when developing or integrating `mu-console-ui`, the unified CI/CD console web frontend for MuConsole:
 
-## 1. Avionics Shell & HTML Accessibility
+## 1. Console Shell & HTML Accessibility
 
 - **Zero-Leakage Viewport Layout**:
   - Root shell enforces `100dvh` flex-column hierarchy (`#muconsole-shell`).
@@ -19,7 +19,7 @@ Use these guidelines when developing or integrating `mu-console-ui`, the avionic
 ## 2. WireframeSkin & SVG Generation
 
 - **WireframeSkin Aesthetics**:
-  - Deterministic retro avionics styling with CRT phosphor glows, dark slate bezels, and modular instrument plates.
+  - Deterministic technical wireframe styling with dark slate frames, cyan accents, and modular instrument panels.
   - Parametric rendering of rotary knobs, rocker switches, LED annunciators, and yard trainway pipeline progression.
 - **Typography & Dyslexic Mode**:
   - Pixel-perfect monospace alignment supporting both Hurmit and OpenDyslexicM font metrics.
