@@ -15,7 +15,7 @@ use mu_console_protocol::{
     SubmoduleId, TestState, UiCommand, ViewModel, WorkerConfig,
 };
 use mu_console_theme::interaction::SwitchEvent;
-use mu_console_theme::wireframe::{AvionicsSkin, WireframeSkin};
+use mu_console_theme::wireframe::WireframeSkin;
 use mu_console_ui::components::{render_console, render_html_shell};
 use mu_console_ui::router::{breadcrumb_segments, escape_up, format_hash, parse_hash};
 use mu_console_ui::state::{
@@ -687,19 +687,12 @@ fn u7_font_toggle_dyslexic_reflow_phone_touch_targets_html_shell_and_skin_parity
         );
     }
 
-    let svg_av = render_console(
-        &AvionicsSkin::default(),
-        &st,
-        Viewport::new(1512.0, 860.0),
-        SafeArea::ZERO,
-    );
     let svg_wf = render_console(
         &WireframeSkin,
         &st,
         Viewport::new(1512.0, 860.0),
         SafeArea::ZERO,
     );
-    let doc_av = roxmltree::Document::parse(&svg_av).expect("av XML");
     let doc_wf = roxmltree::Document::parse(&svg_wf).expect("wf XML");
     let controls = |d: &roxmltree::Document<'_>| -> Vec<(String, Option<String>, Option<String>)> {
         d.descendants()
@@ -712,7 +705,7 @@ fn u7_font_toggle_dyslexic_reflow_phone_touch_targets_html_shell_and_skin_parity
             })
             .collect()
     };
-    assert_eq!(controls(&doc_wf), controls(&doc_av));
+    assert!(!controls(&doc_wf).is_empty());
 
     if let Ok(dir) = std::env::var("MUCONSOLE_EXPORT_PREVIEWS") {
         let p = std::path::Path::new(&dir);
@@ -1537,19 +1530,17 @@ fn u17_interactive_scorecards_breadcrumbs_filters_trace_selection_and_pagination
 }
 
 #[test]
-fn u18_avionics_skin_switcher_and_operator_job_restart_actions() {
+fn u18_wireframe_skin_lock_and_operator_job_restart_actions() {
     use mu_console_protocol::ConsoleSkin;
-    use mu_console_theme::tokens::Effects;
-    use mu_console_theme::wireframe::AvionicsSkin;
     use mu_console_ui::state::parse_skin_pref;
 
     // 1. Skin preference parsing enforces WireframeSkin invariant strictly.
     assert_eq!(
-        parse_skin_pref("?skin=avionics", None),
+        parse_skin_pref("?skin=legacy", None),
         ConsoleSkin::Wireframe
     );
     assert_eq!(
-        parse_skin_pref("?skin=wireframe", Some("avionics")),
+        parse_skin_pref("?skin=wireframe", Some("legacy")),
         ConsoleSkin::Wireframe
     );
     assert_eq!(
@@ -1577,10 +1568,7 @@ fn u18_avionics_skin_switcher_and_operator_job_restart_actions() {
     assert_eq!(st.skin, ConsoleSkin::Wireframe);
     assert_eq!(btn_cmds, vec![UiCommand::SetSkin(ConsoleSkin::Wireframe)]);
 
-    // 3. Render AvionicsSkin across all 6 target viewports and verify zero overflow + tactile tokens.
-    let av_skin = AvionicsSkin {
-        effects: Effects::FULL,
-    };
+    // 3. Render WireframeSkin across all 6 target viewports and verify zero overflow + filter-free SVG.
     let viewports = [
         (390.0, 844.0, "phone_portrait"),
         (844.0, 390.0, "phone_landscape"),
@@ -1590,15 +1578,9 @@ fn u18_avionics_skin_switcher_and_operator_job_restart_actions() {
         (2560.0, 1080.0, "wide"),
     ];
     for (w, h, label) in viewports {
-        let svg = render_console(&av_skin, &st, Viewport::new(w, h), SafeArea::ZERO);
-        assert_svg_bounds_zero_overflow(&svg, w, h, &format!("u18_avionics_{label}"));
-        assert!(svg.contains("mu-woodgrain"));
-        assert!(svg.contains("mu-brushed"));
-        assert!(svg.contains("mu-park"));
-        assert!(svg.contains("mu-lcdbg"));
-        assert!(svg.contains("mu-crt-ci"));
-        assert!(svg.contains("mu-vignette"));
-        assert!(svg.contains("mu-glass"));
+        let svg = render_console(&WireframeSkin, &st, Viewport::new(w, h), SafeArea::ZERO);
+        assert_svg_bounds_zero_overflow(&svg, w, h, &format!("u18_wireframe_{label}"));
+        assert!(!svg.contains("<filter"));
     }
 
     // 4. Operator pull-to-turn c5-restart-switch and data-restart-job emit UiCommand::RestartJob.
@@ -1791,30 +1773,6 @@ fn u20_dom_action_target_resolution_repo_steppers_subview_tabs_and_trainway_sign
     assert_eq!(st.route.subview, SubView::Ci(CiSubView::QueueLogs));
     assert_eq!(st.route.branch.as_deref(), Some("main"));
     assert!(!sig_cmds.is_empty());
-
-    // 4. AvionicsSkin CRT decorative overlays must carry pointer-events="none".
-    let svg_av = render_console(
-        &AvionicsSkin::default(),
-        &st,
-        Viewport::new(1512.0, 860.0),
-        SafeArea::ZERO,
-    );
-    let doc_av = roxmltree::Document::parse(&svg_av).expect("valid Avionics XML");
-    for node in doc_av.descendants().filter(|n| n.has_tag_name("rect")) {
-        if let Some(fill) = node.attribute("fill") {
-            if fill.starts_with("url(#mu-lcdbg-")
-                || fill.starts_with("url(#mu-scan-")
-                || fill.starts_with("url(#mu-vignette-")
-                || fill.starts_with("url(#mu-glass-")
-            {
-                assert_eq!(
-                    node.attribute("pointer-events"),
-                    Some("none"),
-                    "Avionics overlay rect fill={fill} must have pointer-events=\"none\""
-                );
-            }
-        }
-    }
 }
 
 #[test]

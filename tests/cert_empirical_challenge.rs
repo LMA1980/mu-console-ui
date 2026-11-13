@@ -23,20 +23,20 @@ use mu_console_ui::state::{parse_skin_pref, ConsoleState};
 #[test]
 fn test_empirical_skin_query_and_storage_permutations_unbreachable() {
     let queries = [
-        "?skin=avionics",
+        "?skin=legacy",
         "?skin=wood",
         "?skin=crt",
         "?skin=scanlines",
         "?skin=wireframe",
         "?skin=",
-        "?foo=1&skin=avionics&bar=2",
+        "?foo=1&skin=legacy&bar=2",
         "?skin=../../etc/shadow",
         "?skin=default",
         "",
     ];
 
     let stored_values = [
-        Some("avionics"),
+        Some("legacy"),
         Some("wood"),
         Some("crt"),
         Some("scanlines"),
@@ -64,7 +64,7 @@ fn test_empirical_skin_state_methods_locked_to_wireframe() {
     let mut state = ConsoleState::new();
 
     // Direct setter attempt
-    let cmd = state.set_skin(ConsoleSkin::Avionics);
+    let cmd = state.set_skin(ConsoleSkin::Wireframe);
     assert_eq!(state.skin, ConsoleSkin::Wireframe);
     assert_eq!(cmd, UiCommand::SetSkin(ConsoleSkin::Wireframe));
 
@@ -74,7 +74,7 @@ fn test_empirical_skin_state_methods_locked_to_wireframe() {
     assert_eq!(cmd, UiCommand::SetSkin(ConsoleSkin::Wireframe));
 
     // Restore from localStorage attempt
-    state.restore_stored_skin("?skin=avionics", Some("avionics"));
+    state.restore_stored_skin("?skin=legacy", Some("legacy"));
     assert_eq!(state.skin, ConsoleSkin::Wireframe);
 }
 

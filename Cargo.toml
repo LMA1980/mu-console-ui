@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2021"
 repository = "https://github.com/LMA1980/mu-console-ui"
 authors = ["LMA1980"]
-description = "Avionics terminal web frontend for MuConsole (WireframeSkin, HTML accessibility shell, WASM bootstrap)"
+description = "Unified CI/CD console web frontend for MuConsole (WireframeSkin SVG renderer, HTML accessibility shell, WASM bootstrap)"
 license = "AGPL-3.0-only"
 
 [lib]

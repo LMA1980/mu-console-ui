@@ -1,10 +1,10 @@
 # mu-console-ui
 
-Avionics terminal web frontend for MuConsole: WireframeSkin SVG renderer, HTML accessibility shell, deep-link hash router, and WASM bootstrapper.
+Unified CI/CD console web frontend for MuConsole: WireframeSkin SVG renderer, HTML accessibility shell, deep-link hash router, and WASM bootstrapper.
 
 ## Architecture
 
-- **WireframeSkin SVG Renderer (`components`)**: Pure SVG instrument and gauge renderer generating tactile avionics interfaces with dark slate bezels, CRT glow, and modular instrument plates.
+- **WireframeSkin SVG Renderer (`components`)**: Deterministic technical wireframe SVG renderer with dark slate frames, cyan accents, and modular instrument panels.
 - **HTML Accessibility Shell (`components`)**: Accessible 100dvh flex column layout, `.skip-link`, and 16px iOS safe query filter input.
 - **Deep-Link Hash Router (`router`)**: Fragment-based hash navigation (`#c1/c2`), breadcrumbs, and hierarchy collapsing.
 - **Console State Machine (`state`)**: Interactive control dispatch (rotaries, annunciator lamps, switches), font selection (`Hurmit` and `OpenDyslexicM`), and view model synchronization.
