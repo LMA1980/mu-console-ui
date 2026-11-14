@@ -2469,14 +2469,21 @@ fn u24_dist_freshness_and_submodule_alignment() {
                 }
             };
 
-            if let (Some(dist_ts), Some(ui_ts), Some(data_ts)) = (
-                get_ts("dist/muconsole-ui_bg.wasm"),
-                get_ts("code/ui"),
-                get_ts("code/data"),
-            ) {
+            let dist_ts = [
+                "dist/muconsole-ui_bg.wasm",
+                "dist/muconsole-data_bg.wasm",
+                "dist/muconsole-data_loader.js",
+                "dist/index.html",
+            ]
+            .into_iter()
+            .filter_map(get_ts)
+            .max();
+            if let (Some(dist_ts), Some(ui_ts), Some(data_ts)) =
+                (dist_ts, get_ts("code/ui"), get_ts("code/data"))
+            {
                 assert!(
                     dist_ts >= ui_ts && dist_ts >= data_ts,
-                    "dist/muconsole-ui_bg.wasm ({dist_ts}) is older than code/ui ({ui_ts}) or code/data ({data_ts}) git commit!\n\
+                    "dist/ bundle ({dist_ts}) is older than code/ui ({ui_ts}) or code/data ({data_ts}) git commit!\n\
                      Run scripts/build-dist.sh and commit updated dist/ artifacts."
                 );
             }
