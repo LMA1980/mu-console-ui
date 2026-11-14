@@ -1,40 +1,36 @@
-______________________________________________________________________
-
-## name: mu-console-ui description: "Implement, test, and consume the mu-console-ui crate for unified console frontend rendering, WireframeSkin, accessibility shell, and WASM bootstrapping."
+---
+name: mu-console-ui
+description: "Implement, test, and consume the mu-console-ui crate for unified console frontend rendering (`HtmlCoreSkin` and `WireframeSkin`), 8 role-gated areas, accessibility shell, and WASM bootstrapping."
+---
 
 # `mu-console-ui` Architecture & Guidelines
 
-Use these guidelines when developing or integrating `mu-console-ui`, the unified CI/CD console web frontend for MuConsole:
+Use these guidelines when developing or integrating `mu-console-ui`, the unified console web frontend for MuConsole:
 
-## 1. Console Shell & HTML Accessibility
+## 1. Dual-Skin Architecture & HTML Accessibility
 
-- **Zero-Leakage Viewport Layout**:
-  - Root shell enforces `100dvh` flex-column hierarchy (`#muconsole-shell`).
-  - Viewport layout solver computes non-overlapping pixel bounding boxes for all instruments, annunciators, and gauges.
-- **Accessibility Invariants**:
-  - Accessible `.skip-link` pointing directly to main dashboard content.
-  - `#muconsole-filter` enforces a minimum `16px` font-size to prevent mobile iOS Safari auto-zoom triggers.
-  - Proper ARIA live regions and annunciator status updates.
+- **Skin-Agnostic Scene Seam (`scene`, `copy`)**:
+  - Build every screen and modal through `ConsoleScene` and `DialogModel` with centralized English copy from `copy.rs` (`lang="en"`).
+  - Unauthenticated (`Anonymous`, `Unresolved`), `AuthorizationDenied`, and `PasskeyEnrollmentRequired` sessions are locked to `ConsoleSkin::Html` with `[Aa]` font toggle and `[Sign In]` / `[Sign Out]`.
+  - Active operators (`AuthStatus::Active`) unlock `Html` / `Wireframe` selection via `?skin=` or `@user -> Preferences` while removing `[Aa]` from the active top bar (`@user`, `+role`, `[Sign Out]`).
+- **Accessibility & Mobile Invariants (`components`)**:
+  - Semantic `.skip-link` target (`#muconsole-dashboard`), `aria-live` polite/assertive status regions, and `font-size: 16px` across form inputs (`#muconsole-filter`, `.mu-input`) to prevent iOS Safari auto-zoom.
+  - Horizontal scrollable `.mu-segmented` area/sub-view rails and `<dialog class="mu-dialog">` focus trapping.
 
-## 2. WireframeSkin & SVG Generation
+## 2. Fail-Closed Authentication, Role Leases & Modals
 
-- **WireframeSkin Aesthetics**:
-  - Deterministic technical wireframe styling with dark slate frames, cyan accents, and modular instrument panels.
-  - Parametric rendering of rotary knobs, rocker switches, LED annunciators, and yard trainway pipeline progression.
-- **Typography & Dyslexic Mode**:
-  - Pixel-perfect monospace alignment supporting both Hurmit and OpenDyslexicM font metrics.
-  - Dynamic font toggling and persistence via browser storage keys.
+- **Fail-Closed Boot & Invite Privacy (`state`, `boot`)**:
+  - Cold boot (`AuthStatus::Unresolved`) disables all 8 areas with zero cached telemetry. Strip `?invite=` into `sessionStorage` immediately without disclosing invite status in anonymous or `AuthorizationDenied` UI.
+  - Do not rely solely on `AuthState::is_authenticated()`; gate active-operator capabilities strictly on `auth.status == AuthStatus::Active`.
+- **Passkey Onboarding, `+role` Leases & Risk Confirmation (`roles`, `state`)**:
+  - Zero-Passkey bound sessions enforce a non-dismissible `PasskeyEnrollmentGate` (`attestation: "none"`, `userVerification: "preferred"`, no `authenticatorAttachment`).
+  - `+role[seconds_remaining][idle_timer]` adheres strictly to UTF-8 `chars().count()` bounds (`…(+N)` overflow), resets idle timers only on explicit `pointerdown`/`keydown` events, and expires only elapsed `Timed` leases on `00:00`.
+  - Stateful/destructive actions (CI job restart, A|B rollback, Platform admin mutations) require `RiskConfirm` (`ResumeJob` stays 1-click); `Platform > Users & Invites` enforces the last-admin protection guard.
 
-## 3. WASM Bootstrapper & Worker Link
+## 3. 8-Area Router, WASM Bootstrapper & Privacy Boundaries
 
-- **Main-Thread Lifecycle**:
-  - Minimalist main-thread WASM entry point initializes DOM event delegates (`MouseEvent`, `KeyboardEvent`, `HashChangeEvent`, `WheelEvent`).
-  - Dedicated Web Worker link transferring zero-copy `ArrayBuffer` postcard-encoded commands (`UiCommand`) and telemetry events (`DataEvent`).
-- **Deep-Link Hash Router**:
-  - URL fragment routing (`#c1/c2`) maintaining synchrony between browser history, breadcrumbs, and selected sub-views.
-
-## 4. Privacy & Lab Boundary Invariants
-
+- **Canonical Routing (`router`)**:
+  - Route `#/{area}/{subview}?repo=...` across all 8 areas (`27` sub-views) and legacy aliases (`#/iam`, `#/fleet`, `#/cd/gate`, `#/registry`, `#/observe`, `#/ovr`). Keep unpermitted tabs/sub-views/cards rendered as `disabled` with zero navigation or OAuth redirect.
 - **Public Repository Cleanliness**:
-  - Documentation, logs, and skills must never expose internal hostnames or private network ranges.
+  - Documentation, logs, fixtures, and skills must never expose internal hostnames or private RFC1918 network ranges.
   - Use generic placeholders (`node-a`, `worker-riscv64`, `192.0.2.x`) across all tests and documentation.

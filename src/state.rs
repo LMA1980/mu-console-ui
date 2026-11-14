@@ -1,387 +1,376 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Interactive console state machine for `C1`–`C6`, `SubViewBar`, Registry &
-//! Observe sub-views, keyboard shortcuts, rotary 350 ms settle debounce,
-//! `PullToTurn` restart guard, and `Hurmit` <-> `OpenDyslexicM` persistence.
+//! Client UI state machine, fail-closed auth/policy gating, skin/font persistence,
+//! explicit-activity `Timed` lease timers, and modal/DOM action routing.
 
-use std::collections::BTreeMap;
+use std::cell::Cell;
 
-use mu_console_layout::{scorecard_page_capacity, solve, SafeArea, Viewport};
+use mu_console_layout::{scorecard_page_capacity, SafeArea, Viewport};
 use mu_console_protocol::{
-    Area, AuthState, CdSubView, CiSubView, ConsoleSkin, CrtFont, LogSeverity, ObserveSubView,
-    PackageEcosystem, PanelId, RegistrySubView, RepoId, RepoScore, Route, SmartscapeLayer, SubView,
-    SubmoduleId, UiCommand,
+    AbDeploySubView, Area, AuthState, AuthStatus, CiJobSummary, CiSubView, ConsoleSkin, CrtFont,
+    DialogModel, LogSeverity, MaintenanceMode, PackageEcosystem, PasskeyEnrollmentGateModel,
+    RepoId, RepoScore, RepoStatus, RiskConfirmAction, RiskConfirmDialogModel, Route,
+    SessionRolesDialogModel, SubView, SubmoduleId, SubsystemId, UiCommand, UserProfileDialogModel,
+    UserProfileTab, Visibility,
 };
-use mu_console_theme::instruments::switch::SwitchAction;
-use mu_console_theme::interaction::{SwitchEvent, SwitchOutcome, SwitchState};
 use mu_console_theme::metrics::{CrtFontMetrics, HURMIT, OPEN_DYSLEXIC};
 
 use crate::client::{ClientUpdate, DataClient};
-use crate::router::{area_label, escape_up, parse_area, parse_hash, parse_subview};
+use crate::copy;
+use crate::roles::{
+    expire_timed_leases, format_active_roles, redirect_if_lacking_access, touch_active_leases,
+};
+use crate::router::{can_access_subview, escape_up, format_hash, has_explicit_route, parse_hash};
 
-/// `localStorage` key persisting the user's selected CRT reading font.
+/// Browser `localStorage` key storing the `Hurmit` / `OpenDyslexicM` preference.
 pub const FONT_STORAGE_KEY: &str = "muconsole.dyslexia_font";
-/// `localStorage` key persisting the user's selected visual skin (`wireframe`).
+/// Browser `localStorage` key storing the signed-in `Html` / `Wireframe` skin preference.
 pub const SKIN_STORAGE_KEY: &str = "muconsole.skin";
-/// `localStorage` key persisting the user's active repository/submodule selection.
+/// Browser `localStorage` key storing the active selected repository/submodule.
 pub const REPO_STORAGE_KEY: &str = "muconsole.active_repo";
-/// `sessionStorage` key holding a captured one-time `?invite=<token>` across OAuth redirects.
+/// Browser `sessionStorage` key holding an onboarding `?invite=<token>` stripped before OAuth.
 pub const PENDING_INVITE_STORAGE_KEY: &str = "muconsole.pending_invite";
-/// Rotary settle window before dispatching [`UiCommand::SelectRepo`].
+/// Browser `sessionStorage` key holding a protected deep-link hash across OAuth login.
+pub const PENDING_HASH_STORAGE_KEY: &str = "muconsole.pending_hash";
+/// Repo selector settle debounce delay in milliseconds.
 pub const ROTARY_SETTLE_MS: u64 = 350;
-/// Armed confirmation window (ms) for the guarded Trainway `RESTART` control.
-pub const RESTART_ARM_WINDOW_MS: u64 = 3_000;
 
-/// Ordered areas on the C1 selector rail (`CI`, `CD`, `REG`, `OBS`, `FLT`).
-pub const AREAS: [Area; 5] = Area::ALL;
+/// Canonical 8 console areas rendered in top navigation.
+pub const AREAS: [Area; 8] = Area::ALL;
 
-fn compact_service_token(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let bare = trimmed
-        .strip_prefix("svc:")
-        .or_else(|| trimmed.strip_prefix("proc:"))
-        .unwrap_or(trimmed);
-    let head = bare.split('·').next().unwrap_or(bare).trim();
-    let head = head.split('@').next().unwrap_or(head).trim();
-    let head = head.split('(').next().unwrap_or(head).trim();
-    head.chars()
-        .filter(|c| !matches!(c, '-' | '_' | ' '))
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
-}
-
-/// Compare an `OBS` service filter token against a candidate service/entity name,
-/// case-insensitively and ignoring hyphens/underscores (e.g.
-/// `"action-runner-controller"` matches `"actionrunner-controller"`).
-#[must_use]
-pub fn service_filter_matches(filter: &str, candidate: &str) -> bool {
-    let fa = compact_service_token(filter);
-    let fb = compact_service_token(candidate);
-    !fa.is_empty() && !fb.is_empty() && fa == fb
-}
-
-fn push_observed_service(out: &mut Vec<String>, raw: &str) {
-    let trimmed = raw.trim().strip_prefix("svc:").unwrap_or(raw.trim()).trim();
-    let base = trimmed.split('·').next().unwrap_or(trimmed).trim();
-    let base = base.split('(').next().unwrap_or(base).trim();
-    if base.is_empty() || base.starts_with("node:") {
-        return;
-    }
-    let normalized = if base.eq_ignore_ascii_case("action-runner-controller") {
-        "actionrunner-controller"
-    } else {
-        base
-    };
-    if !out
-        .iter()
-        .any(|existing| service_filter_matches(existing, normalized))
-    {
-        out.push(normalized.to_owned());
-    }
-}
-
-/// Action attributes checked on each DOM ancestor from innermost target to outermost container.
-pub const ACTION_ATTRS: [&str; 18] = [
+/// Semantic DOM attributes recognized by delegated event listeners in `crate::boot`.
+pub const ACTION_ATTRS: [&str; 22] = [
+    "data-control-id",
     "data-action",
-    "data-trace-id",
-    "data-select-trace",
-    "data-page-step",
-    "data-cd-gate",
     "data-area",
     "data-subview",
+    "data-page-step",
     "data-repo-step",
     "data-dyslexia-toggle",
     "data-skin-toggle",
     "data-restart-job",
-    "data-trainway-restart",
+    "data-trace-id",
+    "data-cd-gate",
     "data-ecosystem",
     "data-package",
     "data-entity-id",
     "data-purepath-filter",
+    "data-select-trace",
     "data-span-id",
     "data-log-severity",
+    "data-role-id",
+    "data-credential-id",
+    "data-subsystem",
+    "data-external-href",
 ];
 
-/// Returns `true` if `branch` and `branch_ref` refer to the same Git branch name
-/// (comparing with or without a leading `refs/heads/` prefix).
+/// Browser WebAuthn ceremony queued for execution by `crate::boot`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebAuthnRequest {
+    RegisterPasskey { label: Option<String> },
+    ElevateTimedRole { role_id: String },
+    RemovePasskey { credential_id: String },
+}
+
+/// Editable draft inputs maintained by the UI for `@user` profile, A|B rollback note,
+/// and `Area::Platform` administration controls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformFormState {
+    pub selected_subsystem: SubsystemId,
+    pub maintenance_mode: MaintenanceMode,
+    pub maintenance_reason: String,
+    pub maintenance_auto_clear_secs: Option<u64>,
+    pub invite_note: String,
+    pub invite_ttl_secs: u64,
+    pub selected_user_login: Option<String>,
+    pub user_roles_draft: String,
+    pub role_id_draft: String,
+    pub role_display_draft: String,
+    pub folio_id_draft: String,
+    pub folio_policies_draft: String,
+    pub anonymous_lockdown_draft: bool,
+    pub ab_rollback_note: String,
+}
+
+impl Default for PlatformFormState {
+    fn default() -> Self {
+        Self {
+            selected_subsystem: SubsystemId::Ci,
+            maintenance_mode: MaintenanceMode::Auto,
+            maintenance_reason: String::new(),
+            maintenance_auto_clear_secs: None,
+            invite_note: String::new(),
+            invite_ttl_secs: 86_400,
+            selected_user_login: None,
+            user_roles_draft: String::new(),
+            role_id_draft: String::new(),
+            role_display_draft: String::new(),
+            folio_id_draft: String::new(),
+            folio_policies_draft: String::new(),
+            anonymous_lockdown_draft: false,
+            ab_rollback_note: String::new(),
+        }
+    }
+}
+
+/// Case-insensitive multi-term substring match used by `#muconsole-filter`.
+#[must_use]
+pub fn service_filter_matches(filter: &str, candidate: &str) -> bool {
+    let q = filter.trim();
+    if q.is_empty() {
+        return true;
+    }
+    let hay = candidate.to_ascii_lowercase();
+    q.split_whitespace()
+        .all(|tok| hay.contains(&tok.to_ascii_lowercase()))
+}
+
+/// Match full ref name (`refs/heads/foo`) against bare branch names (`foo`).
 #[must_use]
 pub fn branch_matches_ref(branch: &str, branch_ref: &str) -> bool {
-    let a = branch.trim().trim_start_matches("refs/heads/");
-    let b = branch_ref.trim().trim_start_matches("refs/heads/");
+    let a = branch.trim_start_matches("refs/heads/");
+    let b = branch_ref.trim_start_matches("refs/heads/");
     !a.is_empty() && a == b
 }
 
-/// Returns `true` if `element_id` is a root layout container whose state attributes must
-/// never be interpreted as delegated click actions.
+/// Return `true` when clicking inside an interactive action boundary (`ActionControl`).
 #[must_use]
 pub fn is_action_root_boundary(element_id: &str) -> bool {
-    matches!(
-        element_id,
-        "muconsole-dashboard" | "muconsole-shell" | "muconsole-header"
-    )
+    !element_id.is_empty() && !is_passive_container_control_id(element_id)
 }
 
-/// Returns `true` if `control_id` is a passive grouping container rather than a leaf action target.
+/// Passive layout wrapper IDs ignored when bubbling click events.
 #[must_use]
 pub fn is_passive_container_control_id(control_id: &str) -> bool {
     matches!(
         control_id,
-        "c1-area-selector"
-            | "c2-subview-bar"
-            | "c4-carousel-switch"
-            | "reg-pkg-filter"
-            | "obs-pp-filter"
-            | "obs-log-filter"
-            | "c3-rotary"
-            | "c4-page-dots"
-            | "c5-selected-inspector"
-    ) || control_id.ends_with("-screen")
+        "c2-top-bar"
+            | "muconsole-shell"
+            | "muconsole-header"
+            | "muconsole-dashboard"
+            | "muconsole-main"
+    )
 }
 
-/// Extract `?invite=<token>` from a URL query string and return `(Some(token), sanitized_query)`
-/// with the `invite` parameter stripped so one-time invite tokens are removed from browser history.
+/// Extract `?invite=<token>` from a URL query string (`?a=1&invite=tok&b=2`) and return
+/// `(Some(token), cleaned_query)` with `invite` stripped out cleanly.
 #[must_use]
 pub fn extract_invite_token(query: &str) -> (Option<String>, String) {
-    let raw = query.trim_start_matches('?');
+    let trimmed = query.trim();
+    let raw = trimmed.strip_prefix('?').unwrap_or(trimmed);
     if raw.is_empty() {
         return (None, String::new());
     }
-    let mut token = None;
-    let mut kept = Vec::new();
-    for pair in raw.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        if let Some(("invite", val)) = pair.split_once('=') {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                token = Some(trimmed.to_owned());
+    let mut found = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in raw.split('&').filter(|p| !p.is_empty()) {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "invite" {
+                if !v.is_empty() && found.is_none() {
+                    found = Some(v.to_owned());
+                }
+                continue;
             }
-        } else {
-            kept.push(pair);
         }
+        kept.push(pair);
     }
     let clean = if kept.is_empty() {
         String::new()
     } else {
         format!("?{}", kept.join("&"))
     };
-    (token, clean)
+    (found, clean)
 }
 
-/// Percent-encode a string for use in query parameter values (RFC 3986).
+/// RFC 3986 percent-encode arbitrary strings for query parameters (`rd=`).
 #[must_use]
 pub fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                use std::fmt::Write;
-                let _ = write!(out, "%{:02X}", b);
-            }
+    for b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(*b as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "%{:02X}", b);
         }
     }
     out
 }
 
-/// Format a sign-in URL with a strictly formatted and percent-encoded `?rd=` return parameter.
+/// Construct a validated `/oauth2/start?rd=...` redirect URL.
 #[must_use]
 pub fn format_sign_in_url(rd: &str) -> String {
-    if rd == "/" {
-        "/oauth2/start?rd=/".to_string()
-    } else {
-        format!("/oauth2/start?rd={}", percent_encode(rd))
-    }
+    let normalized = if rd.is_empty() { "/" } else { rd };
+    format!("/oauth2/start?rd={}", percent_encode(normalized))
 }
 
-/// Format a sign-out URL with a strictly formatted and percent-encoded `?rd=` return parameter.
+/// Construct a validated `/oauth2/sign_out?rd=...` sign-out URL.
 #[must_use]
 pub fn format_sign_out_url(rd: &str) -> String {
-    if rd == "/" {
-        "/oauth2/sign_out?rd=/".to_string()
-    } else {
-        format!("/oauth2/sign_out?rd={}", percent_encode(rd))
-    }
+    let normalized = if rd.is_empty() { "/" } else { rd };
+    format!("/oauth2/sign_out?rd={}", percent_encode(normalized))
 }
 
-/// Validate that a sign-in `href` has a valid query format with `=`.
-/// Rejects malformed patterns such as `?rdhttps:` missing `=`.
+/// Reject malformed sign-in URLs (missing `rd=`, unencoded parameters, empty `rd`).
 pub fn validate_sign_in_href(href: &str) -> Result<(), &'static str> {
-    let Some((path, query)) = href.split_once('?') else {
-        return Err("missing query string");
-    };
+    let (path, query) = href.split_once('?').ok_or("missing query string")?;
     if path != "/oauth2/start" {
         return Err("invalid path, expected /oauth2/start");
     }
-    let mut has_rd = false;
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == "rd" {
-                if v.is_empty() {
-                    return Err("empty rd parameter");
-                }
-                has_rd = true;
-            }
-        } else if pair.starts_with("rd") {
+    if !query.starts_with("rd=") {
+        if query.starts_with("rd") {
             return Err("malformed rd parameter missing '='");
         }
+        return Err("missing rd parameter");
     }
-    if has_rd {
-        Ok(())
-    } else {
-        Err("missing rd parameter")
+    let rd_val = &query["rd=".len()..];
+    if rd_val.is_empty() {
+        return Err("empty rd parameter");
     }
+    if rd_val.contains('&') || rd_val.contains('=') {
+        return Err("unencoded nested delimiter in rd parameter");
+    }
+    Ok(())
 }
 
-/// Parse `?font=dyslexic|hurmit` or stored `localStorage` value.
+fn find_query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    let raw = query.trim().strip_prefix('?').unwrap_or(query.trim());
+    for pair in raw.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve `CrtFont` from URL query (`?font=` / `?dyslexic=`) with `localStorage` fallback.
 #[must_use]
 pub fn parse_font_pref(query: &str, stored: Option<&str>) -> CrtFont {
-    for pair in query.trim_start_matches('?').split('&') {
-        if let Some(("font", val)) = pair.split_once('=') {
-            if val.eq_ignore_ascii_case("dyslexic")
-                || val.eq_ignore_ascii_case("opendyslexic")
-                || val.eq_ignore_ascii_case("true")
-                || val == "1"
-            {
-                return CrtFont::OpenDyslexic;
-            }
-            if val.eq_ignore_ascii_case("hurmit") || val.eq_ignore_ascii_case("false") || val == "0"
-            {
-                return CrtFont::Hurmit;
-            }
+    if let Some(val) = find_query_param(query, "font") {
+        let lower = val.to_ascii_lowercase();
+        if lower == "dyslexic" || lower == "opendyslexic" || lower == "opendyslexicm" {
+            return CrtFont::OpenDyslexic;
+        }
+        if lower == "hurmit" || lower == "mono" {
+            return CrtFont::Hurmit;
+        }
+    }
+    if let Some(val) = find_query_param(query, "dyslexic") {
+        if val == "1" || val.eq_ignore_ascii_case("true") {
+            return CrtFont::OpenDyslexic;
+        }
+        if val == "0" || val.eq_ignore_ascii_case("false") {
+            return CrtFont::Hurmit;
         }
     }
     if let Some(s) = stored {
-        let s = s.trim();
-        if s.eq_ignore_ascii_case("dyslexic")
-            || s.eq_ignore_ascii_case("opendyslexic")
-            || s.eq_ignore_ascii_case("true")
-            || s == "1"
-        {
+        let lower = s.trim().to_ascii_lowercase();
+        if lower == "1" || lower == "true" || lower.contains("dyslexic") {
             return CrtFont::OpenDyslexic;
         }
     }
     CrtFont::Hurmit
 }
 
-/// Serialize [`CrtFont`] for `localStorage` / query parameters.
+/// Canonical storage/DOM slug for [`CrtFont`].
 #[must_use]
 pub const fn font_slug(font: CrtFont) -> &'static str {
     match font {
         CrtFont::Hurmit => "hurmit",
-        CrtFont::OpenDyslexic => "dyslexic",
+        CrtFont::OpenDyslexic => "opendyslexic",
     }
 }
 
-/// Parse `?skin=wireframe` or stored `localStorage` value.
-/// Enforces `ConsoleSkin::Wireframe` invariant strictly per M1 requirements.
+/// Resolve `ConsoleSkin` preference from `?skin=html|wireframe` or `localStorage`
+/// (defaulting to [`ConsoleSkin::Html`]; anonymous sessions still enforce `Html` via
+/// [`ConsoleState::effective_skin`]).
 #[must_use]
-pub fn parse_skin_pref(_query: &str, _stored: Option<&str>) -> ConsoleSkin {
-    ConsoleSkin::Wireframe
+pub fn parse_skin_pref(query: &str, stored: Option<&str>) -> ConsoleSkin {
+    if let Some(val) = find_query_param(query, "skin") {
+        if val.eq_ignore_ascii_case("wireframe") {
+            return ConsoleSkin::Wireframe;
+        }
+        if val.eq_ignore_ascii_case("html") {
+            return ConsoleSkin::Html;
+        }
+    }
+    if let Some(s) = stored {
+        if s.trim().eq_ignore_ascii_case("wireframe") {
+            return ConsoleSkin::Wireframe;
+        }
+    }
+    ConsoleSkin::Html
 }
 
-/// Serialize [`ConsoleSkin`] for `localStorage` / query parameters.
+/// Canonical storage/DOM slug for [`ConsoleSkin`].
 #[must_use]
 pub const fn skin_slug(skin: ConsoleSkin) -> &'static str {
-    match skin {
-        ConsoleSkin::Wireframe => "wireframe",
-    }
+    skin.as_str()
 }
 
-/// Complete UI state for the console.
+/// Stateful client model bridging worker `ViewModel` snapshots/deltas, local modal workflows,
+/// skin/font persistence, `Timed` lease timers, and DOM input dispatch.
 #[derive(Debug)]
 pub struct ConsoleState {
     pub client: DataClient,
     pub route: Route,
     pub font: CrtFont,
     pub skin: ConsoleSkin,
-    /// Current viewport used to compute dynamic Scorecard/Trainway page capacities.
+    pub url_skin_override: Option<ConsoleSkin>,
     pub viewport: Viewport,
-    /// Current safe-area insets.
     pub safe_area: SafeArea,
     pub lazy_dyslexic_loaded: bool,
     pub reduced_motion: bool,
-    /// Outer rotary ring index into [`Self::filtered_repos`].
     pub outer_index: usize,
-    /// Inner rotary ring index (`0` = `PARENT`, `1..=M` = submodules).
     pub inner_index: usize,
-    /// `/` type-ahead filter string.
     pub filter_query: String,
     pub filter_focused: bool,
-    /// Pending rotary selection waiting for the 350 ms settle window (`due_ms`).
     pub pending_select_at_ms: Option<u64>,
-    /// Pending filter subscription query debounce waiting for 300 ms.
     pub pending_filter_at_ms: Option<u64>,
-    /// Phone bottom-sheet repo selector visibility.
     pub phone_rotary_open: bool,
-    /// C4 Scorecard page index.
     pub carousel_page: u32,
-    /// Persistent Trainway siding lane assignments (`ref_name -> lane`).
-    pub trainway_lanes: BTreeMap<String, u32>,
-    /// C5 Trainway `YARD +N` overflow page index.
     pub yard_page: u32,
-    /// C5 Trainway `LIVE` follow toggle.
-    pub trainway_live: bool,
-    /// C5 guarded `PullToTurn` `RESTART` switch (`NORM` = 0, `RST` = 1).
-    pub restart_switch: SwitchState,
-    /// Timestamp until which the `RESTART` switch remains armed (`Some(until_ms)`).
-    pub restart_armed_until_ms: Option<u64>,
-    /// Count of confirmed restarts triggered through the `PullToTurn` guard.
-    pub restart_count: u32,
-    /// C6 Delivery history strip selection (`0` = live / latest gate).
-    pub selected_history_idx: usize,
-    /// C6 Delivery selected test row for log excerpt paging.
-    pub selected_test_idx: usize,
-    /// C6 Delivery log excerpt page cursor.
-    pub log_page: u32,
-    /// Fleet telemetry page cursor.
-    pub fleet_page: u32,
-    /// Active sub-view CRT page cursor (`QueueLogs`, `DeploymentsSlots`, `ActiveLeases`, `Reg*`, `Obs*`).
     pub subview_page: u32,
-    /// `CI > Queue & Logs` and `OBS > Logs` auto-follow newest log page (tail).
+    pub log_page: u32,
     pub follow_log: bool,
-    /// Last rendered 0-based page index of `ci-job-detail-screen` (or compact `ci-queue-logs-screen`).
-    pub(crate) rendered_ci_log_page: std::cell::Cell<u32>,
-    /// Last rendered 0-based page index of `obs-logs-screen`.
-    pub(crate) rendered_obs_log_page: std::cell::Cell<u32>,
-    /// `CI > Queue & Logs` queue filter (`0 = ALL`, `1 = ACTIVE`, `2 = FAILED`, `3 = REPO`).
     pub ci_queue_filter: u8,
-    /// `CI > Queue & Logs` selected stage index in the job detail inspector.
     pub selected_stage_idx: Option<usize>,
-    /// `OBS > Metrics` selected metric series index for the SVG sparkline.
+    pub selected_history_idx: usize,
+    pub selected_test_idx: usize,
     pub selected_metric_idx: usize,
-    /// `OBS > Smartscape` layer filter (`0 = ALL`, `1 = SERVICES`, `2 = PROCESSES`, `3 = HOSTS`).
     pub obs_smartscape_filter: u8,
-    /// `FLT > Sandbox Profiles` selected sandbox profile index for the security drawer.
     pub selected_sandbox_idx: Option<usize>,
-    /// `REG > Packages` ecosystem filter (`None` = `ALL`).
     pub reg_ecosystem_filter: Option<PackageEcosystem>,
-    /// `REG > Packages` selected package name for the version/dependency drawer.
     pub selected_package: Option<String>,
-    /// `OBS > Smartscape` selected entity ID for the side inspection drawer.
     pub selected_entity_id: Option<String>,
-    /// `OBS > PurePath` quick-filter pill (`ALL`, `ERRORS`, `SLOW P99`, `CI`, `CD`, `REGISTRY`).
     pub purepath_filter: String,
-    /// `OBS > PurePath` selected trace ID.
     pub selected_trace_id: Option<String>,
-    /// `OBS > PurePath` selected span ID.
     pub selected_span_id: Option<String>,
-    /// `FLT > Worker Nodes` selected worker node ID for the stage drill-down drawer.
     pub selected_node_id: Option<String>,
-    /// `OBS > Logs` severity filter (`None` = `ALL`).
     pub log_severity_filter: Option<LogSeverity>,
-    /// `OBS` multi-service filter (`None` = `* All services`, `Some(service)` = single service/sidecar).
     pub obs_service_filter: Option<String>,
-    /// Polite `aria-live` announcement text.
+    pub rendered_ci_log_page: Cell<u32>,
+    pub rendered_obs_log_page: Cell<u32>,
     pub aria_polite: String,
-    /// Assertive `aria-live` alert text.
     pub aria_assertive: String,
-    /// One-time invite token captured from `?invite=<token>` or `sessionStorage`.
     pub pending_invite: Option<String>,
-    /// Target URL for pending client-side or browser navigation.
     pub pending_navigation: Option<String>,
+    pub pending_external_url: Option<String>,
+    pub pending_webauthn: Option<WebAuthnRequest>,
+    pub stashed_deep_link: Option<String>,
+    pub has_explicit_hash: bool,
+    pub route_sync_dirty: bool,
+    pub prefs_dirty: bool,
+    pub local_dialog: Option<DialogModel>,
+    pub profile_tab: UserProfileTab,
+    pub profile_display_name_draft: String,
+    pub profile_passkey_label_draft: String,
+    pub platform_form: PlatformFormState,
+    prev_auth_status: AuthStatus,
+    prev_lease_ids: Vec<String>,
+    last_lease_tick_ms: u64,
+    last_activity_at_ms: u64,
 }
 
 impl Default for ConsoleState {
@@ -391,23 +380,16 @@ impl Default for ConsoleState {
 }
 
 impl ConsoleState {
+    /// Construct initial fail-closed state (`ConsoleSkin::Html` default, unresolved auth).
     #[must_use]
     pub fn new() -> Self {
         Self {
             client: DataClient::new(),
-            route: Route {
-                area: Area::Ci,
-                subview: SubView::Ci(CiSubView::Scorecards),
-                repo: None,
-                submodule: None,
-                branch: None,
-                job: None,
-                trace_id: None,
-                filter: None,
-            },
+            route: Route::default(),
             font: CrtFont::Hurmit,
-            skin: ConsoleSkin::Wireframe,
-            viewport: Viewport::new(1512.0, 860.0),
+            skin: ConsoleSkin::Html,
+            url_skin_override: None,
+            viewport: Viewport::new(1280.0, 800.0),
             safe_area: SafeArea::ZERO,
             lazy_dyslexic_loaded: false,
             reduced_motion: false,
@@ -419,162 +401,193 @@ impl ConsoleState {
             pending_filter_at_ms: None,
             phone_rotary_open: false,
             carousel_page: 0,
-            trainway_lanes: BTreeMap::new(),
             yard_page: 0,
-            trainway_live: true,
-            restart_switch: SwitchState::new(SwitchAction::PullToTurn, 2, 0),
-            restart_armed_until_ms: None,
-            restart_count: 0,
-            selected_history_idx: 0,
-            selected_test_idx: 0,
-            log_page: 0,
-            fleet_page: 0,
             subview_page: 0,
+            log_page: 0,
             follow_log: true,
-            rendered_ci_log_page: std::cell::Cell::new(0),
-            rendered_obs_log_page: std::cell::Cell::new(0),
             ci_queue_filter: 0,
             selected_stage_idx: None,
+            selected_history_idx: 0,
+            selected_test_idx: 0,
             selected_metric_idx: 0,
             obs_smartscape_filter: 0,
             selected_sandbox_idx: None,
             reg_ecosystem_filter: None,
             selected_package: None,
             selected_entity_id: None,
-            purepath_filter: "ALL".into(),
+            purepath_filter: String::new(),
             selected_trace_id: None,
             selected_span_id: None,
             selected_node_id: None,
             log_severity_filter: None,
             obs_service_filter: None,
+            rendered_ci_log_page: Cell::new(0),
+            rendered_obs_log_page: Cell::new(0),
             aria_polite: String::new(),
             aria_assertive: String::new(),
             pending_invite: None,
             pending_navigation: None,
+            pending_external_url: None,
+            pending_webauthn: None,
+            stashed_deep_link: None,
+            has_explicit_hash: false,
+            route_sync_dirty: false,
+            prefs_dirty: false,
+            local_dialog: None,
+            profile_tab: UserProfileTab::UserDetails,
+            profile_display_name_draft: String::new(),
+            profile_passkey_label_draft: "Security Key".into(),
+            platform_form: PlatformFormState::default(),
+            prev_auth_status: AuthStatus::Unresolved,
+            prev_lease_ids: Vec::new(),
+            last_lease_tick_ms: 0,
+            last_activity_at_ms: 0,
         }
     }
 
-    /// Initialize route, font preference, and any `?invite=<token>` from browser location + storage.
+    /// Initialize route, font preference, and `?invite=` token capture from initial URL/storage.
     pub fn init_from_env(&mut self, hash: &str, search: &str, stored_font: Option<&str>) {
         self.apply_hash(hash);
-        let (invite, _) = extract_invite_token(search);
+        self.font = parse_font_pref(search, stored_font);
+        if self.font == CrtFont::OpenDyslexic {
+            self.lazy_dyslexic_loaded = true;
+        }
+        let (invite, _clean) = extract_invite_token(search);
         if invite.is_some() {
             self.pending_invite = invite;
         }
-        let f = parse_font_pref(search, stored_font);
-        self.set_font(f);
-        let sk = parse_skin_pref(search, None);
-        self.skin = sk;
+        if let Some(q) = self.route.filter.as_deref() {
+            self.filter_query = q.to_owned();
+        }
     }
 
-    /// Restore stored visual skin from `localStorage` (`muconsole.skin`) unless overridden by `?skin=`.
+    /// Restore skin override (`?skin=html|wireframe` or `localStorage`), remaining locked to `Html`
+    /// while unauthenticated.
     pub fn restore_stored_skin(&mut self, search: &str, stored_skin: Option<&str>) {
+        if let Some(val) = find_query_param(search, "skin") {
+            if val.eq_ignore_ascii_case("wireframe") {
+                self.url_skin_override = Some(ConsoleSkin::Wireframe);
+            } else if val.eq_ignore_ascii_case("html") {
+                self.url_skin_override = Some(ConsoleSkin::Html);
+            }
+        }
         self.skin = parse_skin_pref(search, stored_skin);
     }
 
-    /// Apply a location hash and synchronize sub-view filters / trace selection.
+    /// Parse and store URL hash route.
     pub fn apply_hash(&mut self, hash: &str) {
-        self.route = parse_hash(hash);
-        if matches!(
-            self.route.subview,
-            SubView::Ci(CiSubView::QueueLogs) | SubView::Observe(ObserveSubView::Logs)
-        ) {
-            self.follow_log = true;
+        self.has_explicit_hash = has_explicit_route(hash);
+        let parsed = parse_hash(hash);
+        self.route = parsed;
+        if let Some(q) = self.route.filter.as_deref() {
+            self.filter_query = q.to_owned();
         }
-        if let Some(tr) = self.route.trace_id.clone() {
-            self.selected_trace_id = Some(tr);
-        }
-        if let Some(flt) = self.route.filter.clone() {
-            match self.route.subview {
-                SubView::Observe(ObserveSubView::PurePath) => {
-                    self.purepath_filter = flt.to_ascii_uppercase();
-                }
-                SubView::Observe(ObserveSubView::Logs) => {
-                    self.log_severity_filter = match flt.to_ascii_uppercase().as_str() {
-                        "ERROR" | "ERRORS" => Some(LogSeverity::Error),
-                        "WARN" => Some(LogSeverity::Warn),
-                        "INFO" => Some(LogSeverity::Info),
-                        _ => None,
-                    };
-                }
-                SubView::Registry(RegistrySubView::Packages) => {
-                    self.reg_ecosystem_filter = match flt.to_ascii_uppercase().as_str() {
-                        "CARGO" => Some(PackageEcosystem::Cargo),
-                        "NUGET" => Some(PackageEcosystem::NuGet),
-                        "MAVEN" => Some(PackageEcosystem::Maven),
-                        _ => None,
-                    };
-                }
-                _ => {}
-            }
+        if let Some(t) = self.route.trace_id.as_deref() {
+            self.selected_trace_id = Some(t.to_owned());
         }
         self.sync_rotary_from_route();
     }
 
-    /// Restore active repository from `localStorage` (`muconsole.active_repo`) when URL has none.
+    /// Restore previously persisted repo selection (`owner/repo` or `owner/repo@submodule`).
     pub fn restore_stored_repo(&mut self, stored_repo: Option<&str>) {
-        if self.route.repo.is_some()
-            || !matches!(
-                self.route.subview,
-                SubView::Ci(CiSubView::Trainway) | SubView::Cd(CdSubView::IntegrationGate)
-            )
-        {
-            return;
-        }
         let Some(raw) = stored_repo.map(str::trim).filter(|s| !s.is_empty()) else {
             return;
         };
-        let (repo_part, sub_part) = raw.split_once("::").unwrap_or((raw, ""));
+        let (repo_part, sub_part) = match raw.split_once('@') {
+            Some((r, s)) if !s.is_empty() => (r, Some(SubmoduleId { path: s.to_owned() })),
+            _ => (raw, None),
+        };
         if let Some((owner, repo)) = repo_part.split_once('/') {
             if !owner.is_empty() && !repo.is_empty() {
                 self.route.repo = Some(RepoId::new(owner, repo));
-                if !sub_part.is_empty() {
-                    self.route.submodule = Some(SubmoduleId {
-                        path: sub_part.to_owned(),
-                    });
-                }
+                self.route.submodule = sub_part;
+                self.sync_rotary_from_route();
             }
         }
     }
 
-    /// Serialize active repo + submodule for `localStorage` (`muconsole.active_repo`).
+    /// Format active repository selection for `localStorage` persistence.
     #[must_use]
     pub fn stored_repo_value(&self) -> Option<String> {
         let repo = self.route.repo.as_ref()?;
-        match self.route.submodule.as_ref() {
-            Some(sub) => Some(format!("{}/{}::{}", repo.owner, repo.repo, sub.path)),
+        match &self.route.submodule {
+            Some(sub) => Some(format!("{}/{}@{}", repo.owner, repo.repo, sub.path)),
             None => Some(format!("{}/{}", repo.owner, repo.repo)),
         }
     }
 
-    /// Current operator authentication state from the view model (defaults to [`AuthState::Anonymous`]).
+    /// Return current [`AuthState`] (defaults to fail-closed [`AuthState::unresolved`] until hydrated).
     #[must_use]
     pub fn auth(&self) -> AuthState {
         self.client
             .view()
             .map(|v| v.auth.clone())
-            .unwrap_or(AuthState::Anonymous)
+            .unwrap_or_else(AuthState::unresolved)
     }
 
-    /// Whether the active session is an authenticated, invite-bound operator.
+    /// Return active skin enforced for the session (`Html` unconditionally unless `Active`).
+    #[must_use]
+    pub fn effective_skin(&self) -> ConsoleSkin {
+        if self.auth().status != AuthStatus::Active {
+            return ConsoleSkin::Html;
+        }
+        self.url_skin_override.unwrap_or(self.skin)
+    }
+
+    /// Return `true` when session is an active bound operator.
     #[must_use]
     pub fn is_operator(&self) -> bool {
         self.auth().is_operator()
     }
 
-    /// Return the formatted sign-in URL.
+    /// Check whether `area` is enabled for the active session.
     #[must_use]
-    pub fn sign_in_href(&self) -> String {
-        format_sign_in_url("/")
+    pub fn can_access_area(&self, area: Area) -> bool {
+        let auth = self.auth();
+        auth.is_resolved()
+            && auth.status != AuthStatus::PasskeyEnrollmentRequired
+            && !auth.anonymous_lockdown
+            && auth.can_access_area(area)
     }
 
-    /// Return the formatted sign-out URL.
+    /// Check whether `subview` satisfies minimal active-role access requirements.
+    #[must_use]
+    pub fn can_access_subview(&self, subview: SubView) -> bool {
+        can_access_subview(&self.auth(), subview)
+    }
+
+    /// Format active header role pill string bounded safely on UTF-8 char boundaries.
+    #[must_use]
+    pub fn format_header_roles(&self) -> String {
+        let auth = self.auth();
+        let max_chars = self
+            .client
+            .view()
+            .map(|v| v.max_active_roles_header_chars)
+            .unwrap_or(mu_console_protocol::DEFAULT_MAX_ACTIVE_ROLES_HEADER_CHARS);
+        format_active_roles(&auth.active_roles, max_chars)
+    }
+
+    /// Return sign-in URL preserving the current deep-link path/hash cleanly across OAuth.
+    #[must_use]
+    pub fn sign_in_href(&self) -> String {
+        let default_return = if self.has_explicit_hash { "" } else { "/" };
+        let return_to = self.stashed_deep_link.as_deref().unwrap_or(default_return);
+        if return_to.is_empty() {
+            let hash = format_hash(&self.route);
+            format_sign_in_url(&format!("/{hash}"))
+        } else {
+            format_sign_in_url(return_to)
+        }
+    }
+
+    /// Return canonical `/oauth2/sign_out?rd=/` URL.
     #[must_use]
     pub fn sign_out_href(&self) -> String {
         format_sign_out_url("/")
     }
 
-    /// Active font metrics (`HURMIT` or `OPEN_DYSLEXIC`).
+    /// Return active monospace font metrics.
     #[must_use]
     pub const fn font_metrics(&self) -> &'static CrtFontMetrics {
         match self.font {
@@ -583,17 +596,17 @@ impl ConsoleState {
         }
     }
 
-    /// Set the active reading font, lazy-loading `OpenDyslexicM` on first use.
+    /// Update active font preference locally and emit `UiCommand::SetCrtFont`.
     pub fn set_font(&mut self, font: CrtFont) -> UiCommand {
         self.font = font;
         if font == CrtFont::OpenDyslexic {
             self.lazy_dyslexic_loaded = true;
         }
-        self.aria_polite = format!("Font set to {}", self.font_metrics().family);
+        self.prefs_dirty = true;
         UiCommand::SetCrtFont(font)
     }
 
-    /// Toggle between `Hurmit` and `OpenDyslexicM`.
+    /// Toggle `Hurmit` <-> `OpenDyslexicM` and emit `UiCommand::SetCrtFont`.
     pub fn toggle_font(&mut self) -> UiCommand {
         let next = match self.font {
             CrtFont::Hurmit => CrtFont::OpenDyslexic,
@@ -602,154 +615,305 @@ impl ConsoleState {
         self.set_font(next)
     }
 
-    /// Set the active visual skin (`Wireframe`).
-    pub fn set_skin(&mut self, _skin: ConsoleSkin) -> UiCommand {
-        self.skin = ConsoleSkin::Wireframe;
-        self.aria_polite = "Wireframe technical skin active".into();
-        UiCommand::SetSkin(ConsoleSkin::Wireframe)
+    /// Update skin preference (effective only when `Active`; unauthenticated remains `Html`).
+    pub fn set_skin(&mut self, skin: ConsoleSkin) -> UiCommand {
+        if self.auth().status == AuthStatus::Active {
+            self.url_skin_override = Some(skin);
+            self.skin = skin;
+            self.prefs_dirty = true;
+            UiCommand::SetSkin(skin)
+        } else {
+            self.skin = ConsoleSkin::Html;
+            UiCommand::SetSkin(ConsoleSkin::Html)
+        }
     }
 
-    /// Toggle between visual skins (neutralized to WireframeSkin invariant).
+    /// Toggle `Html` <-> `Wireframe` when `Active` (no-op returning `Html` otherwise).
     pub fn toggle_skin(&mut self) -> UiCommand {
-        self.skin = ConsoleSkin::Wireframe;
-        UiCommand::SetSkin(ConsoleSkin::Wireframe)
+        if self.auth().status != AuthStatus::Active {
+            return self.set_skin(ConsoleSkin::Html);
+        }
+        let next = match self.effective_skin() {
+            ConsoleSkin::Html => ConsoleSkin::Wireframe,
+            ConsoleSkin::Wireframe => ConsoleSkin::Html,
+        };
+        self.set_skin(next)
     }
 
-    /// Active or latest job ID for the selected repository/topology.
+    /// Resolve active dialog (enforcing mandatory `0`-Passkey gate above all dismissible dialogs).
+    #[must_use]
+    pub fn active_dialog(&self) -> Option<DialogModel> {
+        let auth = self.auth();
+        if auth.passkey_enrollment_required || auth.status == AuthStatus::PasskeyEnrollmentRequired
+        {
+            return Some(DialogModel::PasskeyEnrollmentGate(
+                PasskeyEnrollmentGateModel {
+                    github_login: auth.github_login.unwrap_or_else(|| "operator".into()),
+                    passkey_count: auth.passkey_count,
+                    reason_code: auth.reason_code,
+                },
+            ));
+        }
+        if let Some(worker_dlg) = self.client.view().and_then(|v| v.active_dialog.as_ref()) {
+            return Some(worker_dlg.clone());
+        }
+        self.local_dialog.clone()
+    }
+
+    /// Currently active CI job ID selected by route, train, or queue summary.
     #[must_use]
     pub fn active_job_id(&self) -> Option<u64> {
-        if let Some(j) = self.route.job {
-            return Some(j);
+        if let Some(id) = self.route.job {
+            return Some(id);
         }
-        if let Some(v) = self.client.view() {
-            if let Some(topo) = v.topology.as_ref() {
-                if let Some(failed) = topo.trains.iter().find(|t| t.failed()) {
-                    return Some(failed.job_id);
-                }
-                if let Some(first) = topo.trains.first() {
-                    return Some(first.job_id);
-                }
-            }
-            if let Some(rid) = self.route.repo.as_ref() {
-                if let Some(r) = v.repos.iter().find(|x| &x.id == rid) {
-                    if let Some(jid) = r.latest_job_id {
-                        return Some(jid);
-                    }
+        let view = self.client.view()?;
+        if let Some(branch) = &self.route.branch {
+            if let Some(topo) = &view.topology {
+                if let Some(tr) = topo
+                    .trains
+                    .iter()
+                    .find(|t| branch_matches_ref(branch, &t.ref_name))
+                {
+                    return Some(tr.job_id);
                 }
             }
         }
-        None
+        if let Some(first) = view.ci_jobs.first() {
+            return Some(first.job_id);
+        }
+        view.repos.first().and_then(|r| r.latest_job_id)
     }
 
-    /// Dispatch an authenticated `POST /api/jobs/{id}/restart` for `job_id`.
+    /// Trigger CI job restart confirmation (`DialogModel::RiskConfirm`) if `ci:jobs.restart` held.
     pub fn restart_job(&mut self, job_id: u64) -> Option<UiCommand> {
-        if !self.is_operator() {
-            self.aria_assertive =
-                "RAW LOGS & JOB RESTART REQUIRE INVITED GITHUB OPERATOR SESSION".into();
+        let auth = self.auth();
+        if !auth.has_policy("ci:jobs.restart") {
+            self.aria_polite = copy::AUTH_DENIED_STATUS.into();
             return None;
         }
-        self.restart_count = self.restart_count.saturating_add(1);
-        self.aria_assertive = format!("Restarted job #{job_id}");
-        Some(UiCommand::RestartJob { job_id })
+        let repo = self
+            .route
+            .repo
+            .clone()
+            .or_else(|| {
+                self.client.view().and_then(|v| {
+                    v.ci_jobs
+                        .iter()
+                        .find(|j| j.job_id == job_id)
+                        .map(|j| j.repo.clone())
+                })
+            })
+            .unwrap_or_else(|| RepoId::new("LMA1980", "mu-console"));
+        let job_id_str = format!("{job_id:06}");
+        let dlg = DialogModel::RiskConfirm(RiskConfirmDialogModel {
+            action: RiskConfirmAction::RestartCiJob {
+                job_id,
+                job_id_str: job_id_str.clone(),
+                repo,
+            },
+            confirmation_phrase: Some(format!("RESTART {job_id_str}")),
+            typed_confirmation: String::new(),
+        });
+        self.local_dialog = Some(dlg.clone());
+        Some(UiCommand::OpenDialog(dlg))
     }
 
-    /// Feed a worker frame into [`DataClient`] and synchronize selection/route.
-    pub fn on_worker_frame(&mut self, frame: &[u8]) -> ClientUpdate {
-        let upd = self.client.on_frame(frame);
-        match &upd {
-            ClientUpdate::View => {
-                if let Some(v) = self.client.view() {
-                    if let Some(sel) = v.selection.as_ref() {
-                        let single_repo_view = matches!(
-                            self.route.subview,
-                            SubView::Ci(CiSubView::Trainway)
-                                | SubView::Cd(CdSubView::IntegrationGate)
-                        );
-                        if self.route.repo.is_none()
-                            && (v.source != mu_console_protocol::DataSource::Live
-                                || single_repo_view)
-                        {
-                            self.route.repo = Some(sel.repo.clone());
-                            self.route.submodule.clone_from(&sel.submodule);
-                        }
-                    }
-                    if self.selected_trace_id.is_none() {
-                        self.selected_trace_id =
-                            v.observe.traces.first().map(|t| t.trace_id.clone());
-                    }
-                    if v.topology
-                        .as_ref()
-                        .is_some_and(mu_console_protocol::RepoTopology::stop)
-                    {
-                        self.aria_assertive = "STOP: CI stage failure detected".into();
-                    }
-                }
-                self.sync_rotary_from_route();
-            }
-            ClientUpdate::ReloadRequired { expected, found } => {
-                self.aria_assertive = crate::client::reload_banner_text(*expected, *found);
-            }
-            _ => {}
+    /// Execute risk-free CI resume immediately in 1 click (`no risk -> no dialog`) when permitted.
+    pub fn resume_job(&mut self, job_id: u64) -> Option<UiCommand> {
+        if !self.auth().has_policy("ci:jobs.resume") {
+            self.aria_polite = copy::AUTH_DENIED_STATUS.into();
+            return None;
         }
-        upd
+        Some(UiCommand::ResumeJob { job_id })
     }
 
-    /// Repositories matching the current `/` type-ahead filter.
+    /// Apply decoded postcard frame from the data worker and handle auth/expiry route transitions.
+    pub fn on_worker_frame(&mut self, frame: &[u8]) -> ClientUpdate {
+        let update = self.client.on_frame(frame);
+        if matches!(
+            update,
+            ClientUpdate::View | ClientUpdate::ReloadRequired { .. }
+        ) {
+            self.sync_from_view_model();
+        }
+        update
+    }
+
+    fn sync_from_view_model(&mut self) {
+        let Some(view) = self.client.view() else {
+            return;
+        };
+        let next_status = view.auth.status;
+        let next_lease_ids: Vec<String> =
+            view.auth.leases.iter().map(|l| l.role_id.clone()).collect();
+        let lost_timed = self
+            .prev_lease_ids
+            .iter()
+            .any(|id| !next_lease_ids.iter().any(|cur| cur == id));
+
+        if let Some(profile) = &view.user_profile {
+            if let Some(dn) = &profile.display_name {
+                if self.profile_display_name_draft.is_empty() {
+                    self.profile_display_name_draft = dn.clone();
+                }
+            } else if self.profile_display_name_draft.is_empty() {
+                self.profile_display_name_draft = profile.github_login.clone();
+            }
+            if !self.prefs_dirty && self.url_skin_override.is_none() {
+                self.skin = profile.preferences.skin;
+                self.font = profile.preferences.font;
+                if self.font == CrtFont::OpenDyslexic {
+                    self.lazy_dyslexic_loaded = true;
+                }
+            }
+        }
+
+        // Anonymous cold boot on `/` -> auto-route to CI > Queue & Job Steps (#50).
+        if self.prev_auth_status == AuthStatus::Unresolved
+            && matches!(
+                next_status,
+                AuthStatus::Anonymous | AuthStatus::AuthorizationDenied
+            )
+            && !view.auth.anonymous_lockdown
+            && !self.has_explicit_hash
+        {
+            self.route = Route::for_subview(SubView::Ci(CiSubView::QueueLogs));
+            self.route_sync_dirty = true;
+        }
+
+        // Post-login landing (#50): keep route if permitted, or fall back to Dashboard if
+        // stashed deep link requires a dormant role.
+        if self.prev_auth_status != AuthStatus::Active && next_status == AuthStatus::Active {
+            if let Some(stashed) = self.stashed_deep_link.take() {
+                let parsed = parse_hash(&stashed);
+                self.route = parsed;
+            }
+            if redirect_if_lacking_access(&view.auth, &mut self.route) {
+                self.route_sync_dirty = true;
+            }
+        } else if lost_timed && redirect_if_lacking_access(&view.auth, &mut self.route) {
+            // Timed role 00:00 expiry redirect ONLY if remaining active roles lack access (#46/#53).
+            self.route_sync_dirty = true;
+        }
+
+        self.prev_auth_status = next_status;
+        self.prev_lease_ids = next_lease_ids;
+        self.sync_rotary_from_route();
+    }
+
+    /// Return filtered repositories obeying public-only boundary unless private read policy held.
     #[must_use]
     pub fn filtered_repos(&self) -> Vec<RepoScore> {
-        let Some(v) = self.client.view() else {
+        let auth = self.auth();
+        if !auth.is_resolved()
+            || auth.status == AuthStatus::PasskeyEnrollmentRequired
+            || auth.anonymous_lockdown
+        {
+            return Vec::new();
+        }
+        let allow_private =
+            auth.status == AuthStatus::Active && auth.has_policy("ci:repos.private.read");
+        let Some(view) = self.client.view() else {
             return Vec::new();
         };
-        let q = self.filter_query.trim().to_ascii_lowercase();
-        if q.is_empty() {
-            return v.repos.clone();
-        }
-        v.repos
+        view.repos
             .iter()
+            .filter(|r| allow_private || r.visibility == Visibility::Public)
             .filter(|r| {
-                format!("{}/{}", r.id.owner, r.id.repo)
-                    .to_ascii_lowercase()
-                    .contains(&q)
+                let hay = format!("{}/{}", r.id.owner, r.id.repo);
+                service_filter_matches(&self.filter_query, &hay)
             })
             .cloned()
             .collect()
     }
 
-    /// Scorecards ordered for `CI > Scorecards`: selected parent repo first, then
-    /// its submodules in `.gitmodules` order, then remaining repositories.
+    /// Order scorecards parent-first followed by submodules cleanly.
     #[must_use]
     pub fn ordered_carousel_repos(&self) -> Vec<RepoScore> {
-        let Some(v) = self.client.view() else {
-            return Vec::new();
-        };
-        let repos = self.filtered_repos();
-        let mut out = Vec::with_capacity(repos.len());
-        let parent_id = self
-            .route
-            .repo
+        let mut repos = self.filtered_repos();
+        let selected_repo = self.route.repo.as_ref().or_else(|| {
+            self.client
+                .view()
+                .and_then(|v| v.selection.as_ref().map(|s| &s.repo))
+        });
+        let anchor_parent: Option<RepoId> = selected_repo.and_then(|sel| {
+            let entry = repos.iter().find(|r| &r.id == sel)?;
+            if !entry.submodules.is_empty() {
+                Some(entry.id.clone())
+            } else {
+                entry.parents.first().map(|p| p.repo.clone())
+            }
+        });
+        let sub_order: Vec<RepoId> = anchor_parent
             .as_ref()
-            .or_else(|| v.selection.as_ref().map(|s| &s.repo));
-        if let Some(pid) = parent_id {
-            if let Some(parent) = repos.iter().find(|r| &r.id == pid) {
-                out.push(parent.clone());
-                for sub in &parent.submodules {
-                    if let Some(sr) = repos.iter().find(|r| r.id == sub.repo) {
-                        if !out.iter().any(|x| x.id == sr.id) {
-                            out.push(sr.clone());
-                        }
-                    }
-                }
-            }
-        }
-        for r in &repos {
-            if !out.iter().any(|x| x.id == r.id) {
-                out.push(r.clone());
-            }
-        }
-        out
+            .and_then(|pid| repos.iter().find(|r| &r.id == pid))
+            .map(|parent| parent.submodules.iter().map(|s| s.repo.clone()).collect())
+            .unwrap_or_default();
+
+        repos.sort_by_key(|r| {
+            let (tier, order) = if anchor_parent.as_ref() == Some(&r.id) {
+                (0_u8, 0_usize)
+            } else if let Some(pos) = sub_order.iter().position(|id| id == &r.id) {
+                (1_u8, pos)
+            } else {
+                let sev = match r.status {
+                    RepoStatus::Failing => 0_usize,
+                    RepoStatus::Running => 1,
+                    RepoStatus::Unknown => 2,
+                    RepoStatus::Passing => 3,
+                };
+                (2_u8, sev)
+            };
+            (tier, order, r.id.owner.clone(), r.id.repo.clone())
+        });
+        repos
     }
 
-    /// Synchronize `outer_index` and `inner_index` with `self.route`.
+    /// Visible CI jobs obeying public-only filtering when unauthenticated or lacking private read.
+    #[must_use]
+    pub fn visible_ci_jobs(&self) -> Vec<CiJobSummary> {
+        let auth = self.auth();
+        if !auth.is_resolved()
+            || auth.status == AuthStatus::PasskeyEnrollmentRequired
+            || auth.anonymous_lockdown
+        {
+            return Vec::new();
+        }
+        let allow_private =
+            auth.status == AuthStatus::Active && auth.has_policy("ci:repos.private.read");
+        let Some(view) = self.client.view() else {
+            return Vec::new();
+        };
+        let public_repos: Vec<&RepoId> = view
+            .repos
+            .iter()
+            .filter(|r| r.visibility == Visibility::Public)
+            .map(|r| &r.id)
+            .collect();
+        view.ci_jobs
+            .iter()
+            .filter(|job| {
+                if allow_private {
+                    return true;
+                }
+                let matched_repo = view.repos.iter().find(|r| r.id == job.repo);
+                matched_repo.is_none_or(|r| r.visibility == Visibility::Public)
+                    && (public_repos.is_empty()
+                        || public_repos.contains(&&job.repo)
+                        || view.repos.iter().all(|r| r.id != job.repo))
+            })
+            .filter(|job| {
+                let hay = format!(
+                    "{}/{} {} {} {}",
+                    job.repo.owner, job.repo.repo, job.ref_name, job.job_id_str, job.queue_state
+                );
+                service_filter_matches(&self.filter_query, &hay)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Align rotary outer/inner indices with `self.route`.
     pub fn sync_rotary_from_route(&mut self) {
         let repos = self.filtered_repos();
         if repos.is_empty() {
@@ -757,472 +921,306 @@ impl ConsoleState {
             self.inner_index = 0;
             return;
         }
-        if let Some(target) = self.route.repo.as_ref() {
-            if let Some(pos) = repos.iter().position(|r| &r.id == target) {
-                self.outer_index = pos;
+        if let Some(target) = &self.route.repo {
+            if let Some(idx) = repos.iter().position(|r| &r.id == target) {
+                self.outer_index = idx;
             }
+        } else {
+            self.outer_index = self.outer_index.min(repos.len().saturating_sub(1));
         }
-        self.outer_index = self.outer_index.min(repos.len() - 1);
-        let parent = &repos[self.outer_index];
-        self.inner_index = match self.route.submodule.as_ref() {
-            None => 0,
-            Some(sub) => parent
-                .submodules
-                .iter()
-                .position(|s| s.path == sub.path)
-                .map_or(0, |i| i + 1),
-        };
+        let subs_len = repos
+            .get(self.outer_index)
+            .map_or(0, |r| r.submodules.len());
+        if let Some(sub) = &self.route.submodule {
+            if let Some(idx) = repos
+                .get(self.outer_index)
+                .and_then(|r| r.submodules.iter().position(|s| s.path == sub.path))
+            {
+                self.inner_index = idx + 1;
+            } else {
+                self.inner_index = 0;
+            }
+        } else if subs_len == 0 {
+            self.inner_index = 0;
+        }
     }
 
-    /// Rotate the outer (repository) ring by `delta` detents and start the
-    /// 350 ms settle timer.
+    /// Cycle selected parent repository.
     pub fn rotate_outer(&mut self, delta: isize, now_ms: u64) {
         let repos = self.filtered_repos();
-        if repos.is_empty() || delta == 0 {
+        if repos.is_empty() {
             return;
         }
         let len = isize::try_from(repos.len()).unwrap_or(1);
+        let cur = isize::try_from(self.outer_index).unwrap_or(0);
+        let next = usize::try_from((cur + delta).rem_euclid(len)).unwrap_or(0);
+        self.outer_index = next;
         self.inner_index = 0;
-        self.carousel_page = 0;
+        self.route.repo = Some(repos[next].id.clone());
         self.route.submodule = None;
         self.route.branch = None;
         self.route.job = None;
-
-        if self.route.repo.is_none() {
-            let next = if delta > 0 {
-                (delta - 1).rem_euclid(len)
-            } else {
-                (len + delta).rem_euclid(len)
-            };
-            self.outer_index = usize::try_from(next).unwrap_or(0);
-            let chosen = &repos[self.outer_index];
-            self.route.repo = Some(chosen.id.clone());
-            self.pending_select_at_ms = Some(now_ms.saturating_add(ROTARY_SETTLE_MS));
-            self.aria_polite =
-                format!("Selected repository {}/{}", chosen.id.owner, chosen.id.repo);
-            return;
-        }
-
-        let cur = isize::try_from(self.outer_index).unwrap_or(0);
-        if (cur == 0 && delta == -1) || (cur + 1 == len && delta == 1) {
-            self.outer_index = 0;
-            self.route.repo = None;
-            self.pending_select_at_ms = None;
-            self.aria_polite = "Selected * All repositories".to_owned();
-            return;
-        }
-        let next = (cur + delta).rem_euclid(len);
-        self.outer_index = usize::try_from(next).unwrap_or(0);
-        let chosen = &repos[self.outer_index];
-        self.route.repo = Some(chosen.id.clone());
         self.pending_select_at_ms = Some(now_ms.saturating_add(ROTARY_SETTLE_MS));
-        self.aria_polite = format!("Selected repository {}/{}", chosen.id.owner, chosen.id.repo);
     }
 
-    /// Rotate the inner (`PARENT` + submodules) ring by `delta` detents and
-    /// start the 350 ms settle timer.
+    /// Cycle selected submodule within the current parent repo (`0` = root).
     pub fn rotate_inner(&mut self, delta: isize, now_ms: u64) {
         let repos = self.filtered_repos();
-        let Some(parent) = repos.get(self.outer_index) else {
+        let Some(repo) = repos.get(self.outer_index) else {
             return;
         };
-        let total = parent.submodules.len() + 1;
+        let total = repo.submodules.len() + 1;
         let len = isize::try_from(total).unwrap_or(1);
         let cur = isize::try_from(self.inner_index).unwrap_or(0);
-        let next = (cur + delta).rem_euclid(len);
-        self.inner_index = usize::try_from(next).unwrap_or(0);
-        self.route.repo = Some(parent.id.clone());
-        self.route.submodule = if self.inner_index == 0 {
+        let next = usize::try_from((cur + delta).rem_euclid(len)).unwrap_or(0);
+        self.inner_index = next;
+        self.route.submodule = if next == 0 {
             None
         } else {
-            parent
-                .submodules
-                .get(self.inner_index - 1)
-                .map(|s| SubmoduleId {
-                    path: s.path.clone(),
-                })
+            repo.submodules.get(next - 1).map(|s| SubmoduleId {
+                path: s.path.clone(),
+            })
         };
         self.pending_select_at_ms = Some(now_ms.saturating_add(ROTARY_SETTLE_MS));
-        let label = self
-            .route
-            .submodule
-            .as_ref()
-            .map_or("PARENT", |s| s.path.as_str());
-        self.aria_polite = format!("Selected submodule {label}");
     }
 
-    /// Distinct sorted services, crates, and sidecar components observed in `MuObserve`.
+    /// Distinct service names visible in `Observability`.
     #[must_use]
     pub fn observed_services(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if let Some(v) = self.client.view() {
-            for log in &v.observe.logs {
-                push_observed_service(&mut out, &log.service);
-            }
-            for m in &v.observe.metrics {
-                push_observed_service(&mut out, &m.service);
-            }
-            for t in &v.observe.traces {
-                push_observed_service(&mut out, &t.root_service);
-                for sp in &t.spans {
-                    push_observed_service(&mut out, &sp.service);
-                }
-            }
-            for n in &v.observe.smartscape_nodes {
-                if n.layer == SmartscapeLayer::Service {
-                    let s = n.id.strip_prefix("svc:").unwrap_or(&n.label);
-                    push_observed_service(&mut out, s);
-                }
-            }
-            for p in &v.observe.problems {
-                push_observed_service(&mut out, &p.impacted_entity);
-                push_observed_service(&mut out, &p.root_cause_service);
-                for aff in &p.affected_services {
-                    push_observed_service(&mut out, aff);
-                }
-            }
-        }
-        out.sort_by_key(|a| a.to_ascii_lowercase());
-        out
+        let Some(view) = self.client.view() else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = view
+            .observe
+            .smartscape_nodes
+            .iter()
+            .map(|n| n.label.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
-    /// Step the `OBS` service filter (`* All services` <-> `1/N <service>`).
+    /// Cycle service filter inside `Observability`.
     pub fn rotate_obs_service(&mut self, delta: isize) {
         let services = self.observed_services();
-        if services.is_empty() || delta == 0 {
+        if services.is_empty() {
             self.obs_service_filter = None;
             return;
         }
-        let len = isize::try_from(services.len()).unwrap_or(1);
-        let Some(cur_svc) = self.obs_service_filter.as_deref() else {
-            let next_idx = if delta > 0 {
-                0_usize
-            } else {
-                services.len() - 1
-            };
-            let chosen = services[next_idx].clone();
-            self.obs_service_filter = Some(chosen.clone());
-            self.subview_page = 0;
-            self.follow_log = true;
-            self.aria_polite = format!("Filtered Observe by service {chosen}");
-            return;
-        };
-        let cur = services
-            .iter()
-            .position(|s| service_filter_matches(s, cur_svc))
-            .and_then(|i| isize::try_from(i).ok())
+        let total = services.len() + 1;
+        let cur_idx = self
+            .obs_service_filter
+            .as_deref()
+            .and_then(|cur| services.iter().position(|s| s == cur).map(|i| i + 1))
             .unwrap_or(0);
-        if (cur == 0 && delta < 0) || (cur + 1 == len && delta > 0) {
-            self.obs_service_filter = None;
-            self.subview_page = 0;
-            self.follow_log = true;
-            self.aria_polite = "Selected * All services".to_owned();
-            return;
-        }
-        let next = usize::try_from((cur + delta).rem_euclid(len)).unwrap_or(0);
-        let chosen = services[next].clone();
-        self.obs_service_filter = Some(chosen.clone());
-        self.subview_page = 0;
-        self.follow_log = true;
-        self.aria_polite = format!("Filtered Observe by service {chosen}");
+        let next = usize::try_from(
+            (isize::try_from(cur_idx).unwrap_or(0) + delta)
+                .rem_euclid(isize::try_from(total).unwrap_or(1)),
+        )
+        .unwrap_or(0);
+        self.obs_service_filter = if next == 0 {
+            None
+        } else {
+            services.get(next - 1).cloned()
+        };
     }
 
-    /// Update the `/` type-ahead filter and snap `outer_index` to the first
-    /// matching repository (or return to `* All repositories` when cleared on overview views).
+    /// Update `#muconsole-filter` query string cleanly.
     pub fn set_filter_query(&mut self, query: &str, now_ms: u64) {
-        if matches!(self.route.area, Area::Observe | Area::Fleet) {
-            self.filter_query = query.to_owned();
-            self.subview_page = 0;
-            self.fleet_page = 0;
-            if self.route.subview == SubView::Observe(ObserveSubView::Logs) {
-                self.follow_log = true;
-            }
-            let trimmed = query.trim();
-            self.route.filter = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_owned())
-            };
-            self.pending_filter_at_ms = Some(now_ms.saturating_add(300));
-            return;
-        }
         self.filter_query = query.to_owned();
-        self.outer_index = 0;
-        self.inner_index = 0;
+        self.route.filter = if query.trim().is_empty() {
+            None
+        } else {
+            Some(query.to_owned())
+        };
         self.carousel_page = 0;
-        self.route.submodule = None;
-        self.route.branch = None;
-        self.route.job = None;
-        let single_repo_view = matches!(
-            self.route.subview,
-            SubView::Ci(CiSubView::Trainway) | SubView::Cd(CdSubView::IntegrationGate)
-        );
-        if query.trim().is_empty() && !single_repo_view {
-            self.route.repo = None;
-            self.pending_select_at_ms = None;
-            return;
-        }
-        let repos = self.filtered_repos();
-        if let Some(first) = repos.first() {
-            self.route.repo = Some(first.id.clone());
-            self.pending_select_at_ms = Some(now_ms.saturating_add(ROTARY_SETTLE_MS));
-        }
-    }
-
-    fn prune_unused_route_params(&mut self, sv: SubView) {
-        if matches!(sv.area(), Area::Observe | Area::Fleet) {
-            self.route.repo = None;
-            self.route.submodule = None;
-            self.route.branch = None;
-            self.route.job = None;
-            self.inner_index = 0;
-        }
-        if !matches!(sv, SubView::Ci(CiSubView::Trainway | CiSubView::QueueLogs)) {
-            self.route.branch = None;
-            self.route.job = None;
-        }
-        if !matches!(sv, SubView::Observe(ObserveSubView::PurePath)) {
-            self.route.trace_id = None;
-        }
-        if !matches!(sv, SubView::Ci(CiSubView::Scorecards | CiSubView::Trainway)) {
-            self.route.submodule = None;
-            self.inner_index = 0;
-        }
-        if self.route.repo.is_none()
-            && matches!(
-                sv,
-                SubView::Ci(CiSubView::Trainway) | SubView::Cd(CdSubView::IntegrationGate)
-            )
-        {
-            if let Some(first) = self.filtered_repos().first() {
-                self.route.repo = Some(first.id.clone());
-                self.outer_index = 0;
-            }
-        }
-    }
-
-    /// Select an area on C1 (`CI`, `CD`, `REG`, `OBS`, `FLT`).
-    pub fn select_area(&mut self, area: Area) -> UiCommand {
-        self.route.area = area;
-        if self.route.subview.area() != area {
-            self.route.subview = SubView::default_for(area);
-        }
-        self.prune_unused_route_params(self.route.subview);
         self.subview_page = 0;
-        self.log_page = 0;
-        self.follow_log = true;
-        self.aria_polite = format!(
-            "Area {} :: {}",
-            area_label(area),
-            self.route.subview.label()
-        );
-        UiCommand::Subscribe(self.route.clone())
+        self.pending_filter_at_ms = Some(now_ms);
     }
 
-    /// Select a specific [`SubView`] tab in `SubViewBar`.
+    /// Switch to an area only if active session holds minimal access (`disabled` rule).
+    pub fn select_area(&mut self, area: Area) -> UiCommand {
+        if !self.can_access_area(area) {
+            self.aria_polite = copy::announce_disabled_area(area);
+            return UiCommand::Subscribe(self.route.clone());
+        }
+        let default_sub = SubView::default_for(area);
+        let sub = if self.can_access_subview(default_sub) {
+            default_sub
+        } else {
+            SubView::all_for(area)
+                .iter()
+                .copied()
+                .find(|s| self.can_access_subview(*s))
+                .unwrap_or(default_sub)
+        };
+        self.route.area = area;
+        self.route.subview = sub;
+        self.has_explicit_hash = true;
+        self.route_sync_dirty = true;
+        self.subview_page = 0;
+        self.aria_polite = copy::announce_route(area, sub.label());
+        UiCommand::SelectSubView(sub)
+    }
+
+    /// Switch directly to `subview` only when permitted for the active session.
     pub fn select_subview(&mut self, subview: SubView) -> Vec<UiCommand> {
+        if !self.can_access_subview(subview) {
+            self.aria_polite = copy::announce_disabled_area(subview.area());
+            return Vec::new();
+        }
         self.route.area = subview.area();
         self.route.subview = subview;
-        self.prune_unused_route_params(subview);
+        self.has_explicit_hash = true;
+        self.route_sync_dirty = true;
         self.subview_page = 0;
-        self.log_page = 0;
-        self.follow_log = true;
-        self.aria_polite = format!(
-            "Sub-view {} :: {}",
-            area_label(self.route.area),
-            subview.label()
-        );
-        vec![
-            UiCommand::Subscribe(self.route.clone()),
-            UiCommand::SelectSubView(subview),
-        ]
+        self.aria_polite = copy::announce_route(subview.area(), subview.label());
+        vec![UiCommand::SelectSubView(subview)]
     }
 
-    /// Navigate via `[TRACE ↗]` pill to `OBS > PurePath` pre-filtered to `trace_id`.
+    /// Cross-navigate to a PurePath trace when Observability read is permitted.
     pub fn open_trace(&mut self, trace_id: &str) -> Vec<UiCommand> {
-        self.route.area = Area::Observe;
-        self.route.subview = SubView::Observe(ObserveSubView::PurePath);
+        let target = SubView::Observability(mu_console_protocol::ObservabilitySubView::PurePath);
+        if !self.can_access_subview(target) {
+            self.aria_polite = copy::announce_disabled_area(Area::Observability);
+            return Vec::new();
+        }
         self.route.trace_id = Some(trace_id.to_owned());
         self.selected_trace_id = Some(trace_id.to_owned());
-        self.selected_span_id = None;
-        self.subview_page = 0;
-        self.aria_polite = format!("Opened PurePath trace {trace_id}");
-        vec![
-            UiCommand::Subscribe(self.route.clone()),
-            UiCommand::SelectSubView(self.route.subview),
-        ]
+        self.select_subview(target)
     }
 
-    /// Navigate via `[CD GATE ↗]` pill to `CD > Integration Gate`.
+    /// Cross-navigate to `A|B Deployment > Integration Gate` when permitted.
     pub fn open_cd_gate(&mut self, deployment_id: Option<&str>) -> Vec<UiCommand> {
-        self.route.area = Area::Cd;
-        self.route.subview = SubView::Cd(CdSubView::IntegrationGate);
-        self.subview_page = 0;
-        if let Some(dep) = deployment_id {
-            if let Some(v) = self.client.view() {
-                if let Some(pos) = v.history.iter().position(|h| h.deployment_id == dep) {
-                    self.selected_history_idx = pos + 1;
-                }
-            }
-            self.aria_polite = format!("Opened CD Integration Gate for {dep}");
-        } else {
-            self.aria_polite = "Opened CD Integration Gate".into();
+        let target = SubView::AbDeploy(AbDeploySubView::IntegrationGate);
+        if !self.can_access_subview(target) {
+            self.aria_polite = copy::announce_disabled_area(Area::AbDeploy);
+            return Vec::new();
         }
-        vec![
-            UiCommand::Subscribe(self.route.clone()),
-            UiCommand::SelectSubView(self.route.subview),
-        ]
+        if let Some(id) = deployment_id {
+            self.selected_entity_id = Some(id.to_owned());
+        }
+        self.select_subview(target)
     }
 
-    /// Update the active viewport and safe-area insets used for dynamic page capacity calculation.
+    /// Update viewport & safe area geometry.
     pub fn set_viewport(&mut self, viewport: Viewport, safe_area: SafeArea) {
         self.viewport = viewport;
         self.safe_area = safe_area;
     }
 
-    /// Compute the dynamic number of repository scorecards per page for the current viewport and font.
+    /// Scorecard cards fitted per carousel page on the current viewport.
     #[must_use]
     pub fn scorecard_cards_per_page(&self) -> usize {
-        let font = self.font_metrics();
-        let frames = solve(self.viewport, self.safe_area, self.route.area, font);
-        let screen_rect = frames
-            .panels
-            .first()
-            .map_or(frames.active_canvas, |p| p.crt);
-        scorecard_page_capacity(screen_rect, frames.breakpoint, font)
+        let solved = mu_console_layout::solve(
+            self.viewport,
+            self.safe_area,
+            self.route.area,
+            self.font_metrics(),
+        );
+        scorecard_page_capacity(solved.active_canvas, solved.breakpoint, self.font_metrics())
     }
 
-    /// Step the `CI > Scorecards` page by `delta` pages.
+    /// Step scorecard carousel pagination cleanly.
     pub fn step_carousel(&mut self, delta: i32, cards_per_page: usize) -> UiCommand {
-        let total_repos = self.ordered_carousel_repos().len();
-        let per = cards_per_page.max(1);
-        let pages = i32::try_from(total_repos.div_ceil(per).max(1)).unwrap_or(1);
+        let total = self.ordered_carousel_repos().len().max(1);
+        let per_page = cards_per_page.max(1);
+        let total_pages = total.div_ceil(per_page).max(1);
         let cur = i32::try_from(self.carousel_page).unwrap_or(0);
-        let next = (cur + delta).rem_euclid(pages);
+        let next = (cur + delta).rem_euclid(i32::try_from(total_pages).unwrap_or(1));
         self.carousel_page = u32::try_from(next).unwrap_or(0);
         UiCommand::Page {
-            panel: PanelId::Carousel,
+            panel: mu_console_protocol::PanelId::Carousel,
             cursor: self.carousel_page,
         }
     }
 
-    fn step_ci_log_page(&mut self, delta: isize) {
-        if delta < 0 {
-            let base = if self.follow_log && (self.log_page == 0 || self.log_page == u32::MAX) {
-                self.rendered_ci_log_page.get()
-            } else {
-                self.log_page
-            };
-            self.log_page = base.saturating_sub(1);
-            self.follow_log = false;
-        } else {
-            let base = if self.log_page == u32::MAX {
-                self.rendered_ci_log_page.get()
-            } else {
-                self.log_page
-            };
-            self.log_page = base.saturating_add(1);
-        }
-    }
-
-    fn step_obs_log_page(&mut self, delta: isize) {
-        if delta < 0 {
-            let base =
-                if self.follow_log && (self.subview_page == 0 || self.subview_page == u32::MAX) {
-                    self.rendered_obs_log_page.get()
-                } else {
-                    self.subview_page
-                };
-            self.subview_page = base.saturating_sub(1);
-            self.follow_log = false;
-        } else {
-            let base = if self.subview_page == u32::MAX {
-                self.rendered_obs_log_page.get()
-            } else {
-                self.subview_page
-            };
-            self.subview_page = base.saturating_add(1);
-        }
-    }
-
-    /// Step the active screen's pagination cursor by `delta`.
+    /// Step active view pagination.
     pub fn step_active_page(&mut self, delta: isize) {
-        let step = |cur: u32| -> u32 {
-            if delta >= 0 {
-                cur.wrapping_add(1)
-            } else {
-                cur.saturating_sub(1)
+        if delta < 0 {
+            self.subview_page = self
+                .subview_page
+                .saturating_sub(delta.unsigned_abs() as u32);
+        } else {
+            self.subview_page = self.subview_page.saturating_add(delta as u32);
+        }
+    }
+
+    /// Explicit user pointer/keyboard activity resets idle timers locally and notifies the worker.
+    ///
+    /// Background SSE updates and ticks never call this.
+    pub fn on_explicit_user_activity(&mut self, now_ms: u64) -> Vec<UiCommand> {
+        self.last_activity_at_ms = now_ms;
+        let auth = self.client.view_mut();
+        if let Some(view) = auth {
+            if touch_active_leases(&mut view.auth, now_ms) {
+                return vec![UiCommand::RecordUserActivity];
+            }
+        }
+        Vec::new()
+    }
+
+    /// Open `@user` Profile modal (`User Details | Preferences | Passkeys`).
+    pub fn open_user_profile(&mut self, tab: UserProfileTab) -> Vec<UiCommand> {
+        let auth = self.auth();
+        if auth.status != AuthStatus::Active {
+            return Vec::new();
+        }
+        self.profile_tab = tab;
+        let profile = if let Some(p) = self.client.view().and_then(|v| v.user_profile.as_ref()) {
+            if self.profile_display_name_draft.is_empty() {
+                self.profile_display_name_draft = p
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| p.github_login.clone());
+            }
+            p.clone()
+        } else {
+            let login = auth.github_login.unwrap_or_else(|| "operator".into());
+            if self.profile_display_name_draft.is_empty() {
+                self.profile_display_name_draft.clone_from(&login);
+            }
+            mu_console_protocol::UserProfileDto {
+                github_login: login,
+                display_name: (!self.profile_display_name_draft.is_empty())
+                    .then(|| self.profile_display_name_draft.clone()),
+                ..Default::default()
             }
         };
-        match self.route.subview {
-            SubView::Ci(CiSubView::Scorecards) => {
-                let per_page = self.scorecard_cards_per_page();
-                let _ = self.step_carousel(if delta >= 0 { 1 } else { -1 }, per_page);
-            }
-            SubView::Ci(CiSubView::Trainway) => {
-                self.yard_page = step(self.yard_page);
-            }
-            SubView::Cd(CdSubView::IntegrationGate) => {
-                self.log_page = step(self.log_page);
-            }
-            SubView::Fleet(_) => {
-                self.fleet_page = step(self.fleet_page);
-            }
-            SubView::Ci(CiSubView::QueueLogs) => {
-                self.step_ci_log_page(delta);
-                self.subview_page = step(self.subview_page);
-            }
-            SubView::Observe(ObserveSubView::Logs) => {
-                self.step_obs_log_page(delta);
-            }
-            _ => {
-                self.subview_page = step(self.subview_page);
-            }
-        }
+        let dlg = DialogModel::UserProfile(UserProfileDialogModel {
+            profile,
+            active_tab: tab,
+            max_session_expires_epoch_ms: None,
+        });
+        self.local_dialog = Some(dlg.clone());
+        vec![UiCommand::OpenDialog(dlg)]
     }
 
-    /// Feed an event into the guarded `PullToTurn` Trainway `RESTART` switch.
-    ///
-    /// Requires an authenticated operator session (`self.is_operator()`).
-    /// Rotating to position `1` (`RST`) requires either a >= 300 ms pull hold
-    /// or `shift: true`. The first valid rotation arms the control for
-    /// [`RESTART_ARM_WINDOW_MS`]; confirming within that window dispatches
-    /// [`UiCommand::Retry`].
-    pub fn on_restart_switch(&mut self, ev: SwitchEvent, now_ms: u64) -> Option<UiCommand> {
-        if !self.is_operator() {
-            self.restart_armed_until_ms = None;
-            self.aria_assertive =
-                "RAW LOGS & JOB RESTART REQUIRE INVITED GITHUB OPERATOR SESSION".into();
-            return None;
+    /// Open `+role` Session Roles modal.
+    pub fn open_session_roles(&mut self) -> Vec<UiCommand> {
+        let auth = self.auth();
+        if auth.status != AuthStatus::Active {
+            return Vec::new();
         }
-        if let Some(until) = self.restart_armed_until_ms {
-            if now_ms > until {
-                self.restart_armed_until_ms = None;
-            }
-        }
-        match self.restart_switch.apply(ev) {
-            SwitchOutcome::Fired(1) => {
-                if self
-                    .restart_armed_until_ms
-                    .is_some_and(|until| now_ms <= until)
-                {
-                    self.restart_armed_until_ms = None;
-                    self.restart_count = self.restart_count.saturating_add(1);
-                    self.aria_assertive = "Trainway restart confirmed".into();
-                    Some(UiCommand::Retry)
+        let roles = self
+            .client
+            .view()
+            .and_then(|v| {
+                if let Some(DialogModel::SessionRoles(sr)) = &v.active_dialog {
+                    Some(sr.roles.clone())
                 } else {
-                    self.restart_armed_until_ms =
-                        Some(now_ms.saturating_add(RESTART_ARM_WINDOW_MS));
-                    self.aria_polite = "Restart armed: confirm within 3 seconds to execute".into();
                     None
                 }
-            }
-            SwitchOutcome::Refused => {
-                self.aria_polite = "Pull and hold 300ms (or Shift) before turning RESTART".into();
-                None
-            }
-            _ => None,
-        }
+            })
+            .unwrap_or_default();
+        let dlg = DialogModel::SessionRoles(SessionRolesDialogModel {
+            github_login: auth.github_login.unwrap_or_else(|| "operator".into()),
+            roles,
+            lock_all_enabled: !auth.leases.is_empty(),
+        });
+        self.local_dialog = Some(dlg.clone());
+        vec![UiCommand::OpenDialog(dlg)]
     }
 
     /// Activate an interactive control target by ID (`data-control-id` / `data-action`).
@@ -1236,847 +1234,760 @@ impl ConsoleState {
         &mut self,
         attr_name: &str,
         attr_val: &str,
-        shift: bool,
+        _shift: bool,
         now_ms: u64,
     ) -> Vec<UiCommand> {
         match attr_name {
             "data-area" => {
-                if let Some(area) = parse_area(attr_val) {
-                    let cmd = self.select_area(area);
-                    return vec![cmd, UiCommand::SelectSubView(self.route.subview)];
+                if let Some(area) = Area::from_slug(attr_val) {
+                    if !self.can_access_area(area) {
+                        self.aria_polite = copy::announce_disabled_area(area);
+                        return Vec::new();
+                    }
+                    return vec![self.select_area(area)];
                 }
+                Vec::new()
             }
             "data-subview" => {
-                if let Some(sv) = parse_subview(self.route.area, attr_val) {
+                if let Some((a_slug, sv_slug)) = attr_val.split_once(':') {
+                    if let Some(area) = Area::from_slug(a_slug) {
+                        if let Some(sv) = SubView::from_area_and_slug(area, sv_slug) {
+                            return self.select_subview(sv);
+                        }
+                    }
+                } else if let Some(sv) = SubView::from_area_and_slug(self.route.area, attr_val) {
                     return self.select_subview(sv);
                 }
-                for area in Area::ALL {
-                    if let Some(sv) = parse_subview(area, attr_val) {
-                        return self.select_subview(sv);
-                    }
-                }
+                Vec::new()
             }
-            "data-repo-step" => {
-                if self.route.area == Area::Observe {
-                    match attr_val {
-                        "prev" => self.rotate_obs_service(-1),
-                        "next" => self.rotate_obs_service(1),
-                        _ => {}
-                    }
-                } else {
-                    match attr_val {
-                        "prev" => self.rotate_outer(-1, now_ms),
-                        "next" => self.rotate_outer(1, now_ms),
-                        "sub-prev" => self.rotate_inner(-1, now_ms),
-                        "sub-next" => self.rotate_inner(1, now_ms),
-                        _ => {}
-                    }
+            "data-repo-step" => match attr_val {
+                "prev-outer" => {
+                    self.rotate_outer(-1, now_ms);
+                    Vec::new()
                 }
+                "next-outer" => {
+                    self.rotate_outer(1, now_ms);
+                    Vec::new()
+                }
+                "prev-inner" => {
+                    self.rotate_inner(-1, now_ms);
+                    Vec::new()
+                }
+                "next-inner" => {
+                    self.rotate_inner(1, now_ms);
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            },
+            "data-dyslexia-toggle" => vec![self.toggle_font()],
+            "data-skin-toggle" => vec![self.toggle_skin()],
+            "data-external-href" => {
+                if attr_val.starts_with("https://") || attr_val.starts_with("http://") {
+                    self.pending_external_url = Some(attr_val.to_owned());
+                }
+                Vec::new()
             }
             "data-page-step" => match attr_val {
-                "prev" => self.step_active_page(-1),
-                "next" => self.step_active_page(1),
-                _ => {}
+                "prev" => {
+                    self.step_active_page(-1);
+                    Vec::new()
+                }
+                "next" => {
+                    self.step_active_page(1);
+                    Vec::new()
+                }
+                _ => Vec::new(),
             },
-            "data-dyslexia-toggle" => {
-                return vec![self.toggle_font()];
-            }
-            "data-skin-toggle" => {
-                return vec![self.toggle_skin()];
-            }
-            "data-restart-job" => {
-                if let Ok(job_id) = attr_val.parse::<u64>() {
-                    return self.restart_job(job_id).into_iter().collect();
-                }
-            }
-            "data-trainway-restart" => {
-                let res = self.on_restart_switch(
-                    SwitchEvent::Rotate {
-                        to: 1,
-                        at_ms: now_ms,
-                        shift: true,
-                    },
-                    now_ms,
-                );
-                let _ = self.on_restart_switch(SwitchEvent::Release { at_ms: now_ms }, now_ms);
-                if let Some(cmd) = res {
-                    let mut cmds = Vec::new();
-                    if let Some(job_id) = self.active_job_id() {
-                        cmds.push(UiCommand::RestartJob { job_id });
-                    }
-                    cmds.push(cmd);
-                    return cmds;
-                }
-            }
-            "data-trace-id" => {
-                return self.open_trace(attr_val);
-            }
-            "data-cd-gate" => {
-                return self.open_cd_gate(Some(attr_val));
-            }
+            "data-trace-id" => self.open_trace(attr_val),
+            "data-cd-gate" => self.open_cd_gate(Some(attr_val)),
             "data-ecosystem" => {
-                self.reg_ecosystem_filter = match attr_val.to_ascii_uppercase().as_str() {
-                    "CARGO" => Some(PackageEcosystem::Cargo),
-                    "NUGET" => Some(PackageEcosystem::NuGet),
-                    "MAVEN" => Some(PackageEcosystem::Maven),
+                self.reg_ecosystem_filter = match attr_val {
+                    "cargo" => Some(PackageEcosystem::Cargo),
+                    "nuget" => Some(PackageEcosystem::NuGet),
+                    "maven" => Some(PackageEcosystem::Maven),
                     _ => None,
                 };
-                self.subview_page = 0;
-                self.route.filter = self.reg_ecosystem_filter.map(|e| e.label().to_owned());
-                self.aria_polite = format!("Filtered packages by {attr_val}");
+                Vec::new()
             }
             "data-package" => {
-                if self.selected_package.as_deref() == Some(attr_val) {
-                    self.selected_package = None;
-                } else {
-                    self.selected_package = Some(attr_val.to_owned());
-                }
+                self.selected_package = Some(attr_val.to_owned());
+                Vec::new()
             }
             "data-entity-id" => {
-                if self.selected_entity_id.as_deref() == Some(attr_val) {
-                    self.selected_entity_id = None;
-                } else {
-                    self.selected_entity_id = Some(attr_val.to_owned());
-                }
+                self.selected_entity_id = Some(attr_val.to_owned());
+                Vec::new()
             }
             "data-purepath-filter" => {
-                self.purepath_filter = attr_val.to_ascii_uppercase();
-                self.subview_page = 0;
-                self.route.filter = if self.purepath_filter == "ALL" {
-                    None
-                } else {
-                    Some(self.purepath_filter.clone())
-                };
-                self.aria_polite = format!("PurePath filter {}", self.purepath_filter);
+                self.purepath_filter = attr_val.to_owned();
+                Vec::new()
             }
             "data-select-trace" => {
                 self.selected_trace_id = Some(attr_val.to_owned());
-                self.route.trace_id = Some(attr_val.to_owned());
-                self.selected_span_id = None;
-                self.subview_page = 0;
-                return vec![UiCommand::Subscribe(self.route.clone())];
+                Vec::new()
             }
             "data-span-id" => {
                 self.selected_span_id = Some(attr_val.to_owned());
+                Vec::new()
             }
             "data-log-severity" => {
-                self.log_severity_filter = match attr_val.to_ascii_uppercase().as_str() {
-                    "ERROR" | "ERRORS" => Some(LogSeverity::Error),
-                    "WARN" => Some(LogSeverity::Warn),
-                    "INFO" => Some(LogSeverity::Info),
+                self.log_severity_filter = match attr_val.to_ascii_lowercase().as_str() {
+                    "info" => Some(LogSeverity::Info),
+                    "warn" => Some(LogSeverity::Warn),
+                    "error" => Some(LogSeverity::Error),
                     _ => None,
                 };
-                self.subview_page = 0;
-                self.follow_log = true;
-                self.route.filter = self.log_severity_filter.map(|s| s.label().to_owned());
+                Vec::new()
             }
-            "data-action" | "data-control-id" => {
-                return self.on_control_id(attr_val, shift, now_ms)
-            }
-            _ => {}
+            "data-action" | "data-control-id" => self.handle_control_id(attr_val, now_ms),
+            _ => Vec::new(),
         }
-        Vec::new()
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn on_control_id(&mut self, id: &str, shift: bool, now_ms: u64) -> Vec<UiCommand> {
+    fn handle_control_id(&mut self, id: &str, now_ms: u64) -> Vec<UiCommand> {
         if let Some(area_slug) = id
-            .strip_prefix("c1-area-rail:")
-            .or_else(|| id.strip_prefix("c1-area-selector:"))
+            .strip_prefix("nav-area:")
+            .or_else(|| id.strip_prefix("dash-card:"))
         {
-            if let Some(area) = parse_area(area_slug) {
-                let cmd = self.select_area(area);
-                return vec![cmd, UiCommand::SelectSubView(self.route.subview)];
-            }
+            return self.on_dom_action("data-area", area_slug, false, now_ms);
         }
-        if let Some(sv_slug) = id.strip_prefix("c2-subview-bar:") {
-            if let Some(sv) = parse_subview(self.route.area, sv_slug) {
-                return self.select_subview(sv);
-            }
-        }
-        if let Some(eco) = id
-            .strip_prefix("reg-pkg-filter:")
-            .or_else(|| id.strip_prefix("eco:"))
-        {
-            return self.on_dom_action("data-ecosystem", eco, shift, now_ms);
-        }
-        if let Some(pp) = id
-            .strip_prefix("obs-pp-filter:")
-            .or_else(|| id.strip_prefix("ppfilter:"))
-        {
-            return self.on_dom_action("data-purepath-filter", pp, shift, now_ms);
-        }
-        if let Some(sev) = id
-            .strip_prefix("obs-log-filter:")
-            .or_else(|| id.strip_prefix("logsev:"))
-        {
-            return self.on_dom_action("data-log-severity", sev, shift, now_ms);
-        }
-        if let Some(svc) = id.strip_prefix("obs-service:") {
-            let trimmed = svc.trim();
-            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("ALL") || trimmed == "*" {
-                self.obs_service_filter = None;
-                self.aria_polite = "Selected * All services".to_owned();
-            } else {
-                self.obs_service_filter = Some(trimmed.to_owned());
-                self.aria_polite = format!("Filtered Observe by service {trimmed}");
-            }
-            self.subview_page = 0;
-            self.follow_log = true;
-            return Vec::new();
-        }
-        if id == "obs-service-reset" {
-            self.obs_service_filter = None;
-            self.subview_page = 0;
-            self.follow_log = true;
-            self.aria_polite = "Selected * All services".to_owned();
-            return Vec::new();
-        }
-        if id == "ci-queue-filter" {
-            self.ci_queue_filter = (self.ci_queue_filter + 1) % 4;
-            self.subview_page = 0;
-            self.follow_log = true;
-            self.aria_polite = format!("CI queue filter {}", self.ci_queue_filter);
-            return Vec::new();
-        }
-        if let Some(flt_str) = id.strip_prefix("ci-queue-filter:") {
-            self.ci_queue_filter = match flt_str.trim().to_ascii_lowercase().as_str() {
-                "0" | "all" => 0,
-                "1" | "active" => 1,
-                "2" | "failed" => 2,
-                "3" | "repo" => 3,
-                _ => (self.ci_queue_filter + 1) % 4,
-            };
-            self.subview_page = 0;
-            self.follow_log = true;
-            self.aria_polite = format!("CI queue filter {}", self.ci_queue_filter);
-            return Vec::new();
-        }
-        if let Some(r_id) = id.strip_prefix("ingress-route:") {
-            self.filter_query = r_id.to_string();
-            self.subview_page = 0;
-            self.aria_polite = format!("Selected Ingress route {r_id}");
-            return Vec::new();
-        }
-        if let Some(u_id) = id.strip_prefix("ingress-upstream:") {
-            self.filter_query = u_id.to_string();
-            self.subview_page = 0;
-            self.aria_polite = format!("Selected Ingress upstream {u_id}");
-            return Vec::new();
-        }
-        if let Some(st_str) = id.strip_prefix("ci-stage-select:") {
-            if let Ok(idx) = st_str.parse::<usize>() {
-                if self.selected_stage_idx == Some(idx) {
-                    self.selected_stage_idx = None;
-                } else {
-                    self.selected_stage_idx = Some(idx);
-                }
-                self.log_page = 0;
-                self.follow_log = true;
-                self.aria_polite = format!("Selected CI stage #{}", idx + 1);
-                return Vec::new();
-            }
-        }
-        if id == "obs-smartscape-filter" {
-            self.obs_smartscape_filter = (self.obs_smartscape_filter + 1) % 4;
-            self.subview_page = 0;
-            self.aria_polite = format!("Smartscape layer filter {}", self.obs_smartscape_filter);
-            return Vec::new();
-        }
-        if let Some(flt_str) = id.strip_prefix("obs-smartscape-filter:") {
-            self.obs_smartscape_filter = match flt_str.trim().to_ascii_lowercase().as_str() {
-                "0" | "all" => 0,
-                "1" | "services" | "service" => 1,
-                "2" | "processes" | "process" => 2,
-                "3" | "hosts" | "host" => 3,
-                _ => (self.obs_smartscape_filter + 1) % 4,
-            };
-            self.subview_page = 0;
-            self.aria_polite = format!("Smartscape layer filter {}", self.obs_smartscape_filter);
-            return Vec::new();
-        }
-        if let Some(m_str) = id.strip_prefix("obs-metric:") {
-            if let Ok(idx) = m_str.parse::<usize>() {
-                self.selected_metric_idx = idx;
-                self.aria_polite = format!("Selected metric series #{idx}");
-                return Vec::new();
-            }
-        }
-        if let Some(sb_str) = id.strip_prefix("flt-sandbox:") {
-            if let Ok(idx) = sb_str.parse::<usize>() {
-                self.selected_sandbox_idx = Some(idx);
-                self.aria_polite = format!("Selected sandbox profile #{idx}");
-                return Vec::new();
-            }
-        }
-        if let Some(hist_str) = id.strip_prefix("c6-history:") {
-            if let Ok(idx) = hist_str.parse::<usize>() {
-                self.selected_history_idx = idx + 1;
-                self.aria_polite = format!("Selected deployment history #{}", idx + 1);
-                return Vec::new();
-            }
-        }
-        if let Some(repo_idx_str) = id.strip_prefix("repo-select:") {
-            if let Ok(idx) = repo_idx_str.parse::<usize>() {
-                let repos = self.filtered_repos();
-                if let Some(chosen) = repos.get(idx) {
-                    let rid = chosen.id.clone();
-                    self.outer_index = idx;
-                    self.inner_index = 0;
-                    self.carousel_page = 0;
-                    self.route.repo = Some(rid.clone());
-                    self.route.submodule = None;
-                    self.route.branch = None;
-                    self.route.job = None;
-                    self.aria_polite = format!("Selected repository {}/{}", rid.owner, rid.repo);
-                    return vec![UiCommand::SelectRepo {
-                        repo: rid,
-                        submodule: None,
-                    }];
-                }
-            }
-        }
-        if let Some(repo_str) = id.strip_prefix("c4-card-select:") {
-            if let Some((owner, repo)) = repo_str.split_once('/') {
-                let rid = RepoId::new(owner, repo);
-                self.route.repo = Some(rid.clone());
-                self.route.submodule = None;
-                self.route.branch = None;
-                self.route.job = None;
-                self.carousel_page = 0;
-                self.sync_rotary_from_route();
-                self.aria_polite = format!("Selected repository {owner}/{repo}");
-                return vec![UiCommand::SelectRepo {
-                    repo: rid,
-                    submodule: None,
-                }];
-            }
-        }
-        if let Some(rest) = id.strip_prefix("c4-card-") {
-            let per_page = self.scorecard_cards_per_page();
-            if let Some(idx_str) = rest.strip_suffix("-left") {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    let ordered = self.ordered_carousel_repos();
-                    let slot = (self.carousel_page as usize) * per_page + idx;
-                    if let Some(r) = ordered.get(slot) {
-                        let target = format!("c4-open-trainway:{}/{}", r.id.owner, r.id.repo);
-                        return self.on_control_id(&target, shift, now_ms);
-                    }
-                }
-            } else if let Some(idx_str) = rest.strip_suffix("-right") {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    let ordered = self.ordered_carousel_repos();
-                    let slot = (self.carousel_page as usize) * per_page + idx;
-                    if let Some(r) = ordered.get(slot) {
-                        let target = format!("c4-open-gate:{}/{}", r.id.owner, r.id.repo);
-                        return self.on_control_id(&target, shift, now_ms);
-                    }
-                }
-            }
-        }
-        if let Some(repo_str) = id.strip_prefix("c4-open-trainway:") {
-            if let Some((owner, repo)) = repo_str.split_once('/') {
-                let rid = RepoId::new(owner, repo);
-                self.route.repo = Some(rid.clone());
-                self.route.submodule = None;
-                self.route.branch = None;
-                self.route.job = None;
-                self.sync_rotary_from_route();
-                let mut cmds = vec![UiCommand::SelectRepo {
-                    repo: rid,
-                    submodule: None,
-                }];
-                cmds.extend(self.select_subview(SubView::Ci(CiSubView::Trainway)));
-                return cmds;
-            }
-        }
-        if let Some(repo_str) = id.strip_prefix("c4-open-gate:") {
-            if let Some((owner, repo)) = repo_str.split_once('/') {
-                let rid = RepoId::new(owner, repo);
-                self.route.repo = Some(rid.clone());
-                self.route.submodule = None;
-                self.route.branch = None;
-                self.route.job = None;
-                self.sync_rotary_from_route();
-                let mut cmds = vec![UiCommand::SelectRepo {
-                    repo: rid,
-                    submodule: None,
-                }];
-                cmds.extend(self.open_cd_gate(None));
-                return cmds;
-            }
-        }
-        if let Some(branch_ref) = id
-            .strip_prefix("c5-track-")
-            .or_else(|| id.strip_prefix("ci-train:"))
-        {
-            self.route.branch = Some(branch_ref.to_owned());
-            let matched_job = self.client.view().and_then(|v| {
-                v.topology
-                    .as_ref()
-                    .and_then(|t| {
-                        t.trains
-                            .iter()
-                            .find(|tr| branch_matches_ref(&tr.ref_name, branch_ref))
-                            .map(|tr| tr.job_id)
-                            .filter(|&jid| jid > 0)
-                            .or_else(|| {
-                                t.branches
-                                    .iter()
-                                    .find(|b| branch_matches_ref(&b.ref_name, branch_ref))
-                                    .and_then(|b| b.last_job)
-                                    .filter(|&jid| jid > 0)
-                            })
-                    })
-                    .or_else(|| {
-                        v.ci_jobs
-                            .iter()
-                            .find(|j| branch_matches_ref(&j.ref_name, branch_ref))
-                            .map(|j| j.job_id)
-                            .filter(|&jid| jid > 0)
-                    })
-            });
-            self.aria_polite = format!("Selected branch {branch_ref}");
-            let mut cmds = vec![UiCommand::Subscribe(self.route.clone())];
-            if let Some(job_id) = matched_job {
-                self.route.job = Some(job_id);
-                self.selected_stage_idx = None;
-                self.log_page = 0;
-                cmds.push(UiCommand::SelectJob { job_id });
-            }
-            return cmds;
-        }
-        if let Some(sig_rest) = id.strip_prefix("c5-signal:") {
-            if let Some((branch_ref, _st_idx)) = sig_rest.rsplit_once(':') {
-                self.route.branch = Some(branch_ref.to_owned());
-                let matched_job = self
-                    .client
-                    .view()
-                    .and_then(|v| v.topology.as_ref())
-                    .and_then(|t| {
-                        t.trains
-                            .iter()
-                            .find(|tr| branch_matches_ref(&tr.ref_name, branch_ref))
-                    })
-                    .map(|tr| tr.job_id)
-                    .filter(|&jid| jid > 0)
-                    .or_else(|| self.active_job_id());
-                self.follow_log = true;
-                self.subview_page = 0;
-                self.selected_stage_idx = None;
-                self.log_page = 0;
-                let mut cmds = self.select_subview(SubView::Ci(CiSubView::QueueLogs));
-                if let Some(job_id) = matched_job {
-                    self.route.job = Some(job_id);
-                    cmds.push(UiCommand::SelectJob { job_id });
-                }
-                return cmds;
-            }
-        }
-        if let Some(station) = id.strip_prefix("c5-station:") {
-            let matched_job = self.active_job_id();
-            self.follow_log = true;
-            self.subview_page = 0;
-            self.selected_stage_idx = None;
-            self.log_page = 0;
-            let mut cmds = self.select_subview(SubView::Ci(CiSubView::QueueLogs));
-            if let Some(job_id) = matched_job.filter(|&jid| jid > 0) {
-                self.route.job = Some(job_id);
-                cmds.push(UiCommand::SelectJob { job_id });
-            }
-            self.aria_polite = format!("Opened Queue & Logs for stage {station}");
-            return cmds;
-        }
-        if let Some(job_str) = id
-            .strip_prefix("c5-job-select:")
-            .or_else(|| id.strip_prefix("ci-job-open:"))
-        {
-            if let Ok(job_id) = job_str.parse::<u64>() {
-                self.route.job = Some(job_id);
-                self.selected_stage_idx = None;
-                self.log_page = 0;
-                self.follow_log = true;
-                self.subview_page = 0;
-                let mut cmds = self.select_subview(SubView::Ci(CiSubView::QueueLogs));
-                cmds.push(UiCommand::SelectJob { job_id });
-                return cmds;
-            }
+        if let Some(sv_target) = id.strip_prefix("nav-subview:") {
+            return self.on_dom_action("data-subview", sv_target, false, now_ms);
         }
         if let Some(job_str) = id.strip_prefix("ci-job:") {
             if let Ok(job_id) = job_str.parse::<u64>() {
                 self.route.job = Some(job_id);
                 self.selected_stage_idx = None;
                 self.log_page = 0;
-                self.follow_log = true;
-                self.subview_page = 0;
-                self.aria_polite = format!("Selected CI job #{job_id}");
                 return vec![UiCommand::SelectJob { job_id }];
+            }
+        }
+        if let Some(stage_str) = id.strip_prefix("ci-stage-select:") {
+            if let Ok(idx) = stage_str.parse::<usize>() {
+                self.selected_stage_idx = if self.selected_stage_idx == Some(idx) {
+                    None
+                } else {
+                    Some(idx)
+                };
+                return Vec::new();
             }
         }
         if let Some(job_str) = id.strip_prefix("ci-job-resume:") {
             if let Ok(job_id) = job_str.parse::<u64>() {
-                if self.is_operator() {
-                    self.aria_assertive = format!("Resuming CI job #{job_id}");
-                    return vec![UiCommand::ResumeJob { job_id }];
-                }
-                self.aria_assertive = "Operator session required to resume CI jobs".into();
-                return Vec::new();
+                return self.resume_job(job_id).into_iter().collect();
             }
         }
         if let Some(job_str) = id.strip_prefix("ci-job-restart:") {
             if let Ok(job_id) = job_str.parse::<u64>() {
-                if self.is_operator() {
-                    self.aria_assertive = format!("Restarting CI job #{job_id}");
-                    return vec![UiCommand::RestartJob { job_id }];
-                }
-                self.aria_assertive = "Operator session required to restart CI jobs".into();
-                return Vec::new();
+                return self.restart_job(job_id).into_iter().collect();
             }
         }
-        if let Some(node_id) = id.strip_prefix("flt-node:") {
-            self.selected_node_id = Some(node_id.to_owned());
-            self.aria_polite = format!("Selected worker node {node_id}");
+        if let Some(dep_id) = id.strip_prefix("ab-rollback:") {
+            return self.open_ab_rollback_confirm(dep_id);
+        }
+        if let Some(role_id) = id.strip_prefix("role-enable:") {
+            if self.auth().status != AuthStatus::Active {
+                return Vec::new();
+            }
+            return vec![UiCommand::EnableRole {
+                role_id: role_id.into(),
+            }];
+        }
+        if let Some(role_id) = id.strip_prefix("role-disable:") {
+            if self.auth().status != AuthStatus::Active {
+                return Vec::new();
+            }
+            return vec![UiCommand::DisableRole {
+                role_id: role_id.into(),
+            }];
+        }
+        if let Some(role_id) = id.strip_prefix("role-elevate:") {
+            if self.auth().status != AuthStatus::Active {
+                return Vec::new();
+            }
+            self.pending_webauthn = Some(WebAuthnRequest::ElevateTimedRole {
+                role_id: role_id.into(),
+            });
             return Vec::new();
         }
-        if let Some(sub_path) = id.strip_prefix("c5-sub-select:") {
-            self.route.submodule = Some(SubmoduleId {
-                path: sub_path.to_owned(),
+        if let Some(cred_id) = id.strip_prefix("profile-passkey-remove:") {
+            if self.auth().status != AuthStatus::Active {
+                return Vec::new();
+            }
+            self.pending_webauthn = Some(WebAuthnRequest::RemovePasskey {
+                credential_id: cred_id.into(),
             });
-            self.sync_rotary_from_route();
-            self.aria_polite = format!("Selected submodule {sub_path}");
-            return vec![UiCommand::Subscribe(self.route.clone())];
+            return Vec::new();
         }
-        if let Some(test_idx_str) = id.strip_prefix("c6-test-") {
-            if let Ok(idx) = test_idx_str.parse::<usize>() {
-                self.selected_test_idx = idx;
-                self.log_page = 0;
-                self.aria_polite = format!("Selected gate test #{idx}");
+        if let Some(login) = id.strip_prefix("platform-user-reset-passkeys:") {
+            return self.open_platform_risk_confirm(
+                RiskConfirmAction::ResetUserPasskeys {
+                    github_login: login.into(),
+                },
+                Some(format!("RESET {login}")),
+            );
+        }
+        if let Some(login) = id.strip_prefix("platform-user-revoke:") {
+            let is_last_admin = self.client.view().is_some_and(|v| {
+                let admins: Vec<_> = v
+                    .platform
+                    .users
+                    .iter()
+                    .filter(|u| u.is_platform_admin)
+                    .collect();
+                admins.len() <= 1 && admins.iter().any(|u| u.github_login == login)
+            });
+            if is_last_admin {
+                self.aria_assertive = "Last platform administrator cannot be revoked.".into();
+                return Vec::new();
+            }
+            return self.open_platform_risk_confirm(
+                RiskConfirmAction::RevokeUser {
+                    github_login: login.into(),
+                },
+                Some(format!("REVOKE {login}")),
+            );
+        }
+        if let Some(role_id) = id.strip_prefix("platform-role-delete:") {
+            return self.open_platform_risk_confirm(
+                RiskConfirmAction::DeleteRoleSpec {
+                    role_id: role_id.into(),
+                },
+                Some(format!("DELETE {role_id}")),
+            );
+        }
+        if let Some(folio_id) = id.strip_prefix("platform-folio-delete:") {
+            return self.open_platform_risk_confirm(
+                RiskConfirmAction::DeletePolicyFolio {
+                    folio_id: folio_id.into(),
+                },
+                Some(format!("DELETE {folio_id}")),
+            );
+        }
+        if let Some(inv_id) = id.strip_prefix("platform-invite-revoke:") {
+            if !self.auth().has_policy("platform:invites.write") {
+                return Vec::new();
+            }
+            return vec![UiCommand::RevokeInvite {
+                invite_id: inv_id.into(),
+            }];
+        }
+        if let Some(track_ref) = id.strip_prefix("c5-track-") {
+            self.route.branch = Some(track_ref.into());
+            if let Some(job_id) = self.active_job_id() {
+                self.route.job = Some(job_id);
+                return vec![UiCommand::SelectJob { job_id }];
+            }
+            return Vec::new();
+        }
+        if let Some(hist) = id.strip_prefix("c6-history:") {
+            if let Ok(idx) = hist.parse::<usize>() {
+                self.selected_history_idx = idx + 1;
                 return Vec::new();
             }
         }
-        if let Some(tid) = id.strip_prefix("select-trace:") {
-            return self.on_dom_action("data-select-trace", tid, shift, now_ms);
+        if let Some(m) = id.strip_prefix("obs-metric:") {
+            if let Ok(idx) = m.parse::<usize>() {
+                self.selected_metric_idx = idx;
+                return Vec::new();
+            }
         }
-        if let Some(tid) = id.strip_prefix("trace:") {
-            return self.open_trace(tid);
+        if let Some(sb) = id.strip_prefix("flt-sandbox:") {
+            if let Ok(idx) = sb.parse::<usize>() {
+                self.selected_sandbox_idx = Some(idx);
+                return Vec::new();
+            }
         }
-        if let Some(dep) = id.strip_prefix("gate:") {
-            return self.open_cd_gate(Some(dep));
+        if let Some(sub) = id.strip_prefix("platform-maint-select:") {
+            self.platform_form.selected_subsystem =
+                SubsystemId::from_policy_prefix(sub).unwrap_or(SubsystemId::Ci);
+            return Vec::new();
         }
-        if let Some(pkg) = id.strip_prefix("pkg:") {
-            return self.on_dom_action("data-package", pkg, shift, now_ms);
+        if let Some(repo_idx_str) = id.strip_prefix("repo-select:") {
+            if let Ok(idx) = repo_idx_str.parse::<usize>() {
+                if let Some(r) = self.filtered_repos().get(idx).cloned() {
+                    self.outer_index = idx;
+                    self.inner_index = 0;
+                    self.route.repo = Some(r.id.clone());
+                    self.route.submodule = None;
+                    return vec![UiCommand::SelectRepo {
+                        repo: r.id,
+                        submodule: None,
+                    }];
+                }
+            }
         }
-        if let Some(ent) = id.strip_prefix("entity:") {
-            return self.on_dom_action("data-entity-id", ent, shift, now_ms);
-        }
-        if let Some(sp) = id.strip_prefix("span:") {
-            return self.on_dom_action("data-span-id", sp, shift, now_ms);
-        }
+
         match id {
-            "c2-area" => self.select_subview(SubView::default_for(self.route.area)),
-            "c2-subview" => {
-                let next = self.route.subview.step(1);
-                self.select_subview(next)
-            }
-            "c2-repo" => {
-                self.route.submodule = None;
-                self.route.branch = None;
-                self.route.job = None;
-                self.sync_rotary_from_route();
-                self.select_subview(SubView::Ci(CiSubView::Scorecards))
-            }
-            "c2-submodule" => {
-                self.route.submodule = None;
-                self.sync_rotary_from_route();
-                self.aria_polite = "Returned to parent repository".into();
-                vec![UiCommand::Subscribe(self.route.clone())]
-            }
-            "c2-branch" => {
-                self.route.branch = None;
-                self.select_subview(SubView::Ci(CiSubView::Trainway))
-            }
-            "c2-job" => {
-                self.route.job = None;
-                self.select_subview(SubView::Ci(CiSubView::QueueLogs))
-            }
-            "c2-trace" => {
-                self.route.trace_id = None;
-                self.select_subview(SubView::Observe(ObserveSubView::PurePath))
-            }
-            "c2-font-switch" | "c2-font-switch:hurmit" | "c2-font-switch:dyslexic" => {
-                vec![self.toggle_font()]
-            }
-            "c2-skin-switch" | "muconsole-skin-toggle" => {
-                vec![self.toggle_skin()]
-            }
-            "c2-repo-prev" | "c3-rotary:outer-prev" => {
-                self.rotate_outer(-1, now_ms);
-                Vec::new()
-            }
-            "c2-repo-next" | "c3-rotary:outer-next" | "c2-repo-select" => {
-                self.rotate_outer(1, now_ms);
-                Vec::new()
-            }
-            "c2-obs-service-prev" => {
-                self.rotate_obs_service(-1);
-                Vec::new()
-            }
-            "c2-obs-service-next" | "c2-obs-service-select" => {
-                self.rotate_obs_service(1);
-                Vec::new()
-            }
-            "c2-sub-prev" | "c3-rotary:inner-prev" => {
-                self.rotate_inner(-1, now_ms);
-                Vec::new()
-            }
-            "c2-sub-next" | "c3-rotary:inner-next" | "c5-submodule-interchange" => {
-                self.rotate_inner(1, now_ms);
-                Vec::new()
-            }
-            "c2-phone-rotary-trigger" => {
-                self.phone_rotary_open = !self.phone_rotary_open;
-                Vec::new()
-            }
-            "c4-carousel-switch:prev" => {
-                let per_page = self.scorecard_cards_per_page();
-                vec![self.step_carousel(-1, per_page)]
-            }
-            "c4-carousel-switch:next" => {
-                let per_page = self.scorecard_cards_per_page();
-                vec![self.step_carousel(1, per_page)]
-            }
-            "c5-live-toggle" => {
-                self.trainway_live = !self.trainway_live;
-                Vec::new()
-            }
-            "ci-log-follow-toggle" => {
-                self.follow_log = !self.follow_log;
-                if self.follow_log {
-                    self.log_page = u32::MAX;
-                    self.subview_page = u32::MAX;
-                } else if self.log_page == 0 || self.log_page == u32::MAX {
-                    self.log_page = self.rendered_ci_log_page.get();
+            "c2-auth-status" | "hdr-auth-action" | "login-gate-signin" | "auth-gate-signin" => {
+                let auth = self.auth();
+                if !auth.is_resolved() {
+                    return Vec::new();
                 }
-                Vec::new()
-            }
-            "obs-log-follow-toggle" => {
-                self.follow_log = !self.follow_log;
-                if self.follow_log {
-                    self.subview_page = u32::MAX;
-                    self.log_page = u32::MAX;
-                } else if self.subview_page == 0 || self.subview_page == u32::MAX {
-                    self.subview_page = self.rendered_obs_log_page.get();
-                }
-                Vec::new()
-            }
-            "ci-log-page-prev" | "ci-job-detail-screen:prev" => {
-                self.step_ci_log_page(-1);
-                Vec::new()
-            }
-            "ci-log-page-next" | "ci-job-detail-screen:next" => {
-                self.step_ci_log_page(1);
-                Vec::new()
-            }
-            "obs-logs-screen:prev" => {
-                self.step_obs_log_page(-1);
-                Vec::new()
-            }
-            "obs-logs-screen:next" => {
-                self.step_obs_log_page(1);
-                Vec::new()
-            }
-            "screen-page-prev" | "ci-queue-logs-screen:prev" => {
-                if self.route.subview == SubView::Observe(ObserveSubView::Logs) {
-                    self.step_obs_log_page(-1);
-                } else {
-                    if self.route.subview == SubView::Ci(CiSubView::QueueLogs) {
-                        self.follow_log = false;
-                    }
-                    self.subview_page = self.subview_page.saturating_sub(1);
-                }
-                Vec::new()
-            }
-            "screen-page-next" | "ci-queue-logs-screen:next" => {
-                if self.route.subview == SubView::Observe(ObserveSubView::Logs) {
-                    self.step_obs_log_page(1);
-                } else {
-                    self.subview_page = self.subview_page.saturating_add(1);
-                }
-                Vec::new()
-            }
-            "c5-open-logs" => self.select_subview(SubView::Ci(CiSubView::QueueLogs)),
-            "c5-yard-pager" => {
-                self.yard_page = self.yard_page.wrapping_add(1);
-                Vec::new()
-            }
-            "c5-restart-switch" | "c5-restart-switch:rst" => {
-                let res = self.on_restart_switch(
-                    SwitchEvent::Rotate {
-                        to: 1,
-                        at_ms: now_ms,
-                        shift,
-                    },
-                    now_ms,
-                );
-                let _ = self.on_restart_switch(SwitchEvent::Release { at_ms: now_ms }, now_ms);
-                if let Some(cmd) = res {
-                    let mut cmds = Vec::new();
-                    if let Some(job_id) = self.active_job_id() {
-                        cmds.push(UiCommand::RestartJob { job_id });
-                    }
-                    cmds.push(cmd);
-                    cmds
-                } else {
-                    Vec::new()
-                }
-            }
-            "c6-log-pager" => {
-                self.log_page = self.log_page.wrapping_add(1);
-                Vec::new()
-            }
-            "c6-history-strip" => {
-                let total = self.client.view().map_or(1, |v| v.history.len() + 1).max(1);
-                self.selected_history_idx = (self.selected_history_idx + 1) % total;
-                Vec::new()
-            }
-            "c2-auth-status" | "c6-log-auth-gate" => {
-                let href = match self.auth() {
-                    AuthState::Anonymous => self.sign_in_href(),
-                    _ => self.sign_out_href(),
+                let href = match auth.status {
+                    AuthStatus::Anonymous => self.sign_in_href(),
+                    AuthStatus::AuthorizationDenied
+                    | AuthStatus::PasskeyEnrollmentRequired
+                    | AuthStatus::Active => self.sign_out_href(),
+                    AuthStatus::Unresolved => return Vec::new(),
                 };
                 self.pending_navigation = Some(href.clone());
                 self.aria_polite = format!("Navigating to {href}");
                 vec![UiCommand::Navigate { href }]
             }
-            other if other.ends_with(":prev") => {
-                self.step_active_page(-1);
+            "dlg-passkey-signout" | "profile-signout" => {
+                let href = self.sign_out_href();
+                self.pending_navigation = Some(href.clone());
+                vec![UiCommand::Navigate { href }]
+            }
+            "dlg-passkey-register" | "register-passkey" | "profile-passkey-add" => {
+                if !matches!(
+                    self.auth().status,
+                    AuthStatus::PasskeyEnrollmentRequired | AuthStatus::Active
+                ) {
+                    return Vec::new();
+                }
+                let label = if self.profile_passkey_label_draft.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.profile_passkey_label_draft.trim().to_owned())
+                };
+                self.pending_webauthn = Some(WebAuthnRequest::RegisterPasskey { label });
                 Vec::new()
             }
-            other if other.ends_with(":next") => {
-                self.step_active_page(1);
+            "hdr-user" | "open-profile" => self.open_user_profile(UserProfileTab::UserDetails),
+            "profile-tab:details" => self.open_user_profile(UserProfileTab::UserDetails),
+            "profile-tab:preferences" => self.open_user_profile(UserProfileTab::Preferences),
+            "profile-tab:passkeys" => self.open_user_profile(UserProfileTab::Passkeys),
+            "profile-save-details" => self.save_user_profile_details(),
+            "profile-skin:html" => {
+                if self.auth().status != AuthStatus::Active {
+                    return Vec::new();
+                }
+                let cmd = self.set_skin(ConsoleSkin::Html);
+                vec![
+                    cmd,
+                    UiCommand::UpdateUserProfile {
+                        display_name: None,
+                        preferred_skin: Some(ConsoleSkin::Html),
+                        preferred_font: None,
+                    },
+                ]
+            }
+            "profile-skin:wireframe" => {
+                if self.auth().status != AuthStatus::Active {
+                    return Vec::new();
+                }
+                let cmd = self.set_skin(ConsoleSkin::Wireframe);
+                vec![
+                    cmd,
+                    UiCommand::UpdateUserProfile {
+                        display_name: None,
+                        preferred_skin: Some(ConsoleSkin::Wireframe),
+                        preferred_font: None,
+                    },
+                ]
+            }
+            "profile-font:hurmit" => {
+                if self.auth().status != AuthStatus::Active {
+                    return Vec::new();
+                }
+                let cmd = self.set_font(CrtFont::Hurmit);
+                vec![
+                    cmd,
+                    UiCommand::UpdateUserProfile {
+                        display_name: None,
+                        preferred_skin: None,
+                        preferred_font: Some(CrtFont::Hurmit),
+                    },
+                ]
+            }
+            "profile-font:dyslexic" => {
+                if self.auth().status != AuthStatus::Active {
+                    return Vec::new();
+                }
+                let cmd = self.set_font(CrtFont::OpenDyslexic);
+                vec![
+                    cmd,
+                    UiCommand::UpdateUserProfile {
+                        display_name: None,
+                        preferred_skin: None,
+                        preferred_font: Some(CrtFont::OpenDyslexic),
+                    },
+                ]
+            }
+            "hdr-role" | "open-session-roles" => self.open_session_roles(),
+            "roles-lock-all" | "profile-lock-timed" => {
+                if self.auth().status != AuthStatus::Active {
+                    return Vec::new();
+                }
+                vec![UiCommand::LockTimedRoles]
+            }
+            "btn-cancel" | "btn-close" | "roles-close" | "btn-close-inv" | "dismiss-dialog" => {
+                self.dismiss_dialog()
+            }
+            "btn-confirm" | "confirm-risk" => self.confirm_risk_dialog(),
+            "font-toggle" | "c2-font-switch" => vec![self.toggle_font()],
+            "repo-prev" => {
+                self.rotate_outer(-1, now_ms);
                 Vec::new()
+            }
+            "repo-next" => {
+                self.rotate_outer(1, now_ms);
+                Vec::new()
+            }
+            "sub-prev" => {
+                self.rotate_inner(-1, now_ms);
+                Vec::new()
+            }
+            "sub-next" => {
+                self.rotate_inner(1, now_ms);
+                Vec::new()
+            }
+            "ci-queue-filter" => {
+                self.ci_queue_filter = (self.ci_queue_filter + 1) % 3;
+                self.subview_page = 0;
+                Vec::new()
+            }
+            "ci-queue-filter:failed" => {
+                self.ci_queue_filter = 2;
+                self.subview_page = 0;
+                Vec::new()
+            }
+            "ci-log-follow-toggle" | "obs-log-follow-toggle" => {
+                self.follow_log = !self.follow_log;
+                if self.follow_log {
+                    self.log_page = u32::MAX;
+                    self.subview_page = u32::MAX;
+                }
+                Vec::new()
+            }
+            "ci-log-page-prev" => {
+                self.follow_log = false;
+                self.log_page = self.log_page.saturating_sub(1);
+                Vec::new()
+            }
+            "ci-log-page-next" => {
+                self.follow_log = false;
+                self.log_page = self.log_page.saturating_add(1);
+                Vec::new()
+            }
+            "ci-job-detail-screen:prev" => {
+                self.follow_log = false;
+                self.log_page = self.rendered_ci_log_page.get().saturating_sub(1);
+                Vec::new()
+            }
+            "obs-logs-screen:prev" => {
+                self.follow_log = false;
+                self.subview_page = self.rendered_obs_log_page.get().saturating_sub(1);
+                Vec::new()
+            }
+            "c6-history-strip" => {
+                self.selected_history_idx = 0;
+                Vec::new()
+            }
+            "obs-smartscape-filter:hosts" => {
+                self.obs_smartscape_filter = 3;
+                Vec::new()
+            }
+            "obs-smartscape-filter" => {
+                self.obs_smartscape_filter = 0;
+                Vec::new()
+            }
+            "platform-maint-apply" => self.open_platform_risk_confirm(
+                RiskConfirmAction::SetSubsystemMaintenance {
+                    subsystem: self.platform_form.selected_subsystem,
+                    mode: self.platform_form.maintenance_mode,
+                    reason: (!self.platform_form.maintenance_reason.trim().is_empty())
+                        .then(|| self.platform_form.maintenance_reason.trim().to_owned()),
+                    auto_clear_secs: self.platform_form.maintenance_auto_clear_secs,
+                },
+                None,
+            ),
+            "platform-invite-create" => {
+                if !self.auth().has_policy("platform:invites.write") {
+                    return Vec::new();
+                }
+                vec![UiCommand::CreateInvite {
+                    note: (!self.platform_form.invite_note.trim().is_empty())
+                        .then(|| self.platform_form.invite_note.trim().to_owned()),
+                    ttl_secs: Some(self.platform_form.invite_ttl_secs),
+                }]
+            }
+            "platform-rfi-toggle-anon" => {
+                self.platform_form.anonymous_lockdown_draft =
+                    !self.platform_form.anonymous_lockdown_draft;
+                self.open_platform_risk_confirm(RiskConfirmAction::UpdateRoleFolioIndex, None)
             }
             _ => Vec::new(),
         }
     }
 
-    /// Handle a keyboard shortcut and return any resulting [`UiCommand`].
+    fn save_user_profile_details(&self) -> Vec<UiCommand> {
+        if self.auth().status != AuthStatus::Active {
+            return Vec::new();
+        }
+        let name = self.profile_display_name_draft.trim();
+        vec![UiCommand::UpdateUserProfile {
+            display_name: (!name.is_empty()).then(|| name.to_owned()),
+            preferred_skin: None,
+            preferred_font: None,
+        }]
+    }
+
+    fn open_ab_rollback_confirm(&mut self, deployment_id: &str) -> Vec<UiCommand> {
+        if !self.auth().has_policy("ab:rollback") {
+            self.aria_polite = copy::AUTH_DENIED_STATUS.into();
+            return Vec::new();
+        }
+        let gate = self.client.view().and_then(|v| {
+            v.gate
+                .as_ref()
+                .filter(|g| deployment_id.is_empty() || g.deployment_id == deployment_id)
+        });
+        let (dep_id, repo, target_node, current_slot, restore_slot) = match gate {
+            Some(g) => (
+                g.deployment_id.clone(),
+                g.repo.clone(),
+                g.target_node.clone(),
+                g.staged_slot,
+                g.restore_slot,
+            ),
+            None => (
+                deployment_id.to_owned(),
+                self.route
+                    .repo
+                    .clone()
+                    .unwrap_or_else(|| RepoId::new("LMA1980", "mu-console")),
+                "node-a".to_owned(),
+                mu_console_protocol::Slot::B,
+                mu_console_protocol::Slot::A,
+            ),
+        };
+        let note = (!self.platform_form.ab_rollback_note.trim().is_empty())
+            .then(|| self.platform_form.ab_rollback_note.trim().to_owned());
+        // A|B emergency rollback uses fast RiskConfirm (no heavy confirmation phrase, optional note #56).
+        let dlg = DialogModel::RiskConfirm(RiskConfirmDialogModel {
+            action: RiskConfirmAction::TriggerAbRollback {
+                deployment_id: dep_id,
+                repo,
+                target_node,
+                current_slot,
+                restore_slot,
+                note,
+            },
+            confirmation_phrase: None,
+            typed_confirmation: String::new(),
+        });
+        self.local_dialog = Some(dlg.clone());
+        vec![UiCommand::OpenDialog(dlg)]
+    }
+
+    fn open_platform_risk_confirm(
+        &mut self,
+        action: RiskConfirmAction,
+        confirmation_phrase: Option<String>,
+    ) -> Vec<UiCommand> {
+        let required = match &action {
+            RiskConfirmAction::SetSubsystemMaintenance { .. } => "platform:maintenance.write",
+            RiskConfirmAction::UpdateUserRoles { .. }
+            | RiskConfirmAction::ResetUserPasskeys { .. }
+            | RiskConfirmAction::RevokeUser { .. } => "platform:users.write",
+            RiskConfirmAction::UpsertRoleSpec { .. } | RiskConfirmAction::DeleteRoleSpec { .. } => {
+                "platform:roles.write"
+            }
+            RiskConfirmAction::UpsertPolicyFolio { .. }
+            | RiskConfirmAction::DeletePolicyFolio { .. }
+            | RiskConfirmAction::UpdateRoleFolioIndex => "platform:folios.write",
+            RiskConfirmAction::RestartCiJob { .. } => "ci:jobs.restart",
+            RiskConfirmAction::TriggerAbRollback { .. } => "ab:rollback",
+        };
+        if !self.auth().has_policy(required) {
+            self.aria_polite = copy::AUTH_DENIED_STATUS.into();
+            return Vec::new();
+        }
+        let dlg = DialogModel::RiskConfirm(RiskConfirmDialogModel {
+            action,
+            confirmation_phrase,
+            typed_confirmation: String::new(),
+        });
+        self.local_dialog = Some(dlg.clone());
+        vec![UiCommand::OpenDialog(dlg)]
+    }
+
+    /// Update the typed phrase inside an open `DialogModel::RiskConfirm`.
+    pub fn set_risk_confirm_input(&mut self, typed: &str) {
+        if let Some(DialogModel::RiskConfirm(rc)) = &mut self.local_dialog {
+            rc.typed_confirmation = typed.to_owned();
+        }
+    }
+
+    /// Confirm active `RiskConfirm` dialog if phrase guard (when present) matches.
+    pub fn confirm_risk_dialog(&mut self) -> Vec<UiCommand> {
+        let Some(DialogModel::RiskConfirm(rc)) = self.active_dialog() else {
+            return Vec::new();
+        };
+        if let Some(expected) = &rc.confirmation_phrase {
+            if rc.typed_confirmation.trim() != expected {
+                self.aria_assertive = "Confirmation phrase does not match.".into();
+                return Vec::new();
+            }
+        }
+        let cmd = match rc.action {
+            RiskConfirmAction::RestartCiJob { job_id, .. } => UiCommand::RestartJob { job_id },
+            RiskConfirmAction::TriggerAbRollback {
+                deployment_id,
+                note,
+                ..
+            } => UiCommand::TriggerAbRollback {
+                deployment_id,
+                note: note.or_else(|| {
+                    (!self.platform_form.ab_rollback_note.trim().is_empty())
+                        .then(|| self.platform_form.ab_rollback_note.trim().to_owned())
+                }),
+            },
+            RiskConfirmAction::SetSubsystemMaintenance {
+                subsystem,
+                mode,
+                reason,
+                auto_clear_secs,
+            } => UiCommand::SetSubsystemMaintenance {
+                subsystem,
+                mode,
+                reason,
+                auto_clear_secs,
+            },
+            RiskConfirmAction::UpdateUserRoles {
+                github_login,
+                bound_roles,
+            } => UiCommand::UpdateUserRoles {
+                github_login,
+                bound_roles,
+            },
+            RiskConfirmAction::ResetUserPasskeys { github_login } => {
+                UiCommand::ResetUserPasskeys { github_login }
+            }
+            RiskConfirmAction::RevokeUser { github_login } => {
+                UiCommand::RevokeUser { github_login }
+            }
+            RiskConfirmAction::DeleteRoleSpec { role_id } => UiCommand::DeleteRoleSpec { role_id },
+            RiskConfirmAction::DeletePolicyFolio { folio_id } => {
+                UiCommand::DeletePolicyFolio { folio_id }
+            }
+            RiskConfirmAction::UpsertRoleSpec { .. }
+            | RiskConfirmAction::UpsertPolicyFolio { .. }
+            | RiskConfirmAction::UpdateRoleFolioIndex => {
+                let mut idx = self
+                    .client
+                    .view()
+                    .map(|v| v.platform.role_folio_index.clone())
+                    .unwrap_or_default();
+                if self.platform_form.anonymous_lockdown_draft {
+                    idx.anonymous.clear();
+                } else if idx.anonymous.is_empty() {
+                    idx.anonymous = vec![
+                        "folio:system:dashboard".into(),
+                        "folio:ci:anon-queue".into(),
+                    ];
+                }
+                UiCommand::UpdateRoleFolioIndex(idx)
+            }
+        };
+        self.local_dialog = None;
+        vec![cmd, UiCommand::CloseDialog]
+    }
+
+    /// Dismiss active dialog when permitted (never bypasses mandatory `PasskeyEnrollmentGate`).
+    pub fn dismiss_dialog(&mut self) -> Vec<UiCommand> {
+        let Some(dlg) = self.active_dialog() else {
+            return Vec::new();
+        };
+        if !dlg.is_dismissible() {
+            return Vec::new();
+        }
+        self.local_dialog = None;
+        vec![UiCommand::CloseDialog]
+    }
+
+    /// Handle keyboard navigation and shortcuts.
     pub fn on_key(&mut self, key: &str, shift: bool, now_ms: u64) -> Option<UiCommand> {
         if key == "Escape" {
-            if self.phone_rotary_open {
-                self.phone_rotary_open = false;
-                self.aria_polite = "Closed repository selector sheet".into();
+            if let Some(dlg) = self.active_dialog() {
+                if dlg.is_dismissible() {
+                    self.local_dialog = None;
+                    return Some(UiCommand::CloseDialog);
+                }
                 return None;
             }
-            if self.selected_package.is_some() {
-                self.selected_package = None;
-                self.aria_polite = "Closed package detail drawer".into();
-                return None;
-            }
-            if self.selected_entity_id.is_some() {
-                self.selected_entity_id = None;
-                self.aria_polite = "Closed Smartscape entity drawer".into();
-                return None;
-            }
-            if !self.filter_query.is_empty() || self.filter_focused {
-                self.filter_query.clear();
+            if self.filter_focused || !self.filter_query.is_empty() {
                 self.filter_focused = false;
-                self.aria_polite = "Cleared repository filter".into();
+                self.filter_query.clear();
+                self.route.filter = None;
                 return None;
             }
-            self.route = escape_up(&self.route);
-            self.aria_polite = "Navigated up one level".into();
-            return Some(UiCommand::Subscribe(self.route.clone()));
-        }
-
-        if self.filter_focused {
+            let next = escape_up(&self.route);
+            if self.can_access_subview(next.subview) {
+                self.route = next;
+                self.route_sync_dirty = true;
+            }
             return None;
         }
-
+        if self.filter_focused || self.active_dialog().is_some() {
+            return None;
+        }
         match key {
-            "1" => Some(self.select_area(Area::Ci)),
-            "2" => Some(self.select_area(Area::Cd)),
-            "3" => Some(self.select_area(Area::Registry)),
-            "4" => Some(self.select_area(Area::Observe)),
-            "5" => Some(self.select_area(Area::Fleet)),
-            "[" => {
-                let prev = self.route.subview.step(-1);
-                self.select_subview(prev).into_iter().next()
-            }
-            "]" => {
-                let next = self.route.subview.step(1);
-                self.select_subview(next).into_iter().next()
-            }
-            "/" => {
+            "/" if !shift => {
                 self.filter_focused = true;
-                self.aria_polite = "Type-ahead repository filter focused".into();
                 None
             }
-            "ArrowUp" | "<" | "," => {
-                if self.route.area == Area::Observe {
-                    self.rotate_obs_service(-1);
-                } else if shift {
-                    self.rotate_inner(-1, now_ms);
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" => {
+                let idx = (key.as_bytes()[0] - b'1') as usize;
+                let area = AREAS[idx];
+                self.can_access_area(area).then(|| self.select_area(area))
+            }
+            "s" | "S" => {
+                if self.auth().status == AuthStatus::Active {
+                    Some(self.toggle_skin())
                 } else {
-                    self.rotate_outer(-1, now_ms);
+                    None
                 }
-                None
-            }
-            "ArrowDown" | ">" | "." => {
-                if self.route.area == Area::Observe {
-                    self.rotate_obs_service(1);
-                } else if shift {
-                    self.rotate_inner(1, now_ms);
-                } else {
-                    self.rotate_outer(1, now_ms);
-                }
-                None
-            }
-            "ArrowLeft" => {
-                let per_page = self.scorecard_cards_per_page();
-                Some(self.step_carousel(-1, per_page))
-            }
-            "ArrowRight" => {
-                let per_page = self.scorecard_cards_per_page();
-                Some(self.step_carousel(1, per_page))
             }
             "d" | "D" | "f" | "F" => Some(self.toggle_font()),
-            // "s" | "S" hotkey disabled to strictly enforce WireframeSkin invariant
-            "r" | "R" => {
-                self.aria_polite = "Stream reset and resynchronized".into();
-                Some(UiCommand::ResetStream)
+            "[" if !shift => {
+                self.rotate_outer(-1, now_ms);
+                None
+            }
+            "]" if !shift => {
+                self.rotate_outer(1, now_ms);
+                None
             }
             _ => None,
         }
     }
 
-    /// Advance timers: emit [`UiCommand::SelectRepo`] once the 350 ms rotary
-    /// settle window elapses, and expire the 3 s restart arm window.
+    /// Periodic client tick handling rotary debounce settle and `Timed` lease expiry (`00:00`).
     pub fn tick(&mut self, now_ms: u64) -> Vec<UiCommand> {
+        self.last_lease_tick_ms = now_ms;
         let mut cmds = Vec::new();
-        if let Some(until) = self.restart_armed_until_ms {
-            if now_ms > until {
-                self.restart_armed_until_ms = None;
-            }
-        }
-        if let Some(due) = self.pending_filter_at_ms {
-            if now_ms >= due {
-                self.pending_filter_at_ms = None;
-                cmds.push(UiCommand::Subscribe(self.route.clone()));
-            }
-        }
+
         if let Some(due) = self.pending_select_at_ms {
             if now_ms >= due {
                 self.pending_select_at_ms = None;
-                let repo = self
-                    .route
-                    .repo
-                    .clone()
-                    .unwrap_or_else(|| RepoId::new("fixture", "superproject"));
-                cmds.push(UiCommand::SelectRepo {
-                    repo,
-                    submodule: self.route.submodule.clone(),
-                });
+                if let Some(repo) = self.route.repo.clone() {
+                    cmds.push(UiCommand::SelectRepo {
+                        repo,
+                        submodule: self.route.submodule.clone(),
+                    });
+                }
+            }
+        }
+
+        if let Some(view) = self.client.view_mut() {
+            let expired = expire_timed_leases(&mut view.auth, now_ms);
+            if !expired.is_empty() {
+                if redirect_if_lacking_access(&view.auth, &mut self.route) {
+                    self.route_sync_dirty = true;
+                }
+                cmds.push(UiCommand::RefreshSession);
             }
         }
         cmds
@@ -2086,174 +1997,123 @@ impl ConsoleState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mu_console_protocol::{
-        encode, CiJobStage, CiJobSummary, DataEvent, DeploymentSummary, GateOutcome, RepoTopology,
-        StageState, Station, Train, ViewModel,
-    };
+    use mu_console_protocol::{encode, DataEvent, ViewModel};
 
     #[test]
-    fn activate_target_handles_queue_filter_stage_selector_and_log_pager() {
+    fn fail_closed_boot_and_anonymous_default_to_public_ci_steps() {
         let mut st = ConsoleState::new();
-        assert_eq!(st.ci_queue_filter, 0);
-        assert_eq!(st.selected_stage_idx, None);
+        assert!(!st.auth().is_resolved());
+        for area in Area::ALL {
+            assert!(!st.can_access_area(area));
+        }
 
-        st.subview_page = 3;
-        st.activate_target("ci-queue-filter");
-        assert_eq!(st.ci_queue_filter, 1);
-        assert_eq!(st.subview_page, 0);
+        // Anonymous without explicit hash -> defaults cleanly to CI > QueueLogs (#50).
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Anonymous,
+                active_policies: vec![
+                    "system:dashboard.read".into(),
+                    "ci:queue.read".into(),
+                    "ci:repos.public.read".into(),
+                ],
+                anonymous_lockdown: false,
+                ..AuthState::default()
+            },
+            ..ViewModel::default()
+        };
+        let frame = encode(&DataEvent::Snapshot(vm)).expect("encode");
+        st.on_worker_frame(&frame);
 
-        st.activate_target("ci-queue-filter:failed");
-        assert_eq!(st.ci_queue_filter, 2);
+        assert_eq!(st.route.subview, SubView::Ci(CiSubView::QueueLogs));
+        assert_eq!(st.effective_skin(), ConsoleSkin::Html);
 
-        st.activate_target("ci-stage-select:0");
-        assert_eq!(st.selected_stage_idx, Some(0));
-        st.activate_target("ci-stage-select:0");
-        assert_eq!(st.selected_stage_idx, None);
-        st.activate_target("ci-stage-select:1");
-        assert_eq!(st.selected_stage_idx, Some(1));
-
-        st.follow_log = false;
-        st.log_page = 0;
-        st.activate_target("ci-log-follow-toggle");
-        assert!(st.follow_log);
-        assert_eq!(st.log_page, u32::MAX);
-
-        st.log_page = 4;
-        st.activate_target("ci-log-page-prev");
-        assert!(!st.follow_log);
-        assert_eq!(st.log_page, 3);
-
-        st.activate_target("ci-log-page-next");
-        assert_eq!(st.log_page, 4);
-
-        let cmds = st.activate_target("ci-job:777");
-        assert_eq!(st.route.job, Some(777));
-        assert_eq!(st.selected_stage_idx, None);
-        assert_eq!(st.log_page, 0);
-        assert_eq!(cmds, vec![UiCommand::SelectJob { job_id: 777 }]);
+        // Signed-out user attempting to switch to Wireframe stays locked to Html (#49).
+        st.set_skin(ConsoleSkin::Wireframe);
+        assert_eq!(st.effective_skin(), ConsoleSkin::Html);
+        assert_eq!(st.on_key("s", false, 100), None);
     }
 
     #[test]
-    fn track_selection_hydrates_matching_job_and_interactive_cd_obs_flt_targets() {
-        let mut vm = ViewModel::default();
-        let repo_id = RepoId::new("LMA1980", "mu-console");
-        vm.repos.push(RepoScore::new(repo_id.clone()));
-        vm.ci_jobs.push(CiJobSummary {
-            job_id: 4242,
-            job_id_str: "004242".into(),
-            repo: repo_id.clone(),
-            ref_name: "feat/inspector".into(),
-            commit_sha: "a1b2c3d".into(),
-            queue_state: "Failed".into(),
-            quality_score: 88,
-            coverage_bp: 9250,
-            tests_passed: 41,
-            tests_total: 42,
-            elapsed_secs: 19,
-            wait_secs: 1,
-            benchmark_summary: "ok".into(),
-            stages: vec![CiJobStage {
-                id: "clippy".into(),
-                name: "clippy".into(),
-                state: StageState::Failed,
-                assigned_node: Some("node-a".into()),
-                threads: 4,
-                duration_secs: 5,
-                exit_code: 101,
-            }],
-            raw_log_lines: vec!["error: clippy warning".into()],
-        });
-        vm.topology = Some(RepoTopology {
-            repo: repo_id,
-            submodule: None,
-            default_branch: "main".into(),
-            stations: vec![
-                Station {
-                    id: "fmt".into(),
-                    label: "FMT".into(),
-                },
-                Station {
-                    id: "clippy".into(),
-                    label: "CLIPPY".into(),
-                },
-            ],
-            branches: Vec::new(),
-            trains: vec![Train {
-                job_id: 4242,
-                ref_name: "refs/heads/feat/inspector".into(),
-                stage: 1,
-                stage_states: vec![StageState::Passed, StageState::Failed],
-                node_id: Some("node-a".into()),
-                node_lost: false,
-            }],
-            submodules: Vec::new(),
-            fabric_rev: 1,
-            submodule_bump_pending: false,
-        });
-        vm.history.push(DeploymentSummary {
-            deployment_id: "dep-0099".into(),
-            artifact_digest: "sha256:abcd".into(),
-            outcome: GateOutcome::Promoted,
-            it_passed: 8,
-            it_total: 8,
-        });
-
+    fn passkey_gate_cannot_be_dismissed_and_disabled_nav_is_inert() {
         let mut st = ConsoleState::new();
-        let snap = encode(&DataEvent::Snapshot(vm)).expect("encode");
-        st.on_worker_frame(&snap);
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::PasskeyEnrollmentRequired,
+                github_login: Some("alice".into()),
+                passkey_count: 0,
+                passkey_enrollment_required: true,
+                ..AuthState::default()
+            },
+            ..ViewModel::default()
+        };
+        let frame = encode(&DataEvent::Snapshot(vm)).expect("encode");
+        st.on_worker_frame(&frame);
 
-        let cmds = st.activate_target("c5-track-refs/heads/feat/inspector");
+        assert!(matches!(
+            st.active_dialog(),
+            Some(DialogModel::PasskeyEnrollmentGate(_))
+        ));
+        assert!(st.dismiss_dialog().is_empty());
+        assert_eq!(st.on_key("Escape", false, 100), None);
+
+        // Disabled Platform click produces zero navigation/commands (#50).
+        assert!(st
+            .on_dom_action("data-area", "platform", false, 200)
+            .is_empty());
+        assert_eq!(st.pending_navigation, None);
+    }
+
+    #[test]
+    fn no_risk_resume_executes_once_while_restart_and_rollback_open_risk_confirm() {
+        let mut st = ConsoleState::new();
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                passkey_count: 1,
+                active_policies: vec![
+                    "ci:jobs.read".into(),
+                    "ci:jobs.resume".into(),
+                    "ci:jobs.restart".into(),
+                    "ab:slots.read".into(),
+                    "ab:rollback".into(),
+                ],
+                ..AuthState::default()
+            },
+            ..ViewModel::default()
+        };
+        let frame = encode(&DataEvent::Snapshot(vm)).expect("encode");
+        st.on_worker_frame(&frame);
+
+        // Resume executes in 1 click without dialog.
         assert_eq!(
-            st.route.branch.as_deref(),
-            Some("refs/heads/feat/inspector")
+            st.activate_target("ci-job-resume:42"),
+            vec![UiCommand::ResumeJob { job_id: 42 }]
         );
-        assert_eq!(st.route.job, Some(4242));
-        assert!(cmds.contains(&UiCommand::SelectJob { job_id: 4242 }));
+        assert!(st.active_dialog().is_none());
 
-        st.activate_target("c6-history:0");
-        assert_eq!(st.selected_history_idx, 1);
-        st.activate_target("c6-history-strip");
-        assert_eq!(st.selected_history_idx, 0);
-
-        st.activate_target("obs-metric:1");
-        assert_eq!(st.selected_metric_idx, 1);
-
-        st.activate_target("obs-smartscape-filter:hosts");
-        assert_eq!(st.obs_smartscape_filter, 3);
-        st.activate_target("obs-smartscape-filter");
-        assert_eq!(st.obs_smartscape_filter, 0);
-
-        st.activate_target("flt-sandbox:2");
-        assert_eq!(st.selected_sandbox_idx, Some(2));
-
-        let repo_cmds = st.activate_target("repo-select:0");
-        assert_eq!(st.route.repo, Some(RepoId::new("LMA1980", "mu-console")));
+        // Restart opens RiskConfirm requiring phrase confirmation.
+        let cmds = st.activate_target("ci-job-restart:42");
+        assert!(matches!(
+            cmds.first(),
+            Some(UiCommand::OpenDialog(DialogModel::RiskConfirm(_)))
+        ));
+        assert!(st.confirm_risk_dialog().is_empty());
+        st.set_risk_confirm_input("RESTART 000042");
         assert_eq!(
-            repo_cmds,
-            vec![UiCommand::SelectRepo {
-                repo: RepoId::new("LMA1980", "mu-console"),
-                submodule: None,
-            }]
+            st.confirm_risk_dialog(),
+            vec![UiCommand::RestartJob { job_id: 42 }, UiCommand::CloseDialog]
         );
 
-        // Verify obs-log-follow-toggle and obs-logs-screen:prev step-back from rendered tail page.
-        st.select_subview(SubView::Observe(ObserveSubView::Logs));
-        assert!(st.follow_log);
-        st.rendered_obs_log_page.set(3);
-        st.activate_target("obs-logs-screen:prev");
-        assert!(!st.follow_log);
-        assert_eq!(st.subview_page, 2);
-        st.activate_target("obs-log-follow-toggle");
-        assert!(st.follow_log);
-        assert_eq!(st.subview_page, u32::MAX);
-
-        // Verify ci-job-detail-screen:prev steps back from rendered tail page when follow_log is true.
-        st.select_subview(SubView::Ci(CiSubView::QueueLogs));
-        assert!(st.follow_log);
-        assert_eq!(st.log_page, 0);
-        st.rendered_ci_log_page.set(4);
-        st.activate_target("ci-job-detail-screen:prev");
-        assert!(!st.follow_log);
-        assert_eq!(st.log_page, 3);
+        // A|B Rollback uses fast RiskConfirm (no phrase required).
+        let ab_cmds = st.activate_target("ab-rollback:dep-9");
+        assert!(matches!(
+            ab_cmds.first(),
+            Some(UiCommand::OpenDialog(DialogModel::RiskConfirm(_)))
+        ));
+        assert!(matches!(
+            st.confirm_risk_dialog().first(),
+            Some(UiCommand::TriggerAbRollback { deployment_id, .. }) if deployment_id == "dep-9"
+        ));
     }
 }

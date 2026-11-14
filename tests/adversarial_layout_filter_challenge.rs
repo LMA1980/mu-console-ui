@@ -21,24 +21,40 @@ use mu_console_ui::state::ConsoleState;
 fn test_layout_zero_scrollbars_and_css_invariants() {
     let css = tokens_css();
 
-    // 1. Verify CSS rules enforce zero scroll leakage on html, body, and #muconsole-shell
+    // 1. Verify M2 two-skin CSS rules preserve wireframe 100dvh lock & HTML vertical-scroll safety
     assert!(
-        css.contains("html,body{margin:0;padding:0;height:100vh;overflow:hidden;height:100dvh;"),
-        "tokens_css() must enforce overflow:hidden and 100dvh on html,body"
-    );
-    assert!(
-        css.contains("#muconsole-shell{display:flex;flex-direction:column;height:100vh;height:100dvh;overflow:hidden;margin:0;padding:0}"),
-        "tokens_css() must enforce flex column, 100dvh, and overflow:hidden on #muconsole-shell"
+        css.contains(
+            "html[data-skin=\"wireframe\"],html[data-skin=\"wireframe\"] body{margin:0;padding:0;height:100vh;overflow:hidden;height:100dvh;"
+        ),
+        "tokens_css() must enforce overflow:hidden and 100dvh when WireframeSkin is active"
     );
     assert!(
         css.contains(
-            "#muconsole-dashboard{flex:1 1 auto;overflow:hidden;position:relative;display:flex}"
+            "#muconsole-shell[data-skin=\"wireframe\"],html[data-skin=\"wireframe\"] #muconsole-shell{height:100vh;height:100dvh;overflow:hidden}"
         ),
-        "tokens_css() must enforce flex:1 1 auto and overflow:hidden on #muconsole-dashboard"
+        "tokens_css() must enforce 100dvh and overflow:hidden on #muconsole-shell for wireframe"
+    );
+    assert!(
+        css.contains(
+            "html[data-skin=\"html\"],html[data-skin=\"html\"] body,html:not([data-skin]),html:not([data-skin]) body{margin:0;padding:0;height:auto;min-height:100dvh;overflow-x:hidden;overflow-y:auto;"
+        ),
+        "tokens_css() must enforce overflow-x:hidden and min-height:100dvh on html skin"
+    );
+    assert!(
+        css.contains("#muconsole-dashboard{flex:1 1 auto;overflow:hidden;position:relative;display:flex}"),
+        "tokens_css() must enforce flex:1 1 auto and overflow:hidden on #muconsole-dashboard base rule"
     );
     assert!(
         css.contains("#muconsole-dashboard>svg{width:100%;height:100%;display:block}"),
         "tokens_css() must enforce 100% width and height on #muconsole-dashboard>svg"
+    );
+    assert!(
+        css.contains("input,select,textarea,.mu-input{") && css.contains("font-size:16px"),
+        "tokens_css() must enforce font-size:16px on all form controls to prevent iOS Safari auto-zoom"
+    );
+    assert!(
+        css.contains(".mu-segmented{") && css.contains("overflow-x:auto"),
+        "tokens_css() must enforce horizontal scrolling on contained .mu-segmented controls"
     );
 
     // 2. Test layout solver across viewports: small mobile, tablet, desktop, ultrawide
@@ -59,11 +75,14 @@ fn test_layout_zero_scrollbars_and_css_invariants() {
 
     let fonts = [&HURMIT, &OPEN_DYSLEXIC];
     let areas = [
+        Area::Dashboard,
         Area::Ci,
         Area::Cd,
-        Area::Registry,
-        Area::Observe,
-        Area::Fleet,
+        Area::AbDeploy,
+        Area::Repository,
+        Area::Observability,
+        Area::ModelRunner,
+        Area::Platform,
     ];
 
     for (w, h, label) in target_viewports {
@@ -267,8 +286,8 @@ fn test_sanitized_reference_oracle_passes_all_extreme_inputs() {
 
         assert_eq!(
             sibling_tags,
-            vec!["a", "input", "div", "div", "button", "a"],
-            "Header DOM structure must remain unaltered regardless of input payload"
+            vec!["a", "input", "div", "div", "span"],
+            "Unresolved header DOM structure must remain unaltered regardless of input payload"
         );
     }
 }
@@ -354,7 +373,7 @@ fn test_adversarial_layout_filter_fuzzing() {
 
         assert_eq!(
             sibling_tags,
-            vec!["a", "input", "div", "div", "button", "a"],
+            vec!["a", "input", "div", "div", "span"],
             "Fuzz case #{idx}: Header DOM structure was altered by payload {payload:?}"
         );
     }
@@ -364,7 +383,8 @@ fn test_adversarial_layout_filter_fuzzing() {
 #[test]
 fn test_adversarial_aria_and_auth_injection() {
     use mu_console_data::engine::Engine;
-    use mu_console_protocol::{AuthState, DataEvent, Delta};
+    use mu_console_protocol::dto::AuthSessionDto;
+    use mu_console_protocol::{AuthReasonCode, AuthState, DataEvent, Delta};
 
     let evil_payloads = [
         "\"><script>alert('aria-xss')</script>",
@@ -395,54 +415,66 @@ fn test_adversarial_aria_and_auth_injection() {
             .expect("aria-assertive node must exist");
         assert_eq!(assertive_node.text(), Some(evil));
 
-        // 2. Test auth injection via github_login in InviteRequired
-        let mut st_invite = ConsoleState::new();
+        // 2. Test AuthorizationDenied suppresses arbitrary github_login disclosure
+        let mut st_denied = ConsoleState::new();
         let init_snap = Engine::encode_event(&DataEvent::Snapshot(
             mu_console_protocol::ViewModel::default(),
         ))
         .expect("encode snapshot");
-        st_invite.on_worker_frame(&init_snap);
+        st_denied.on_worker_frame(&init_snap);
 
-        let invite_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(
-            AuthState::InviteRequired {
-                github_login: evil.to_owned(),
-            },
-        )]))
-        .expect("encode Delta::Auth InviteRequired");
-        st_invite.on_worker_frame(&invite_patch);
+        let denied_auth = AuthState::from_session(&AuthSessionDto {
+            authenticated: false,
+            invite_bound: false,
+            github_login: Some(evil.to_owned()),
+            reason_code: Some(AuthReasonCode::AuthorizationDenied),
+            ..AuthSessionDto::default()
+        });
+        let denied_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(denied_auth)]))
+            .expect("encode Delta::Auth AuthorizationDenied");
+        st_denied.on_worker_frame(&denied_patch);
 
-        let html_invite = render_html_shell("<svg></svg>", &st_invite);
-        let doc_invite = roxmltree::Document::parse(&html_invite)
-            .unwrap_or_else(|e| panic!("Auth invite injection XML parse failed on {evil:?}: {e}"));
-        let auth_link = doc_invite
+        let html_denied = render_html_shell("<svg></svg>", &st_denied);
+        let doc_denied = roxmltree::Document::parse(&html_denied)
+            .unwrap_or_else(|e| panic!("Auth denied XML parse failed on {evil:?}: {e}"));
+        let denied_badge = doc_denied
+            .descendants()
+            .find(|n| n.attribute("id") == Some("muconsole-auth-denied"))
+            .expect("auth-denied node must exist");
+        assert_eq!(denied_badge.text(), Some("Authorization denied"));
+        let auth_link = doc_denied
             .descendants()
             .find(|n| n.attribute("id") == Some("muconsole-auth-link"))
             .expect("auth-link node must exist");
-        let expected_label = format!("INVITE REQ (@{evil})");
-        assert_eq!(auth_link.text(), Some(expected_label.as_str()));
+        assert_eq!(auth_link.text(), Some("Sign Out"));
+        assert!(!html_denied.contains(evil));
 
-        // 3. Test auth injection via github_login in Operator
+        // 3. Test auth injection via github_login in Active (`#muconsole-user-btn`)
         let mut st_operator = ConsoleState::new();
         st_operator.on_worker_frame(&init_snap);
 
-        let op_patch =
-            Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(AuthState::Operator {
-                github_login: evil.to_owned(),
-                role: None,
-            })]))
-            .expect("encode Delta::Auth Operator");
+        let active_auth = AuthState::from_session(&AuthSessionDto {
+            authenticated: true,
+            invite_bound: true,
+            passkey_count: 1,
+            github_login: Some(evil.to_owned()),
+            baseline_role: Some("operator".into()),
+            ..AuthSessionDto::default()
+        });
+        let op_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(active_auth)]))
+            .expect("encode Delta::Auth Active");
         st_operator.on_worker_frame(&op_patch);
 
         let html_op = render_html_shell("<svg></svg>", &st_operator);
-        let doc_op = roxmltree::Document::parse(&html_op).unwrap_or_else(|e| {
-            panic!("Auth operator injection XML parse failed on {evil:?}: {e}")
-        });
-        let auth_link_op = doc_op
+        let doc_op = roxmltree::Document::parse(&html_op)
+            .unwrap_or_else(|e| panic!("Auth active XML parse failed on {evil:?}: {e}"));
+        let user_btn = doc_op
             .descendants()
-            .find(|n| n.attribute("id") == Some("muconsole-auth-link"))
-            .expect("auth-link node must exist");
-        let expected_op_label = format!("@{evil} · OPERATOR");
-        assert_eq!(auth_link_op.text(), Some(expected_op_label.as_str()));
+            .find(|n| n.attribute("id") == Some("muconsole-user-btn"))
+            .expect("user-btn node must exist");
+        let expected_op_label = format!("@{evil}");
+        assert_eq!(user_btn.text(), Some(expected_op_label.as_str()));
+        assert!(!html_op.contains("muconsole-font-toggle"));
     }
 }
 
