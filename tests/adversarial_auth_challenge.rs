@@ -3,7 +3,7 @@
 //!
 //! Stress-tests:
 //! 1. Rapid repeated clicks and idempotency on `c2-auth-status` across authentication states.
-//! 2. State machine transitions: Anonymous <-> InviteRequired <-> Operator under load.
+//! 2. State machine transitions: Anonymous <-> AuthorizationDenied <-> Active under load.
 //! 3. Malformed return path injection and URL percent-encoding validation.
 //! 4. Strict synchronization between `render_html_shell` `<a id="muconsole-auth-link">` and href methods.
 //! 5. `sessionStorage` invite stashing logic and survival across full-page navigation.
@@ -11,13 +11,43 @@
 
 use mu_console_data::engine::{Effect, Engine};
 use mu_console_data::scenario::Scenario;
-use mu_console_protocol::{AuthState, DataEvent, Delta, UiCommand, WorkerConfig};
+use mu_console_protocol::dto::AuthSessionDto;
+use mu_console_protocol::{
+    AuthReasonCode, AuthState, AuthStatus, DataEvent, Delta, UiCommand, WorkerConfig,
+};
+use mu_console_ui::client::WORKER_URL;
 use mu_console_ui::components::render_html_shell;
 use mu_console_ui::state::{
     extract_invite_token, format_sign_in_url, format_sign_out_url, validate_sign_in_href,
     ConsoleState, PENDING_INVITE_STORAGE_KEY,
 };
-use mu_console_ui::WORKER_URL;
+
+fn anon_auth() -> AuthState {
+    AuthState::anonymous(vec!["ci:jobs.read".into()])
+}
+
+fn denied_auth(login: &str) -> AuthState {
+    AuthState::from_session(&AuthSessionDto {
+        authenticated: false,
+        invite_bound: false,
+        github_login: Some(login.into()),
+        reason_code: Some(AuthReasonCode::AuthorizationDenied),
+        active_policies: vec!["ci:jobs.read".into()],
+        ..AuthSessionDto::default()
+    })
+}
+
+fn active_auth(login: &str) -> AuthState {
+    AuthState::from_session(&AuthSessionDto {
+        authenticated: true,
+        invite_bound: true,
+        passkey_count: 1,
+        github_login: Some(login.into()),
+        baseline_role: Some("operator".into()),
+        active_policies: vec!["system:dashboard.read".into(), "ci:jobs.read".into()],
+        ..AuthSessionDto::default()
+    })
+}
 
 fn initialized_state() -> ConsoleState {
     let mut eng = Engine::new(1);
@@ -41,9 +71,8 @@ fn initialized_state() -> ConsoleState {
             }
         }
     }
-    let anon_patch =
-        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(AuthState::Anonymous)]))
-            .expect("encode Delta::Auth Anonymous");
+    let anon_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(anon_auth())]))
+        .expect("encode Delta::Auth Anonymous");
     state.on_worker_frame(&anon_patch);
     state
 }
@@ -51,7 +80,7 @@ fn initialized_state() -> ConsoleState {
 #[test]
 fn test_rapid_repeated_clicks_idempotency_anonymous() {
     let mut st = initialized_state();
-    assert_eq!(st.auth(), AuthState::Anonymous);
+    assert_eq!(st.auth().status, AuthStatus::Anonymous);
     assert_eq!(st.pending_navigation, None);
 
     // Stress: 100 rapid clicks on c2-auth-status in Anonymous state
@@ -68,17 +97,17 @@ fn test_rapid_repeated_clicks_idempotency_anonymous() {
         assert_eq!(
             cmds[0],
             UiCommand::Navigate {
-                href: "/oauth2/start?rd=/".into(),
+                href: "/oauth2/start?rd=%2F".into(),
             },
             "Iteration {i}: Command must navigate to sign-in URL"
         );
         assert_eq!(
             st.pending_navigation.as_deref(),
-            Some("/oauth2/start?rd=/"),
+            Some("/oauth2/start?rd=%2F"),
             "Iteration {i}: pending_navigation must remain stable"
         );
         assert_eq!(
-            st.aria_polite, "Navigating to /oauth2/start?rd=/",
+            st.aria_polite, "Navigating to /oauth2/start?rd=%2F",
             "Iteration {i}: aria_polite message must remain stable"
         );
     }
@@ -94,88 +123,75 @@ fn test_state_machine_transitions_and_rapid_clicks_cycle() {
         assert_eq!(
             cmds,
             vec![UiCommand::Navigate {
-                href: "/oauth2/start?rd=/".into()
+                href: "/oauth2/start?rd=%2F".into()
             }]
         );
-        assert_eq!(st.pending_navigation.as_deref(), Some("/oauth2/start?rd=/"));
+        assert_eq!(
+            st.pending_navigation.as_deref(),
+            Some("/oauth2/start?rd=%2F")
+        );
     }
 
-    // Stage 2: Transition to InviteRequired
-    let invite_req_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(
-        AuthState::InviteRequired {
-            github_login: "challenger-bot".into(),
-        },
-    )]))
-    .expect("encode Delta::Auth InviteRequired");
-    st.on_worker_frame(&invite_req_patch);
+    // Stage 2: Transition to AuthorizationDenied
+    let denied_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(denied_auth(
+        "challenger-bot",
+    ))]))
+    .expect("encode Delta::Auth AuthorizationDenied");
+    st.on_worker_frame(&denied_patch);
 
-    assert_eq!(
-        st.auth(),
-        AuthState::InviteRequired {
-            github_login: "challenger-bot".into()
-        }
-    );
+    assert_eq!(st.auth().status, AuthStatus::AuthorizationDenied);
     assert!(!st.is_operator());
 
-    // 10 rapid clicks in InviteRequired -> must navigate to sign_out
+    // 10 rapid clicks in AuthorizationDenied -> must navigate to sign_out
     for i in 0..10 {
         let cmds = st.on_dom_action("data-control-id", "c2-auth-status", true, 200 + i);
         assert_eq!(
             cmds,
             vec![UiCommand::Navigate {
-                href: "/oauth2/sign_out?rd=/".into()
+                href: "/oauth2/sign_out?rd=%2F".into()
             }],
-            "InviteRequired state must dispatch sign_out"
+            "AuthorizationDenied state must dispatch sign_out"
         );
         assert_eq!(
             st.pending_navigation.as_deref(),
-            Some("/oauth2/sign_out?rd=/")
+            Some("/oauth2/sign_out?rd=%2F")
         );
-        assert_eq!(st.aria_polite, "Navigating to /oauth2/sign_out?rd=/");
+        assert_eq!(st.aria_polite, "Navigating to /oauth2/sign_out?rd=%2F");
     }
 
-    // Stage 3: Transition to Operator
+    // Stage 3: Transition to Active operator
     let op_patch =
-        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(AuthState::Operator {
-            github_login: "LMA1980".into(),
-            role: Some("operator".into()),
-        })]))
-        .expect("encode Delta::Auth Operator");
+        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(active_auth("LMA1980"))]))
+            .expect("encode Delta::Auth Active");
     st.on_worker_frame(&op_patch);
 
-    assert_eq!(
-        st.auth(),
-        AuthState::Operator {
-            github_login: "LMA1980".into(),
-            role: Some("operator".into()),
-        }
-    );
+    assert_eq!(st.auth().status, AuthStatus::Active);
+    assert_eq!(st.auth().github_login.as_deref(), Some("LMA1980"));
     assert!(st.is_operator());
 
-    // 10 rapid clicks in Operator -> must navigate to sign_out
+    // 10 rapid clicks in Active -> must navigate to sign_out
     for i in 0..10 {
         let cmds = st.on_dom_action("data-control-id", "c2-auth-status", false, 300 + i);
         assert_eq!(
             cmds,
             vec![UiCommand::Navigate {
-                href: "/oauth2/sign_out?rd=/".into()
+                href: "/oauth2/sign_out?rd=%2F".into()
             }],
-            "Operator state must dispatch sign_out"
+            "Active state must dispatch sign_out"
         );
         assert_eq!(
             st.pending_navigation.as_deref(),
-            Some("/oauth2/sign_out?rd=/")
+            Some("/oauth2/sign_out?rd=%2F")
         );
-        assert_eq!(st.aria_polite, "Navigating to /oauth2/sign_out?rd=/");
+        assert_eq!(st.aria_polite, "Navigating to /oauth2/sign_out?rd=%2F");
     }
 
     // Stage 4: Transition back to Anonymous (e.g. sign-out completed or session revoked)
-    let anon_patch =
-        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(AuthState::Anonymous)]))
-            .expect("encode Delta::Auth Anonymous");
+    let anon_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(anon_auth())]))
+        .expect("encode Delta::Auth Anonymous");
     st.on_worker_frame(&anon_patch);
 
-    assert_eq!(st.auth(), AuthState::Anonymous);
+    assert_eq!(st.auth().status, AuthStatus::Anonymous);
     assert!(!st.is_operator());
 
     // Rapid clicks in reverted Anonymous -> must navigate to sign_in again
@@ -184,11 +200,14 @@ fn test_state_machine_transitions_and_rapid_clicks_cycle() {
         assert_eq!(
             cmds,
             vec![UiCommand::Navigate {
-                href: "/oauth2/start?rd=/".into()
+                href: "/oauth2/start?rd=%2F".into()
             }]
         );
-        assert_eq!(st.pending_navigation.as_deref(), Some("/oauth2/start?rd=/"));
-        assert_eq!(st.aria_polite, "Navigating to /oauth2/start?rd=/");
+        assert_eq!(
+            st.pending_navigation.as_deref(),
+            Some("/oauth2/start?rd=%2F")
+        );
+        assert_eq!(st.aria_polite, "Navigating to /oauth2/start?rd=%2F");
     }
 }
 
@@ -247,21 +266,19 @@ fn test_malformed_return_path_injection_and_url_formatting() {
             "sign_out URL must not contain raw CRLF characters: '{sign_out}'"
         );
 
-        // 4. Validate sign_in with validate_sign_in_href
-        if rd.is_empty() {
-            assert_eq!(
-                validate_sign_in_href(&sign_in),
-                Err("empty rd parameter"),
-                "Empty rd parameter must be rejected by validate_sign_in_href"
-            );
-        } else {
-            assert!(
-                validate_sign_in_href(&sign_in).is_ok(),
-                "Valid sign_in URL for '{rd}' failed validation: {:?}",
-                validate_sign_in_href(&sign_in)
-            );
-        }
+        // 4. Validate sign_in with validate_sign_in_href (`""` normalizes to `"/"`)
+        assert!(
+            validate_sign_in_href(&sign_in).is_ok(),
+            "Valid sign_in URL for '{rd}' failed validation: {:?}",
+            validate_sign_in_href(&sign_in)
+        );
     }
+
+    assert_eq!(
+        validate_sign_in_href("/oauth2/start?rd="),
+        Err("empty rd parameter"),
+        "Empty rd parameter must be rejected by validate_sign_in_href"
+    );
 
     // 5. Explicit check: validate_sign_in_href must strictly reject screenshot reproduction string
     // String without '=' after rd
@@ -304,50 +321,58 @@ fn test_html_shell_auth_link_synchronization() {
     // 1. Anonymous state check
     let shell_anon = render_html_shell("<svg></svg>", &st);
     let expected_anon_href = st.sign_in_href();
-    assert_eq!(expected_anon_href, "/oauth2/start?rd=/");
+    assert_eq!(expected_anon_href, "/oauth2/start?rd=%2F");
+    assert!(shell_anon.contains("id=\"muconsole-font-toggle\""));
     assert!(
         shell_anon.contains(&format!(
-            r#"<a id="muconsole-auth-link" href="{expected_anon_href}" data-auth-state="anonymous">READ-ONLY · SIGN IN</a>"#
+            r#"<a id="muconsole-auth-link" href="{expected_anon_href}" data-auth-state="anonymous">Sign In</a>"#
         )),
         "HTML shell must contain synchronized sign_in_href in Anonymous state"
     );
 
-    // 2. InviteRequired state check
-    let invite_req_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(
-        AuthState::InviteRequired {
-            github_login: "test-user-42".into(),
-        },
-    )]))
+    // 2. AuthorizationDenied state check (generic denial, zero invite/identity disclosure)
+    let denied_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(denied_auth(
+        "test-user-42",
+    ))]))
     .expect("encode");
-    st.on_worker_frame(&invite_req_patch);
+    st.on_worker_frame(&denied_patch);
 
-    let shell_uninv = render_html_shell("<svg></svg>", &st);
-    let expected_uninv_href = st.sign_out_href();
-    assert_eq!(expected_uninv_href, "/oauth2/sign_out?rd=/");
+    let shell_denied = render_html_shell("<svg></svg>", &st);
+    let expected_denied_href = st.sign_out_href();
+    assert_eq!(expected_denied_href, "/oauth2/sign_out?rd=%2F");
+    assert!(shell_denied.contains("id=\"muconsole-font-toggle\""));
+    assert!(shell_denied.contains(
+        r#"<span id="muconsole-auth-denied" data-auth-state="authorization_denied">Authorization denied</span>"#
+    ));
     assert!(
-        shell_uninv.contains(&format!(
-            r#"<a id="muconsole-auth-link" href="{expected_uninv_href}" data-auth-state="invite_required">INVITE REQ (@test-user-42)</a>"#
+        shell_denied.contains(&format!(
+            r#"<a id="muconsole-auth-link" href="{expected_denied_href}" data-auth-state="authorization_denied">Sign Out</a>"#
         )),
-        "HTML shell must contain synchronized sign_out_href in InviteRequired state"
+        "HTML shell must contain synchronized sign_out_href in AuthorizationDenied state"
     );
+    assert!(!shell_denied.contains("test-user-42"));
+    assert!(!shell_denied.contains("INVITE"));
 
-    // 3. Operator state check
-    let op_patch =
-        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(AuthState::Operator {
-            github_login: "admin-ops".into(),
-            role: Some("operator".into()),
-        })]))
-        .expect("encode");
+    // 3. Active operator state check (`@user` + `+role` + `Sign Out`, `[Aa]` removed)
+    let op_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(active_auth(
+        "admin-ops",
+    ))]))
+    .expect("encode");
     st.on_worker_frame(&op_patch);
 
     let shell_op = render_html_shell("<svg></svg>", &st);
     let expected_op_href = st.sign_out_href();
-    assert_eq!(expected_op_href, "/oauth2/sign_out?rd=/");
+    assert_eq!(expected_op_href, "/oauth2/sign_out?rd=%2F");
+    assert!(!shell_op.contains("muconsole-font-toggle"));
+    assert!(shell_op.contains(
+        r#"<button id="muconsole-user-btn" type="button" data-control-id="hdr-user" data-action="hdr-user">@admin-ops</button>"#
+    ));
+    assert!(shell_op.contains("id=\"muconsole-roles-btn\""));
     assert!(
         shell_op.contains(&format!(
-            r#"<a id="muconsole-auth-link" href="{expected_op_href}" data-auth-state="operator">@admin-ops · OPERATOR</a>"#
+            r#"<a id="muconsole-auth-link" href="{expected_op_href}" data-auth-state="active">Sign Out</a>"#
         )),
-        "HTML shell must contain synchronized sign_out_href in Operator state"
+        "HTML shell must contain synchronized sign_out_href in Active state"
     );
 
     // 4. Verify root-absolute dyslexic font URL inside shell when loaded
@@ -395,15 +420,18 @@ fn test_session_storage_invite_stashing_and_navigation_survival() {
         Some("inv_test_secret_99887766554433221100")
     );
 
-    // Stage 3: User clicks sign in button -> navigation command emitted
+    // Stage 3: User clicks sign in button -> navigation command preserves unauthorized deep link
     let nav_cmds = st.on_dom_action("data-control-id", "c2-auth-status", false, 1_000);
     assert_eq!(
         nav_cmds,
         vec![UiCommand::Navigate {
-            href: "/oauth2/start?rd=/".into()
+            href: "/oauth2/start?rd=%2F%23%2Fci%2Fscorecards".into()
         }]
     );
-    assert_eq!(st.pending_navigation.as_deref(), Some("/oauth2/start?rd=/"));
+    assert_eq!(
+        st.pending_navigation.as_deref(),
+        Some("/oauth2/start?rd=%2F%23%2Fci%2Fscorecards")
+    );
 
     // Stage 4: Browser performs full-page navigation to GitHub and returns to origin root "/"
     // During this navigation, sessionStorage persists within the origin tab.
@@ -454,17 +482,14 @@ fn test_session_storage_invite_stashing_and_navigation_survival() {
         }
     );
 
-    // Stage 8: Worker authenticates and emits Operator state
+    // Stage 8: Worker authenticates and emits Active session state
     let operator_patch =
-        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(AuthState::Operator {
-            github_login: "LMA1980".into(),
-            role: Some("operator".into()),
-        })]))
-        .expect("encode");
+        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(active_auth("LMA1980"))]))
+            .expect("encode");
     st_return.on_worker_frame(&operator_patch);
     assert!(st_return.is_operator());
 
-    // When operator view arrives, boot.rs purges pending_invite from sessionStorage
+    // When active session arrives, boot.rs purges pending_invite from sessionStorage
     if st_return.is_operator() && st_return.pending_invite.take().is_some() {
         simulated_session_storage.remove(PENDING_INVITE_STORAGE_KEY);
     }
@@ -485,12 +510,12 @@ fn test_root_absolute_invariants_across_all_modules() {
     assert_eq!(WORKER_URL, "/muconsole-data_loader.js");
 
     let st = initialized_state();
-    assert_eq!(st.sign_in_href(), "/oauth2/start?rd=/");
-    assert_eq!(st.sign_out_href(), "/oauth2/sign_out?rd=/");
+    assert_eq!(st.sign_in_href(), "/oauth2/start?rd=%2F");
+    assert_eq!(st.sign_out_href(), "/oauth2/sign_out?rd=%2F");
 
     let shell = render_html_shell("", &st);
     assert!(
-        shell.contains(r#"href="/oauth2/start?rd=/""#),
+        shell.contains(r#"href="/oauth2/start?rd=%2F""#),
         "Shell must have root-absolute href"
     );
 }
@@ -504,17 +529,18 @@ fn test_interleaved_clicks_and_worker_frames() {
     assert_eq!(
         cmds1,
         vec![UiCommand::Navigate {
-            href: "/oauth2/start?rd=/".into()
+            href: "/oauth2/start?rd=%2F".into()
         }]
     );
-    assert_eq!(st.pending_navigation.as_deref(), Some("/oauth2/start?rd=/"));
+    assert_eq!(
+        st.pending_navigation.as_deref(),
+        Some("/oauth2/start?rd=%2F")
+    );
 
-    // 2. Interleaved worker frame: InviteRequired arrives
-    let uninv_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(
-        AuthState::InviteRequired {
-            github_login: "interleaved-bot".into(),
-        },
-    )]))
+    // 2. Interleaved worker frame: AuthorizationDenied arrives
+    let uninv_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(denied_auth(
+        "interleaved-bot",
+    ))]))
     .expect("encode");
     st.on_worker_frame(&uninv_patch);
 
@@ -523,21 +549,19 @@ fn test_interleaved_clicks_and_worker_frames() {
     assert_eq!(
         cmds2,
         vec![UiCommand::Navigate {
-            href: "/oauth2/sign_out?rd=/".into()
+            href: "/oauth2/sign_out?rd=%2F".into()
         }]
     );
     assert_eq!(
         st.pending_navigation.as_deref(),
-        Some("/oauth2/sign_out?rd=/")
+        Some("/oauth2/sign_out?rd=%2F")
     );
 
-    // 3. Interleaved worker frame: Operator arrives
-    let op_patch =
-        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(AuthState::Operator {
-            github_login: "interleaved-bot".into(),
-            role: Some("operator".into()),
-        })]))
-        .expect("encode");
+    // 3. Interleaved worker frame: Active arrives
+    let op_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(active_auth(
+        "interleaved-bot",
+    ))]))
+    .expect("encode");
     st.on_worker_frame(&op_patch);
 
     // Click immediately
@@ -545,18 +569,17 @@ fn test_interleaved_clicks_and_worker_frames() {
     assert_eq!(
         cmds3,
         vec![UiCommand::Navigate {
-            href: "/oauth2/sign_out?rd=/".into()
+            href: "/oauth2/sign_out?rd=%2F".into()
         }]
     );
     assert_eq!(
         st.pending_navigation.as_deref(),
-        Some("/oauth2/sign_out?rd=/")
+        Some("/oauth2/sign_out?rd=%2F")
     );
 
     // 4. Interleaved worker frame: Revoked back to Anonymous
     let anon_patch =
-        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(AuthState::Anonymous)]))
-            .expect("encode");
+        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(anon_auth())])).expect("encode");
     st.on_worker_frame(&anon_patch);
 
     // Click immediately
@@ -564,10 +587,13 @@ fn test_interleaved_clicks_and_worker_frames() {
     assert_eq!(
         cmds4,
         vec![UiCommand::Navigate {
-            href: "/oauth2/start?rd=/".into()
+            href: "/oauth2/start?rd=%2F".into()
         }]
     );
-    assert_eq!(st.pending_navigation.as_deref(), Some("/oauth2/start?rd=/"));
+    assert_eq!(
+        st.pending_navigation.as_deref(),
+        Some("/oauth2/start?rd=%2F")
+    );
 }
 
 #[test]
@@ -644,35 +670,43 @@ fn test_invite_token_extraction_variations() {
 fn test_html_shell_sync_with_unusual_github_logins() {
     let mut st = initialized_state();
 
-    let logins = ["octocat", "bot[ca]", "user-123_test", "admin.infra", "a"];
+    let logins = ["octocat", "bot[ca]", "user-123_test", "admin.infra", "op"];
     for login in logins {
-        // Test InviteRequired
-        let uninv_patch = Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(
-            AuthState::InviteRequired {
-                github_login: login.into(),
-            },
-        )]))
-        .expect("encode");
-        st.on_worker_frame(&uninv_patch);
+        // Test AuthorizationDenied (must not leak @login or invite state)
+        let denied_patch =
+            Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(denied_auth(login))]))
+                .expect("encode");
+        st.on_worker_frame(&denied_patch);
 
         let shell = render_html_shell("<svg></svg>", &st);
         let expected_href = st.sign_out_href();
         assert!(shell.contains(&format!(r#"href="{expected_href}""#)));
-        assert!(shell.contains(r#"data-auth-state="invite_required""#));
-        assert!(shell.contains(&format!("INVITE REQ (@{login})")));
+        assert!(shell.contains(r#"data-auth-state="authorization_denied""#));
+        assert!(shell.contains("Authorization denied"));
+        assert!(!shell.contains(&format!("@{login}")));
+        assert!(!shell.contains("INVITE"));
 
-        // Test Operator
+        // Test Active (`@login` rendered in `#muconsole-user-btn` + `Sign Out` without `[Aa]`)
         let op_patch =
-            Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(AuthState::Operator {
-                github_login: login.into(),
-                role: Some("operator".into()),
-            })]))
-            .expect("encode");
+            Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(active_auth(login))]))
+                .expect("encode");
         st.on_worker_frame(&op_patch);
 
         let shell_op = render_html_shell("<svg></svg>", &st);
-        assert!(shell_op.contains(&format!(r#"href="{expected_href}""#)));
-        assert!(shell_op.contains(r#"data-auth-state="operator""#));
-        assert!(shell_op.contains(&format!("@{login} · OPERATOR")));
+        let doc_op = roxmltree::Document::parse(&shell_op).expect("active shell XML must parse");
+        let user_btn = doc_op
+            .descendants()
+            .find(|n| n.attribute("id") == Some("muconsole-user-btn"))
+            .expect("user button must exist");
+        let expected_handle = format!("@{login}");
+        assert_eq!(user_btn.text(), Some(expected_handle.as_str()));
+        let link = doc_op
+            .descendants()
+            .find(|n| n.attribute("id") == Some("muconsole-auth-link"))
+            .expect("auth link must exist");
+        assert_eq!(link.attribute("href"), Some(expected_href.as_str()));
+        assert_eq!(link.attribute("data-auth-state"), Some("active"));
+        assert_eq!(link.text(), Some("Sign Out"));
+        assert!(!shell_op.contains("muconsole-font-toggle"));
     }
 }

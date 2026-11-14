@@ -53,6 +53,11 @@ impl DataClient {
         self.view.as_ref()
     }
 
+    /// Mutable access to the current view model for local lease countdowns.
+    pub fn view_mut(&mut self) -> Option<&mut ViewModel> {
+        self.view.as_mut()
+    }
+
     #[must_use]
     pub fn conn(&self) -> Option<ConnState> {
         self.conn
@@ -191,7 +196,7 @@ mod tests {
         c.on_frame(&frame(&DataEvent::Connection(ConnState::Live)));
         assert_eq!(c.conn(), Some(ConnState::Live));
         let b = AreaBadges {
-            fleet: 1,
+            ci: 1,
             ..AreaBadges::default()
         };
         assert_eq!(
