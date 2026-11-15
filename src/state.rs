@@ -525,6 +525,16 @@ impl ConsoleState {
             .unwrap_or_else(AuthState::unresolved)
     }
 
+    /// Return the latest worker error when cold-boot session verification has failed.
+    #[must_use]
+    pub fn session_probe_error(&self) -> Option<&mu_console_protocol::UiError> {
+        if self.auth().is_resolved() {
+            None
+        } else {
+            self.client.last_error()
+        }
+    }
+
     /// Return active skin enforced for the session (`Html` unconditionally unless `Active`).
     #[must_use]
     pub fn effective_skin(&self) -> ConsoleSkin {
@@ -1534,10 +1544,15 @@ impl ConsoleState {
                 self.aria_polite = format!("Navigating to {href}");
                 vec![UiCommand::Navigate { href }]
             }
-            "dlg-passkey-signout" | "profile-signout" => {
+            "dlg-passkey-signout" | "profile-signout" | "session-error-signout" => {
                 let href = self.sign_out_href();
                 self.pending_navigation = Some(href.clone());
                 vec![UiCommand::Navigate { href }]
+            }
+            "session-probe-retry" => {
+                self.client.clear_last_error();
+                self.aria_polite = copy::LOADING_SESSION_TITLE.into();
+                vec![UiCommand::Retry]
             }
             "dlg-passkey-register" | "register-passkey" | "profile-passkey-add" => {
                 if !matches!(
@@ -2115,5 +2130,40 @@ mod tests {
             st.confirm_risk_dialog().first(),
             Some(UiCommand::TriggerAbRollback { deployment_id, .. }) if deployment_id == "dep-9"
         ));
+    }
+
+    #[test]
+    fn session_probe_error_retry_and_signout_transition_cleanly() {
+        let mut st = ConsoleState::new();
+        let err_frame = encode(&DataEvent::Error(mu_console_protocol::UiError::Http {
+            status: 503,
+            message: "GET /api/auth/session".into(),
+        }))
+        .expect("encode");
+        st.on_worker_frame(&err_frame);
+        assert!(st.session_probe_error().is_some());
+
+        assert_eq!(
+            st.activate_target("session-error-signout"),
+            vec![UiCommand::Navigate {
+                href: "/oauth2/sign_out?rd=%2F".into()
+            }]
+        );
+        assert_eq!(
+            st.activate_target("session-probe-retry"),
+            vec![UiCommand::Retry]
+        );
+        assert!(st.session_probe_error().is_none());
+
+        st.on_worker_frame(&err_frame);
+        assert!(st.session_probe_error().is_some());
+
+        let snap = encode(&DataEvent::Snapshot(ViewModel {
+            auth: AuthState::anonymous(vec!["ci:queue.read".into()]),
+            ..ViewModel::default()
+        }))
+        .expect("encode");
+        st.on_worker_frame(&snap);
+        assert!(st.session_probe_error().is_none());
     }
 }

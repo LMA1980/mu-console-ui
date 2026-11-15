@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#0e1116" />
+    <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
@@ -30,7 +31,7 @@
   <body>
     <script type="module">
       import init from '/muconsole-ui.js';
-      init('/muconsole-ui_bg.wasm').catch(err => {
+      init({ module_or_path: '/muconsole-ui_bg.wasm' }).catch(err => {
         console.error("Failed to initialize MuConsole WASM:", err);
         const container = document.createElement('div');
         container.style.cssText = 'padding: 24px; font: 16px monospace; color: #ff3b30; background: #0e1116;';

@@ -31,7 +31,7 @@ use crate::state::{
 thread_local! {
     static WORKER: RefCell<Option<Worker>> = const { RefCell::new(None) };
     static LAST_RENDER: RefCell<String> = const { RefCell::new(String::new()) };
-    static LAST_SHELL_AUTH: RefCell<Option<(AuthStatus, bool)>> = const { RefCell::new(None) };
+    static LAST_SHELL_AUTH: RefCell<Option<(AuthStatus, bool, bool)>> = const { RefCell::new(None) };
 }
 
 fn now_ms() -> u64 {
@@ -200,7 +200,11 @@ fn repaint(st: &ConsoleState) {
 
     let vp = window_viewport(&win);
     let rendered = render_console(st, vp, SafeArea::ZERO);
-    let shell_key = (auth.status, auth.passkey_enrollment_required);
+    let shell_key = (
+        auth.status,
+        auth.passkey_enrollment_required,
+        st.session_probe_error().is_some(),
+    );
     let shell_auth_changed = LAST_SHELL_AUTH.with(|prev| {
         let mut slot = prev.borrow_mut();
         if *slot == Some(shell_key) {
@@ -254,7 +258,13 @@ fn repaint(st: &ConsoleState) {
                     AuthStatus::AuthorizationDenied
                     | AuthStatus::PasskeyEnrollmentRequired
                     | AuthStatus::Active => (st.sign_out_href(), copy::SIGN_OUT_LABEL),
-                    AuthStatus::Unresolved => ("#".to_owned(), copy::LOADING_SESSION_TITLE),
+                    AuthStatus::Unresolved => {
+                        if st.session_probe_error().is_some() {
+                            (st.sign_out_href(), copy::SIGN_OUT_LABEL)
+                        } else {
+                            ("#".to_owned(), copy::LOADING_SESSION_TITLE)
+                        }
+                    }
                 };
                 let _ = auth_link.set_attribute("href", &href);
                 let _ = auth_link.set_attribute("data-auth-state", auth_slug);
