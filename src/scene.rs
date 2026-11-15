@@ -51,29 +51,15 @@ pub fn build_console_scene(state: &ConsoleState, _viewport: SceneViewport) -> Co
             };
             scene.status_lamps.push(StatusLamp {
                 control_id: "lamp-session".into(),
-                label: copy::SESSION_PROBE_FAILED_TITLE.into(),
+                label: "Session".into(),
                 value: diag.clone(),
                 lit: true,
                 tone: SemanticTone::Fail,
                 action: None,
             });
-            scene.banners.push(SceneBanner {
-                id: "banner-session-error".into(),
-                tone: SemanticTone::Fail,
-                title: copy::SESSION_PROBE_FAILED_TITLE.into(),
-                message: copy::SESSION_PROBE_FAILED_BODY.into(),
-                action: Some(
-                    ActionControl::new(
-                        "session-probe-retry",
-                        copy::RETRY_SESSION_LABEL,
-                        "session-probe-retry",
-                    )
-                    .with_tone(SemanticTone::Info),
-                ),
-            });
             scene.sections.push(
-                SceneSection::new("sec-cold-boot-error", copy::SESSION_PROBE_FAILED_TITLE)
-                    .with_component(SceneComponent::PlatformPanel(PlatformPanel {
+                SceneSection::new("sec-cold-boot-error", "Session Status").with_component(
+                    SceneComponent::PlatformPanel(PlatformPanel {
                         id: "panel-session-probe-error".into(),
                         title: copy::SESSION_PROBE_FAILED_TITLE.into(),
                         summary: Some(copy::SESSION_PROBE_FAILED_BODY.into()),
@@ -111,7 +97,8 @@ pub fn build_console_scene(state: &ConsoleState, _viewport: SceneViewport) -> Co
                             .with_attr("data-href", state.sign_out_href())
                             .with_tone(SemanticTone::Warn),
                         ],
-                    })),
+                    }),
+                ),
             );
             scene.footer_status = Some(copy::SESSION_PROBE_FAILED_TITLE.into());
             return scene;
