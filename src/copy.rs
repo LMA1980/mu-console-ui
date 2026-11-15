@@ -24,10 +24,20 @@ pub const FILTER_ARIA_LABEL: &str = "Filter repositories and entities";
 pub const LOADING_SESSION_TITLE: &str = "Resolving session";
 pub const LOADING_SESSION_BODY: &str = "Checking authentication and session capabilities.";
 
+/// Cold-boot session verification error copy (when `/api/auth/session` fails or times out).
+pub const SESSION_PROBE_FAILED_TITLE: &str = "Session verification failed";
+pub const SESSION_PROBE_FAILED_BODY: &str =
+    "Unable to verify session via /api/auth/session. Retry or sign out to reset.";
+pub const RETRY_SESSION_LABEL: &str = "Retry";
+
 /// Anonymous lockdown login gate copy (rendered in `#muconsole-login-gate`).
 pub const LOGIN_GATE_TITLE: &str = "Sign in required";
 pub const LOGIN_GATE_BODY: &str =
     "Anonymous access is disabled on this instance. Sign in with GitHub to continue.";
+
+/// Generic lockdown copy for an authenticated user without console authorization.
+pub const AUTH_DENIED_LOCKDOWN_BODY: &str =
+    "This session is not authorized to access console views. Sign out to switch accounts.";
 
 /// Neutral deep-link gate banner/card for unauthorized routes.
 pub const AUTH_REQUIRED_TITLE: &str = "Authentication required";

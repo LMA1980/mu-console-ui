@@ -11,12 +11,14 @@
 
 use mu_console_data::engine::{Effect, Engine};
 use mu_console_data::scenario::Scenario;
+use mu_console_layout::Viewport;
 use mu_console_protocol::dto::AuthSessionDto;
 use mu_console_protocol::{
-    AuthReasonCode, AuthState, AuthStatus, DataEvent, Delta, UiCommand, WorkerConfig,
+    encode, Area, AuthReasonCode, AuthState, AuthStatus, ConsoleSkin, DataEvent, Delta, UiCommand,
+    UiError, ViewModel, WorkerConfig,
 };
 use mu_console_ui::client::WORKER_URL;
-use mu_console_ui::components::render_html_shell;
+use mu_console_ui::components::{render_console_with_skin, render_html_shell};
 use mu_console_ui::state::{
     extract_invite_token, format_sign_in_url, format_sign_out_url, validate_sign_in_href,
     ConsoleState, PENDING_INVITE_STORAGE_KEY,
@@ -709,4 +711,107 @@ fn test_html_shell_sync_with_unusual_github_logins() {
         assert_eq!(link.text(), Some("Sign Out"));
         assert!(!shell_op.contains("muconsole-font-toggle"));
     }
+}
+
+#[test]
+fn test_cold_boot_session_probe_failure_surfaces_retry_and_sign_out_without_sign_in_loop() {
+    let mut st = ConsoleState::new();
+    let err_frame = encode(&DataEvent::Error(UiError::Http {
+        status: 404,
+        message: "GET /api/auth/session".into(),
+    }))
+    .expect("encode error");
+    st.on_worker_frame(&err_frame);
+
+    assert_eq!(st.auth().status, AuthStatus::Unresolved);
+    assert!(st.session_probe_error().is_some());
+    for area in Area::ALL {
+        assert!(
+            !st.can_access_area(area),
+            "failed session probe must keep {area:?} disabled"
+        );
+    }
+
+    for (w, h) in [(360.0, 640.0), (1280.0, 800.0)] {
+        let vp = Viewport::new(w, h);
+        let html = render_console_with_skin(ConsoleSkin::Html, &st, vp);
+        let shell = render_html_shell(&html, &st);
+        assert!(shell.contains("Session verification failed"));
+        assert!(shell.contains("HTTP 404"));
+        assert!(shell.contains("session-probe-retry"));
+        assert!(shell.contains(r#"href="/oauth2/sign_out?rd=%2F""#));
+        assert!(!shell.contains("Sign in required"));
+        assert!(!shell.contains("/oauth2/start"));
+        assert!(!shell.to_ascii_lowercase().contains("invite"));
+
+        let svg = render_console_with_skin(ConsoleSkin::Wireframe, &st, vp);
+        roxmltree::Document::parse(&svg).expect("wireframe error SVG must be valid XML");
+        assert!(svg.contains("Session verification failed"));
+        assert!(svg.contains("session-probe-retry"));
+        assert!(svg.contains("session-error-signout"));
+    }
+
+    let retry_cmds = st.on_dom_action("data-control-id", "session-probe-retry", false, 100);
+    assert_eq!(retry_cmds, vec![UiCommand::Retry]);
+    assert!(st.session_probe_error().is_none());
+
+    st.on_worker_frame(&err_frame);
+    assert!(st.session_probe_error().is_some());
+    let signout_cmds = st.on_dom_action("data-control-id", "session-error-signout", false, 200);
+    assert_eq!(
+        signout_cmds,
+        vec![UiCommand::Navigate {
+            href: "/oauth2/sign_out?rd=%2F".into()
+        }]
+    );
+}
+
+#[test]
+fn test_authorization_denied_with_anonymous_lockdown_renders_sign_out_not_sign_in_gate() {
+    let mut st = ConsoleState::new();
+    let vm = ViewModel {
+        auth: AuthState::from_session(&AuthSessionDto {
+            authenticated: false,
+            invite_bound: false,
+            github_login: Some("uninvited-lockdown".into()),
+            reason_code: Some(AuthReasonCode::AuthorizationDenied),
+            active_policies: vec![],
+            anonymous_lockdown: true,
+            ..AuthSessionDto::default()
+        }),
+        ..ViewModel::default()
+    };
+    let snap = encode(&DataEvent::Snapshot(vm)).expect("encode snapshot");
+    st.on_worker_frame(&snap);
+
+    assert_eq!(st.auth().status, AuthStatus::AuthorizationDenied);
+    assert!(st.auth().anonymous_lockdown);
+
+    for (w, h) in [(360.0, 640.0), (1280.0, 800.0)] {
+        let vp = Viewport::new(w, h);
+        let html = render_console_with_skin(ConsoleSkin::Html, &st, vp);
+        let shell = render_html_shell(&html, &st);
+        assert!(shell.contains("Authorization denied"));
+        assert!(shell.contains("Sign Out"));
+        assert!(shell.contains(r#"data-href="/oauth2/sign_out?rd=%2F""#));
+        assert!(!shell.contains("Sign in required"));
+        assert!(!shell.contains("login-gate-signin"));
+        assert!(!shell.contains("/oauth2/start"));
+        assert!(!shell.contains("uninvited-lockdown"));
+        assert!(!shell.to_ascii_lowercase().contains("invite"));
+
+        let svg = render_console_with_skin(ConsoleSkin::Wireframe, &st, vp);
+        roxmltree::Document::parse(&svg).expect("wireframe denied lockdown SVG must be valid XML");
+        assert!(svg.contains("Authorization denied"));
+        assert!(!svg.contains("Sign in required"));
+        assert!(!svg.contains("uninvited-lockdown"));
+    }
+
+    let cmds = st.on_dom_action("data-control-id", "auth-gate-signin", false, 300);
+    assert_eq!(
+        cmds,
+        vec![UiCommand::Navigate {
+            href: "/oauth2/sign_out?rd=%2F".into()
+        }]
+    );
 }

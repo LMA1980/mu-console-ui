@@ -224,7 +224,16 @@ pub fn render_html_shell(content: &str, state: &ConsoleState) -> String {
 
     let header_tail = match auth.status {
         AuthStatus::Unresolved => {
-            r##"<span id="muconsole-session-loading" data-auth-state="unresolved">Loading session…</span>"##.to_owned()
+            if state.session_probe_error().is_some() {
+                let href = escape_html(&state.sign_out_href());
+                format!(
+                    r##"<span id="muconsole-session-error" data-auth-state="unresolved">{}</span><a id="muconsole-auth-link" href="{href}" data-auth-state="unresolved">{}</a>"##,
+                    escape_html(copy::SESSION_PROBE_FAILED_TITLE),
+                    escape_html(copy::SIGN_OUT_LABEL),
+                )
+            } else {
+                r##"<span id="muconsole-session-loading" data-auth-state="unresolved">Loading session…</span>"##.to_owned()
+            }
         }
         AuthStatus::Anonymous => {
             let href = escape_html(&state.sign_in_href());

@@ -16,7 +16,7 @@ use mu_console_protocol::{
     GateOutcome, ModelRunnerSubView, ObservabilitySubView, PackageEcosystem, PlatformSubView,
     RepoStatus, RepositorySubView, RiskConfirmAction, RoleActivationKind, Slot, StageState,
     StepUpRequirement, SubView, SubsystemHealthEntry, SubsystemId, SubsystemStatus, TestState,
-    UserProfileTab, Visibility,
+    UiError, UserProfileTab, Visibility,
 };
 use mu_console_theme::scene::{
     self as theme_scene, ActionControl, ConsoleScene, GateChecklist, GateItem,
@@ -38,8 +38,84 @@ pub fn build_console_scene(state: &ConsoleState, _viewport: SceneViewport) -> Co
     scene.active_subview = Some(state.route.subview.slug().to_owned());
     scene.area_tabs = build_area_tabs(state, &auth);
 
-    // 1. Fail-closed cold boot: all areas disabled, zero cached data rendered, neutral loading card.
+    // 1. Fail-closed cold boot: all areas disabled, zero cached data rendered, neutral loading card
+    // or explicit session-probe diagnostic with Retry / Sign Out recovery controls.
     if !auth.is_resolved() {
+        if let Some(err) = state.session_probe_error() {
+            let diag = match err {
+                UiError::Http { status: 0, .. } => "Network error".to_owned(),
+                UiError::Http { status, .. } => format!("HTTP {status}"),
+                UiError::Decode(_) => "Invalid payload".to_owned(),
+                UiError::AuthDenied(_) => "Access denied".to_owned(),
+                _ => "Probe error".to_owned(),
+            };
+            scene.status_lamps.push(StatusLamp {
+                control_id: "lamp-session".into(),
+                label: copy::SESSION_PROBE_FAILED_TITLE.into(),
+                value: diag.clone(),
+                lit: true,
+                tone: SemanticTone::Fail,
+                action: None,
+            });
+            scene.banners.push(SceneBanner {
+                id: "banner-session-error".into(),
+                tone: SemanticTone::Fail,
+                title: copy::SESSION_PROBE_FAILED_TITLE.into(),
+                message: copy::SESSION_PROBE_FAILED_BODY.into(),
+                action: Some(
+                    ActionControl::new(
+                        "session-probe-retry",
+                        copy::RETRY_SESSION_LABEL,
+                        "session-probe-retry",
+                    )
+                    .with_tone(SemanticTone::Info),
+                ),
+            });
+            scene.sections.push(
+                SceneSection::new("sec-cold-boot-error", copy::SESSION_PROBE_FAILED_TITLE)
+                    .with_component(SceneComponent::PlatformPanel(PlatformPanel {
+                        id: "panel-session-probe-error".into(),
+                        title: copy::SESSION_PROBE_FAILED_TITLE.into(),
+                        summary: Some(copy::SESSION_PROBE_FAILED_BODY.into()),
+                        tone: SemanticTone::Fail,
+                        attributes: vec![
+                            KeyValueEntry {
+                                key: "Endpoint".into(),
+                                value: "/api/auth/session".into(),
+                                detail: None,
+                                tone: SemanticTone::Neutral,
+                                mono: true,
+                                action: None,
+                            },
+                            KeyValueEntry {
+                                key: "Diagnostic".into(),
+                                value: diag,
+                                detail: None,
+                                tone: SemanticTone::Fail,
+                                mono: true,
+                                action: None,
+                            },
+                        ],
+                        controls: vec![
+                            ActionControl::new(
+                                "session-probe-retry",
+                                copy::RETRY_SESSION_LABEL,
+                                "session-probe-retry",
+                            )
+                            .with_tone(SemanticTone::Info),
+                            ActionControl::new(
+                                "session-error-signout",
+                                copy::SIGN_OUT_LABEL,
+                                "session-error-signout",
+                            )
+                            .with_attr("data-href", state.sign_out_href())
+                            .with_tone(SemanticTone::Warn),
+                        ],
+                    })),
+            );
+            scene.footer_status = Some(copy::SESSION_PROBE_FAILED_TITLE.into());
+            return scene;
+        }
         scene.status_lamps.push(StatusLamp {
             control_id: "lamp-session".into(),
             label: copy::LOADING_SESSION_TITLE.into(),
@@ -125,15 +201,20 @@ pub fn build_console_scene(state: &ConsoleState, _viewport: SceneViewport) -> Co
         });
     }
 
-    // 4. Anonymous lockdown (`RoleFolioIndex["anonymous"] == []`).
-    if matches!(
-        auth.status,
-        AuthStatus::Anonymous | AuthStatus::AuthorizationDenied
-    ) && auth.anonymous_lockdown
-    {
-        scene.sections.push(build_login_gate_section(state));
-        scene.footer_status = Some("Anonymous access disabled".into());
-        return scene;
+    // 4. Anonymous lockdown (`RoleFolioIndex["anonymous"] == []`) vs AuthorizationDenied lockdown.
+    if auth.anonymous_lockdown {
+        if auth.status == AuthStatus::AuthorizationDenied {
+            scene
+                .sections
+                .push(build_auth_denied_lockdown_section(state, &auth));
+            scene.footer_status = Some(copy::AUTH_DENIED_STATUS.into());
+            return scene;
+        }
+        if auth.status == AuthStatus::Anonymous {
+            scene.sections.push(build_login_gate_section(state));
+            scene.footer_status = Some("Anonymous access disabled".into());
+            return scene;
+        }
     }
 
     // 5. Unauthorized deep-link landing card (preserves hash for post-OAuth return).
@@ -743,6 +824,36 @@ fn build_login_gate_section(state: &ConsoleState) -> SceneSection {
             )
             .with_attr("data-href", state.sign_in_href())
             .with_tone(SemanticTone::Info)],
+        }),
+    )
+}
+
+fn build_auth_denied_lockdown_section(state: &ConsoleState, auth: &AuthState) -> SceneSection {
+    let summary = auth
+        .reason_code
+        .filter(|code| *code != mu_console_protocol::AuthReasonCode::AuthorizationDenied)
+        .map_or(copy::AUTH_DENIED_LOCKDOWN_BODY, copy::auth_reason_label);
+    SceneSection::new("sec-auth-denied-lockdown", copy::AUTH_DENIED_STATUS).with_component(
+        SceneComponent::PlatformPanel(PlatformPanel {
+            id: "panel-auth-denied-lockdown".into(),
+            title: copy::AUTH_DENIED_STATUS.into(),
+            summary: Some(summary.into()),
+            tone: SemanticTone::Fail,
+            attributes: vec![KeyValueEntry {
+                key: "Access".into(),
+                value: copy::AUTH_DENIED_STATUS.into(),
+                detail: None,
+                tone: SemanticTone::Fail,
+                mono: false,
+                action: None,
+            }],
+            controls: vec![ActionControl::new(
+                "auth-gate-signin",
+                copy::SIGN_OUT_LABEL,
+                "auth-gate-signin",
+            )
+            .with_attr("data-href", state.sign_out_href())
+            .with_tone(SemanticTone::Warn)],
         }),
     )
 }

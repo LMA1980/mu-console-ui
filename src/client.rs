@@ -38,6 +38,7 @@ pub struct DataClient {
     conn: Option<ConnState>,
     badges: AreaBadges,
     reload_required: Option<(u32, u32)>,
+    last_error: Option<UiError>,
     frames: u32,
 }
 
@@ -74,6 +75,17 @@ impl DataClient {
         self.reload_required
     }
 
+    /// Most recent non-version worker/decode error, cleared once auth resolves or on retry.
+    #[must_use]
+    pub fn last_error(&self) -> Option<&UiError> {
+        self.last_error.as_ref()
+    }
+
+    /// Clear any latched worker error (e.g. when retrying `/api/auth/session`).
+    pub fn clear_last_error(&mut self) {
+        self.last_error = None;
+    }
+
     /// Encode a command for the worker.
     ///
     /// # Errors
@@ -88,7 +100,11 @@ impl DataClient {
         match decode::<DataEvent>(frame) {
             Ok(ev) => self.on_event(ev),
             Err(CodecError::VersionMismatch { expected, found }) => self.mismatch(expected, found),
-            Err(e) => ClientUpdate::Error(UiError::Decode(e.to_string())),
+            Err(e) => {
+                let err = UiError::Decode(e.to_string());
+                self.last_error = Some(err.clone());
+                ClientUpdate::Error(err)
+            }
         }
     }
 
@@ -101,12 +117,18 @@ impl DataClient {
         match ev {
             DataEvent::Ready { source, .. } => ClientUpdate::Ready(source),
             DataEvent::Snapshot(v) => {
+                if v.auth.is_resolved() {
+                    self.last_error = None;
+                }
                 self.view = Some(v);
                 ClientUpdate::View
             }
             DataEvent::Patch(p) => {
                 if let Some(v) = self.view.as_mut() {
                     apply_all(v, &p);
+                    if v.auth.is_resolved() {
+                        self.last_error = None;
+                    }
                 }
                 ClientUpdate::View
             }
@@ -122,7 +144,10 @@ impl DataClient {
             DataEvent::Error(UiError::VersionMismatch { expected, found }) => {
                 self.mismatch(expected, found)
             }
-            DataEvent::Error(e) => ClientUpdate::Error(e),
+            DataEvent::Error(e) => {
+                self.last_error = Some(e.clone());
+                ClientUpdate::Error(e)
+            }
         }
     }
 
