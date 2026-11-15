@@ -878,10 +878,22 @@ fn u15_ios_safari_viewport_safety_and_filter_font_size_invariant() {
 #[test]
 fn u16_tokens_css_distribution_drift_and_synchronization() {
     let generated = tokens_css();
-    let checked_in_dist = include_str!("../dist/tokens.css");
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let parent_root = manifest_dir.join("../..");
+    let target_tokens = if parent_root.join("scripts/build-dist.sh").is_file()
+        && parent_root.join("code/Cargo.toml").is_file()
+    {
+        parent_root.join("dist/tokens.css")
+    } else {
+        manifest_dir.join("dist/tokens.css")
+    };
+    let checked_in_dist = std::fs::read_to_string(&target_tokens)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", target_tokens.display()));
     assert_eq!(
-        generated, checked_in_dist,
-        "dist/tokens.css drifted from mu_console_theme::css::tokens_css()"
+        generated,
+        checked_in_dist,
+        "{} drifted from mu_console_theme::css::tokens_css()",
+        target_tokens.display()
     );
 }
 

@@ -738,6 +738,14 @@ fn test_cold_boot_session_probe_failure_surfaces_retry_and_sign_out_without_sign
         let shell = render_html_shell(&html, &st);
         assert!(shell.contains("Session verification failed"));
         assert!(shell.contains("HTTP 404"));
+        assert!(!shell.contains("Session verification failedHTTP 404"));
+        assert_eq!(
+            shell
+                .matches(r#"data-control-id="session-probe-retry""#)
+                .count(),
+            1,
+            "cold-boot session error must render a unique Retry control"
+        );
         assert!(shell.contains("session-probe-retry"));
         assert!(shell.contains(r#"href="/oauth2/sign_out?rd=%2F""#));
         assert!(!shell.contains("Sign in required"));
