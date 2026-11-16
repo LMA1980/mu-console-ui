@@ -63,6 +63,7 @@ fn sync_browser_state(st: &mut ConsoleState) {
     if let Some(doc_el) = win.document().and_then(|d| d.document_element()) {
         let _ = doc_el.set_attribute("lang", "en");
         let _ = doc_el.set_attribute("data-skin", skin_slug(st.effective_skin()));
+        let _ = doc_el.set_attribute("data-crt-font", font_slug(st.font));
     }
 
     let desired_hash = format_hash(&st.route);
@@ -126,11 +127,14 @@ fn ensure_dyslexic_stylesheet(doc: &web_sys::Document) {
     }
     if let Ok(style) = doc.create_element("style") {
         style.set_id("muconsole-dyslexic-font");
-        style.set_text_content(Some(
-            "@font-face{font-family:'OpenDyslexicM Nerd Font Mono';src:url('/fonts/OpenDyslexicMNerdFontMono-Regular.woff2') format('woff2');font-display:swap;}",
-        ));
-        if let Some(body) = doc.body() {
-            let _ = body.append_child(&style);
+        style.set_text_content(Some(crate::components::DYSLEXIC_FONT_FACE_CSS));
+        if let Some(parent) = doc
+            .query_selector("head")
+            .ok()
+            .flatten()
+            .or_else(|| doc.body().map(Into::into))
+        {
+            let _ = parent.append_child(&style);
         }
     }
 }
@@ -200,6 +204,7 @@ fn repaint(st: &ConsoleState) {
     let eff_skin = st.effective_skin();
     if let Some(doc_el) = doc.document_element() {
         let _ = doc_el.set_attribute("data-skin", skin_slug(eff_skin));
+        let _ = doc_el.set_attribute("data-crt-font", font_slug(st.font));
     }
 
     let vp = window_viewport(&win);
@@ -239,7 +244,13 @@ fn repaint(st: &ConsoleState) {
 
         if let Some(shell) = doc.get_element_by_id("muconsole-shell") {
             let auth_slug = auth_status_slug(auth.status);
+            let font_css = crate::components::font_stack_css(st.font);
             let _ = shell.set_attribute("data-crt-font", font_slug(st.font));
+            let _ = shell.set_attribute("data-font", font_css);
+            let _ = shell.set_attribute(
+                "style",
+                &format!("--font-crt:{font_css};--font-active:{font_css}"),
+            );
             let _ = shell.set_attribute("data-skin", skin_slug(eff_skin));
             let _ = shell.set_attribute(
                 "data-lazy-dyslexic",
@@ -253,6 +264,9 @@ fn repaint(st: &ConsoleState) {
             let _ = shell.set_attribute("data-subview", st.route.subview.slug());
             let _ = shell.set_attribute("data-auth-state", auth_slug);
 
+            if let Some(font_btn) = doc.get_element_by_id("muconsole-font-toggle") {
+                font_btn.set_text_content(Some(&crate::components::font_toggle_label(st.font)));
+            }
             if let Some(roles_btn) = doc.get_element_by_id("muconsole-roles-btn") {
                 roles_btn.set_text_content(Some(&st.format_header_roles()));
             }
@@ -1102,6 +1116,8 @@ pub fn start() {
     {
         let st = state.borrow();
         send(&worker, &UiCommand::Configure(cfg));
+        send(&worker, &UiCommand::SetCrtFont(st.font));
+        send(&worker, &UiCommand::SetSkin(st.skin));
         if let Some(token) = stored_invite {
             send(&worker, &UiCommand::RedeemInvite { token });
         }

@@ -16,7 +16,7 @@ use mu_console_protocol::{
     GateOutcome, ModelRunnerSubView, ObservabilitySubView, PackageEcosystem, PlatformSubView,
     RepoStatus, RepositorySubView, RiskConfirmAction, RoleActivationKind, Slot, StageState,
     StepUpRequirement, SubView, SubsystemHealthEntry, SubsystemId, SubsystemStatus, TestState,
-    UiError, UserProfileTab, Visibility,
+    UiError, Visibility,
 };
 use mu_console_theme::scene::{
     self as theme_scene, ActionControl, ConsoleScene, GateChecklist, GateItem,
@@ -353,14 +353,7 @@ pub fn build_dialog_model(state: &ConsoleState) -> Option<theme_scene::DialogMod
                     )
                     .disabled(!has_timed),
                 ),
-                manage_passkeys_action: Some(
-                    ActionControl::new(
-                        "profile-tab:passkeys",
-                        copy::TAB_PASSKEYS,
-                        "profile-tab:passkeys",
-                    )
-                    .with_pressed(state.profile_tab == UserProfileTab::Passkeys),
-                ),
+                manage_passkeys_action: None,
                 sign_out_action: Some(
                     ActionControl::new("profile-signout", copy::SIGN_OUT_LABEL, "profile-signout")
                         .with_attr("data-href", state.sign_out_href()),

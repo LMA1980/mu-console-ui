@@ -497,6 +497,12 @@ impl ConsoleState {
     pub fn init_from_env(&mut self, hash: &str, search: &str, stored_font: Option<&str>) {
         self.apply_hash(hash);
         self.font = parse_font_pref(search, stored_font);
+        if find_query_param(search, "font").is_some()
+            || find_query_param(search, "dyslexic").is_some()
+            || stored_font.is_some_and(|s| !s.trim().is_empty())
+        {
+            self.prefs_dirty = true;
+        }
         if self.font == CrtFont::OpenDyslexic {
             self.lazy_dyslexic_loaded = true;
         }
@@ -518,6 +524,9 @@ impl ConsoleState {
             } else if val.eq_ignore_ascii_case("html") {
                 self.url_skin_override = Some(ConsoleSkin::Html);
             }
+            self.prefs_dirty = true;
+        } else if stored_skin.is_some_and(|s| !s.trim().is_empty()) {
+            self.prefs_dirty = true;
         }
         self.skin = parse_skin_pref(search, stored_skin);
     }
@@ -1241,6 +1250,29 @@ impl ConsoleState {
         Vec::new()
     }
 
+    fn select_profile_font(&mut self, font: CrtFont) -> Vec<UiCommand> {
+        let status = self.auth().status;
+        if !matches!(
+            status,
+            AuthStatus::Active | AuthStatus::PasskeyEnrollmentRequired
+        ) {
+            return Vec::new();
+        }
+        let cmd = self.set_font(font);
+        if status == AuthStatus::Active {
+            vec![
+                cmd,
+                UiCommand::UpdateUserProfile {
+                    display_name: None,
+                    preferred_skin: None,
+                    preferred_font: Some(font),
+                },
+            ]
+        } else {
+            vec![cmd]
+        }
+    }
+
     /// Open `@user` Profile modal (`User Details | Preferences | Passkeys`).
     pub fn open_user_profile(&mut self, tab: UserProfileTab) -> Vec<UiCommand> {
         let auth = self.auth();
@@ -1702,34 +1734,8 @@ impl ConsoleState {
                     },
                 ]
             }
-            "profile-font:hurmit" => {
-                if self.auth().status != AuthStatus::Active {
-                    return Vec::new();
-                }
-                let cmd = self.set_font(CrtFont::Hurmit);
-                vec![
-                    cmd,
-                    UiCommand::UpdateUserProfile {
-                        display_name: None,
-                        preferred_skin: None,
-                        preferred_font: Some(CrtFont::Hurmit),
-                    },
-                ]
-            }
-            "profile-font:dyslexic" => {
-                if self.auth().status != AuthStatus::Active {
-                    return Vec::new();
-                }
-                let cmd = self.set_font(CrtFont::OpenDyslexic);
-                vec![
-                    cmd,
-                    UiCommand::UpdateUserProfile {
-                        display_name: None,
-                        preferred_skin: None,
-                        preferred_font: Some(CrtFont::OpenDyslexic),
-                    },
-                ]
-            }
+            "profile-font:hurmit" => self.select_profile_font(CrtFont::Hurmit),
+            "profile-font:dyslexic" => self.select_profile_font(CrtFont::OpenDyslexic),
             "hdr-role" | "open-session-roles" => self.open_session_roles(),
             "roles-lock-all" | "profile-lock-timed" => {
                 if self.auth().status != AuthStatus::Active {
