@@ -63,7 +63,23 @@ fn enrich_html_dialog(html: String, state: &ConsoleState) -> String {
         return html;
     };
     if matches!(dlg, ProtoDialogModel::PasskeyEnrollmentGate(_)) {
-        return html;
+        let mut out = html;
+        let steps = r##"<ol class="mu-passkey-steps"><li>Select <strong>Register Passkey</strong> below to launch your passkey prompt.</li><li>Approve in 1Password, your browser or OS passkey manager, or touch a FIDO2 security key.</li><li>Select <strong>Not Now</strong> (or press Escape) to browse public Dashboard and CI views first, then enroll anytime via <strong>@user -&gt; Passkeys</strong>.</li></ol>"##;
+        if let Some(idx) = out.find("<div class=\"mu-dialog-footer\">") {
+            out.insert_str(idx, steps);
+        }
+        if !out.contains("dlg-passkey-dismiss") {
+            if let Some(footer_idx) = out.find("<div class=\"mu-dialog-footer\">") {
+                if let Some(rel_end) = out[footer_idx..].find("</button>") {
+                    let insert_at = footer_idx + rel_end + "</button>".len();
+                    out.insert_str(
+                        insert_at,
+                        r##"<button type="button" class="mu-btn" data-control-id="dlg-passkey-dismiss" data-action="dlg-passkey-dismiss">Not Now</button>"##,
+                    );
+                }
+            }
+        }
+        return out;
     }
 
     match dlg {
@@ -254,7 +270,8 @@ pub fn render_html_shell(content: &str, state: &ConsoleState) -> String {
         }
         AuthStatus::PasskeyEnrollmentRequired | AuthStatus::Active => {
             // Active sessions remove `[Aa]` from the top bar and surface `@user` + `+role[rem][idle]`.
-            let gated_attr = if auth.passkey_enrollment_required
+            // Keep `@user` enabled during 0-Passkey onboarding so Passkey setup stays reachable.
+            let role_gated_attr = if auth.passkey_enrollment_required
                 || auth.status == AuthStatus::PasskeyEnrollmentRequired
             {
                 " disabled=\"disabled\" aria-disabled=\"true\""
@@ -265,7 +282,7 @@ pub fn render_html_shell(content: &str, state: &ConsoleState) -> String {
             let roles_text = escape_html(&state.format_header_roles());
             let href = escape_html(&state.sign_out_href());
             format!(
-                r##"<button id="muconsole-user-btn" type="button" data-control-id="hdr-user" data-action="hdr-user"{gated_attr}>@{handle}</button><button id="muconsole-roles-btn" type="button" data-control-id="hdr-role" data-action="hdr-role"{gated_attr}>{roles_text}</button><a id="muconsole-auth-link" href="{href}" data-auth-state="active">{}</a>"##,
+                r##"<button id="muconsole-user-btn" type="button" data-control-id="hdr-user" data-action="hdr-user">@{handle}</button><button id="muconsole-roles-btn" type="button" data-control-id="hdr-role" data-action="hdr-role"{role_gated_attr}>{roles_text}</button><a id="muconsole-auth-link" href="{href}" data-auth-state="active">{}</a>"##,
                 escape_html(copy::SIGN_OUT_LABEL),
             )
         }

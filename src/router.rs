@@ -33,10 +33,20 @@ pub fn parse_subview(area: Area, slug: &str) -> Option<SubView> {
     SubView::from_area_and_slug(area, slug)
 }
 
+fn normalize_hash_input(hash: &str) -> &str {
+    let trimmed = hash.trim();
+    if trimmed.starts_with("/#") {
+        // Strip leading '/' before '#' so Route::try_from_hash receives "#/..."
+        &trimmed[1..]
+    } else {
+        trimmed
+    }
+}
+
 /// Return `true` when `hash` explicitly names an area path (as opposed to bare `/` or `#/`).
 #[must_use]
 pub fn has_explicit_route(hash: &str) -> bool {
-    let trimmed = hash.trim();
+    let trimmed = normalize_hash_input(hash);
     let no_hash = trimmed.strip_prefix('#').unwrap_or(trimmed);
     let path = match no_hash.split_once('?') {
         Some((p, _)) => p,
@@ -45,7 +55,7 @@ pub fn has_explicit_route(hash: &str) -> bool {
     !path.trim_matches('/').is_empty()
 }
 
-fn percent_decode_lossy(raw: &str) -> String {
+pub(crate) fn percent_decode_lossy(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -99,11 +109,11 @@ fn parse_query_params(route: &mut Route, query: &str) {
 /// cleanly to their canonical v6 targets.
 #[must_use]
 pub fn parse_hash(hash: &str) -> Route {
-    if let Some(mut route) = Route::try_from_hash(hash) {
-        if let Some((_, query)) = hash
-            .trim()
+    let normalized = normalize_hash_input(hash);
+    if let Some(mut route) = Route::try_from_hash(normalized) {
+        if let Some((_, query)) = normalized
             .strip_prefix('#')
-            .unwrap_or(hash.trim())
+            .unwrap_or(normalized)
             .split_once('?')
         {
             route.submodule = None;
@@ -116,8 +126,7 @@ pub fn parse_hash(hash: &str) -> Route {
     }
 
     let mut route = Route::default();
-    let trimmed = hash.trim();
-    let no_hash = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    let no_hash = normalized.strip_prefix('#').unwrap_or(normalized);
     if let Some((_, query)) = no_hash.split_once('?') {
         parse_query_params(&mut route, query);
     }
@@ -157,27 +166,72 @@ pub fn escape_up(route: &Route) -> Route {
     next
 }
 
+const BASELINE_PUBLIC_POLICIES: [&str; 3] = [
+    "system:status.read",
+    "ci:queue.read",
+    "ci:repos.public.read",
+];
+
+/// Evaluate effective policy membership, preserving baseline public read capabilities for
+/// non-lockdown `0`-Passkey sessions (`PasskeyEnrollmentRequired`) until operator enrollment completes.
+#[must_use]
+pub(crate) fn effective_has_policy(auth: &AuthState, policy: &str) -> bool {
+    if !auth.is_resolved() || auth.anonymous_lockdown {
+        return false;
+    }
+    if auth.has_policy(policy) {
+        return true;
+    }
+    if auth.status == AuthStatus::PasskeyEnrollmentRequired {
+        if auth.active_policies.is_empty() {
+            return BASELINE_PUBLIC_POLICIES.contains(&policy);
+        }
+        return auth.active_policies.iter().any(|p| p == policy);
+    }
+    false
+}
+
+/// Evaluate effective minimal area access across all 8 areas, allowing baseline public Dashboard
+/// and CI navigation for non-lockdown `0`-Passkey sessions.
+#[must_use]
+pub(crate) fn effective_can_access_area(auth: &AuthState, area: Area) -> bool {
+    if !auth.is_resolved() || auth.anonymous_lockdown {
+        return false;
+    }
+    if auth.can_access_area(area) {
+        return true;
+    }
+    if auth.status == AuthStatus::PasskeyEnrollmentRequired {
+        let prefix = area.subsystem().policy_prefix();
+        return BASELINE_PUBLIC_POLICIES
+            .iter()
+            .copied()
+            .chain(auth.active_policies.iter().map(String::as_str))
+            .any(|p| p.split(':').next() == Some(prefix));
+    }
+    false
+}
+
 /// Return whether any active role in `auth` satisfies the minimal-access requirement for `subview`.
 ///
-/// Cold-boot unresolved sessions, locked-down anonymous sessions, and mandatory 0-Passkey gates
-/// fail closed across every sub-view. Unauthenticated browsing is limited to Dashboard and
-/// `CI > Queue & Job Steps` when permitted by `RoleFolioIndex["anonymous"]`.
+/// Cold-boot unresolved sessions and `anonymous_lockdown` sessions fail closed across every sub-view.
+/// Unauthenticated browsing and `0`-Passkey pre-enrollment sessions retain public Dashboard and CI views
+/// when `!anonymous_lockdown`, while operator/step-up areas unlock on Passkey enrollment.
 #[must_use]
 pub fn can_access_subview(auth: &AuthState, subview: SubView) -> bool {
-    if !auth.is_resolved()
-        || auth.status == AuthStatus::PasskeyEnrollmentRequired
-        || auth.anonymous_lockdown
-        || !auth.can_access_area(subview.area())
-    {
+    if !effective_can_access_area(auth, subview.area()) {
         return false;
     }
 
-    let has_any = |policies: &[&str]| policies.iter().any(|p| auth.has_policy(p));
-    if auth.status != AuthStatus::Active {
+    let has_any = |policies: &[&str]| policies.iter().any(|p| effective_has_policy(auth, p));
+    if matches!(
+        auth.status,
+        AuthStatus::Anonymous | AuthStatus::AuthorizationDenied
+    ) {
         return match subview {
             SubView::Dashboard(DashboardSubView::Overview) => {
                 has_any(&["system:dashboard.read", "system:status.read"])
-                    || auth.can_access_area(Area::Dashboard)
+                    || effective_can_access_area(auth, Area::Dashboard)
             }
             SubView::Ci(CiSubView::QueueLogs) => has_any(&[
                 "ci:queue.read",
@@ -192,7 +246,7 @@ pub fn can_access_subview(auth: &AuthState, subview: SubView) -> bool {
     match subview {
         SubView::Dashboard(DashboardSubView::Overview) => {
             has_any(&["system:dashboard.read", "system:status.read"])
-                || auth.can_access_area(Area::Dashboard)
+                || effective_can_access_area(auth, Area::Dashboard)
         }
         SubView::Ci(CiSubView::Scorecards) => has_any(&[
             "ci:queue.read",

@@ -14,15 +14,16 @@ use mu_console_data::scenario::Scenario;
 use mu_console_layout::Viewport;
 use mu_console_protocol::dto::AuthSessionDto;
 use mu_console_protocol::{
-    encode, Area, AuthReasonCode, AuthState, AuthStatus, ConsoleSkin, DataEvent, Delta, UiCommand,
-    UiError, ViewModel, WorkerConfig,
+    encode, Area, AuthReasonCode, AuthState, AuthStatus, CiSubView, ConsoleSkin, DataEvent, Delta,
+    RepoId, SubView, UiCommand, UiError, ViewModel, WorkerConfig,
 };
 use mu_console_ui::client::WORKER_URL;
 use mu_console_ui::components::{render_console_with_skin, render_html_shell};
 use mu_console_ui::state::{
     extract_invite_token, format_sign_in_url, format_sign_out_url, validate_sign_in_href,
-    ConsoleState, PENDING_INVITE_STORAGE_KEY,
+    ConsoleState, WebAuthnRequest, PENDING_INVITE_STORAGE_KEY,
 };
+use mu_console_ui::webauthn::{register_start_body, wrap_credential_envelope_json};
 
 fn anon_auth() -> AuthState {
     AuthState::anonymous(vec!["ci:jobs.read".into()])
@@ -821,5 +822,122 @@ fn test_authorization_denied_with_anonymous_lockdown_renders_sign_out_not_sign_i
         vec![UiCommand::Navigate {
             href: "/oauth2/sign_out?rd=%2F".into()
         }]
+    );
+}
+
+#[test]
+fn test_stashed_deep_link_hash_normalizes_oauth2_rd_and_restores_route() {
+    let mut st = initialized_state();
+    st.stashed_deep_link = Some("#/ci/scorecards?repo=LMA1980/ActionRunner-controller".into());
+
+    let href = st.sign_in_href();
+    assert_eq!(
+        href,
+        "/oauth2/start?rd=%2F%23%2Fci%2Fscorecards%3Frepo%3DLMA1980%2FActionRunner-controller"
+    );
+    assert!(
+        validate_sign_in_href(&href).is_ok(),
+        "normalized root-relative deep-link rd must pass validation: {href}"
+    );
+
+    // Reject bare hash, protocol-relative, and /oauth2* self-loop rd parameters.
+    assert!(validate_sign_in_href("/oauth2/start?rd=%23%2Fci%2Fscorecards").is_err());
+    assert!(validate_sign_in_href("/oauth2/start?rd=%2F%2Fattacker.example").is_err());
+    assert!(validate_sign_in_href("/oauth2/start?rd=%2Foauth2%2Fstart").is_err());
+    assert!(validate_sign_in_href("/oauth2/start?rd=%2Foauth2%2Fcallback").is_err());
+
+    // Transition to Active restores Ci > Scorecards with LMA1980/ActionRunner-controller.
+    let active_patch =
+        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(active_auth("alice"))]))
+            .expect("encode active auth patch");
+    st.on_worker_frame(&active_patch);
+    assert_eq!(st.auth().status, AuthStatus::Active);
+    assert_eq!(st.route.area, Area::Ci);
+    assert_eq!(st.route.subview, SubView::Ci(CiSubView::Scorecards));
+    assert_eq!(
+        st.route.repo,
+        Some(RepoId::new("LMA1980", "ActionRunner-controller"))
+    );
+}
+
+#[test]
+fn test_passkey_gate_surfaces_webauthn_errors_and_queues_step_up_when_active() {
+    let mut st = ConsoleState::new();
+    let gate_vm = ViewModel {
+        auth: AuthState::from_session(&AuthSessionDto {
+            authenticated: true,
+            invite_bound: true,
+            github_login: Some("alice".into()),
+            passkey_count: 0,
+            passkey_enrollment_required: true,
+            reason_code: Some(AuthReasonCode::PasskeyEnrollmentRequired),
+            ..AuthSessionDto::default()
+        }),
+        ..ViewModel::default()
+    };
+    let gate_snap = encode(&DataEvent::Snapshot(gate_vm)).expect("encode gate snapshot");
+    st.on_worker_frame(&gate_snap);
+
+    // Clicking dlg-passkey-register queues registration without step-up when passkey_count == 0.
+    let cmds = st.on_dom_action("data-control-id", "dlg-passkey-register", false, 10);
+    assert!(cmds.is_empty());
+    assert_eq!(
+        st.pending_webauthn.take(),
+        Some(WebAuthnRequest::RegisterPasskey {
+            label: Some("Security Key".into()),
+            requires_step_up: false,
+        })
+    );
+
+    // WebAuthn ceremony error updates aria_assertive and renders in HTML and valid XML Wireframe.
+    st.on_webauthn_error("NotAllowedError: user cancelled ceremony");
+    assert!(st
+        .aria_assertive
+        .contains("NotAllowedError: user cancelled ceremony"));
+
+    for (w, h) in [(360.0, 640.0), (1280.0, 800.0)] {
+        let vp = Viewport::new(w, h);
+        let html = render_console_with_skin(ConsoleSkin::Html, &st, vp);
+        assert!(html.contains("banner-webauthn-error"));
+        assert!(html.contains("NotAllowedError: user cancelled ceremony"));
+        assert!(!html.to_ascii_lowercase().contains("invite"));
+
+        let svg = render_console_with_skin(ConsoleSkin::Wireframe, &st, vp);
+        roxmltree::Document::parse(&svg).expect("wireframe passkey error SVG must be valid XML");
+        assert!(svg.contains("NotAllowedError: user cancelled ceremony"));
+        assert!(!svg.to_ascii_lowercase().contains("invite"));
+    }
+
+    // Retrying clears stale error.
+    let _ = st.on_dom_action("data-control-id", "dlg-passkey-register", false, 20);
+    assert!(st.webauthn_error.is_none());
+    let _ = st.pending_webauthn.take();
+
+    // Active session with passkey_count == 1 queues step-up for profile-passkey-add.
+    let active_patch =
+        Engine::encode_event(&DataEvent::Patch(vec![Delta::Auth(active_auth("alice"))]))
+            .expect("encode active auth");
+    st.on_worker_frame(&active_patch);
+    let _ = st.on_dom_action("data-control-id", "profile-passkey-add", false, 30);
+    assert_eq!(
+        st.pending_webauthn.take(),
+        Some(WebAuthnRequest::RegisterPasskey {
+            label: Some("Security Key".into()),
+            requires_step_up: true,
+        })
+    );
+
+    // Envelope helpers format controller-compatible JSON.
+    let start = register_start_body(
+        Some("Security Key"),
+        Some("ch-step"),
+        Some(r#"{"id":"pk0","type":"public-key"}"#),
+    );
+    assert!(start.contains(r#""step_up_challenge_id":"ch-step""#));
+    assert!(start.contains(r#""step_up_credential":{"id":"pk0","type":"public-key"}"#));
+    let finish = wrap_credential_envelope_json(Some("ch-reg"), r#"{"id":"pk1"}"#);
+    assert_eq!(
+        finish,
+        r#"{"challenge_id":"ch-reg","credential":{"id":"pk1"}}"#
     );
 }

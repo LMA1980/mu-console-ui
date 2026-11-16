@@ -19,7 +19,10 @@ use crate::copy;
 use crate::roles::{
     expire_timed_leases, format_active_roles, redirect_if_lacking_access, touch_active_leases,
 };
-use crate::router::{can_access_subview, escape_up, format_hash, has_explicit_route, parse_hash};
+use crate::router::{
+    can_access_subview, escape_up, format_hash, has_explicit_route, parse_hash,
+    percent_decode_lossy,
+};
 
 /// Browser `localStorage` key storing the `Hurmit` / `OpenDyslexicM` preference.
 pub const FONT_STORAGE_KEY: &str = "muconsole.dyslexia_font";
@@ -66,9 +69,16 @@ pub const ACTION_ATTRS: [&str; 22] = [
 /// Browser WebAuthn ceremony queued for execution by `crate::boot`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebAuthnRequest {
-    RegisterPasskey { label: Option<String> },
-    ElevateTimedRole { role_id: String },
-    RemovePasskey { credential_id: String },
+    RegisterPasskey {
+        label: Option<String>,
+        requires_step_up: bool,
+    },
+    ElevateTimedRole {
+        role_id: String,
+    },
+    RemovePasskey {
+        credential_id: String,
+    },
 }
 
 /// Editable draft inputs maintained by the UI for `@user` profile, A|B rollback note,
@@ -196,21 +206,46 @@ pub fn percent_encode(s: &str) -> String {
     out
 }
 
+fn is_non_oauth_root_relative_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && path != "/oauth2"
+        && !path.starts_with("/oauth2/")
+        && !path.starts_with("/oauth2?")
+}
+
+fn normalize_oauth_return_path(rd: &str) -> String {
+    if rd.contains('\r') || rd.contains('\n') {
+        return "/".to_owned();
+    }
+    let trimmed = rd.trim();
+    if trimmed.is_empty() {
+        return "/".to_owned();
+    }
+    if trimmed.starts_with('#') || trimmed.starts_with('?') {
+        return format!("/{trimmed}");
+    }
+    if !is_non_oauth_root_relative_path(trimmed) {
+        return "/".to_owned();
+    }
+    trimmed.to_owned()
+}
+
 /// Construct a validated `/oauth2/start?rd=...` redirect URL.
 #[must_use]
 pub fn format_sign_in_url(rd: &str) -> String {
-    let normalized = if rd.is_empty() { "/" } else { rd };
-    format!("/oauth2/start?rd={}", percent_encode(normalized))
+    let normalized = normalize_oauth_return_path(rd);
+    format!("/oauth2/start?rd={}", percent_encode(&normalized))
 }
 
 /// Construct a validated `/oauth2/sign_out?rd=...` sign-out URL.
 #[must_use]
 pub fn format_sign_out_url(rd: &str) -> String {
-    let normalized = if rd.is_empty() { "/" } else { rd };
-    format!("/oauth2/sign_out?rd={}", percent_encode(normalized))
+    let normalized = normalize_oauth_return_path(rd);
+    format!("/oauth2/sign_out?rd={}", percent_encode(&normalized))
 }
 
-/// Reject malformed sign-in URLs (missing `rd=`, unencoded parameters, empty `rd`).
+/// Reject malformed sign-in URLs (missing `rd=`, unencoded parameters, empty or non-root-relative `rd`).
 pub fn validate_sign_in_href(href: &str) -> Result<(), &'static str> {
     let (path, query) = href.split_once('?').ok_or("missing query string")?;
     if path != "/oauth2/start" {
@@ -228,6 +263,13 @@ pub fn validate_sign_in_href(href: &str) -> Result<(), &'static str> {
     }
     if rd_val.contains('&') || rd_val.contains('=') {
         return Err("unencoded nested delimiter in rd parameter");
+    }
+    let decoded = percent_decode_lossy(rd_val);
+    if decoded.contains('\r')
+        || decoded.contains('\n')
+        || !is_non_oauth_root_relative_path(&decoded)
+    {
+        return Err("rd parameter must be a root-relative non-oauth2 path");
     }
     Ok(())
 }
@@ -358,16 +400,19 @@ pub struct ConsoleState {
     pub pending_navigation: Option<String>,
     pub pending_external_url: Option<String>,
     pub pending_webauthn: Option<WebAuthnRequest>,
+    pub webauthn_error: Option<String>,
     pub stashed_deep_link: Option<String>,
     pub has_explicit_hash: bool,
     pub route_sync_dirty: bool,
     pub prefs_dirty: bool,
     pub local_dialog: Option<DialogModel>,
+    pub passkey_gate_dismissed: bool,
     pub profile_tab: UserProfileTab,
     pub profile_display_name_draft: String,
     pub profile_passkey_label_draft: String,
     pub platform_form: PlatformFormState,
     prev_auth_status: AuthStatus,
+    prev_github_login: Option<String>,
     prev_lease_ids: Vec<String>,
     last_lease_tick_ms: u64,
     last_activity_at_ms: u64,
@@ -429,16 +474,19 @@ impl ConsoleState {
             pending_navigation: None,
             pending_external_url: None,
             pending_webauthn: None,
+            webauthn_error: None,
             stashed_deep_link: None,
             has_explicit_hash: false,
             route_sync_dirty: false,
             prefs_dirty: false,
             local_dialog: None,
+            passkey_gate_dismissed: false,
             profile_tab: UserProfileTab::UserDetails,
             profile_display_name_draft: String::new(),
             profile_passkey_label_draft: "Security Key".into(),
             platform_form: PlatformFormState::default(),
             prev_auth_status: AuthStatus::Unresolved,
+            prev_github_login: None,
             prev_lease_ids: Vec::new(),
             last_lease_tick_ms: 0,
             last_activity_at_ms: 0,
@@ -553,11 +601,7 @@ impl ConsoleState {
     /// Check whether `area` is enabled for the active session.
     #[must_use]
     pub fn can_access_area(&self, area: Area) -> bool {
-        let auth = self.auth();
-        auth.is_resolved()
-            && auth.status != AuthStatus::PasskeyEnrollmentRequired
-            && !auth.anonymous_lockdown
-            && auth.can_access_area(area)
+        crate::router::effective_can_access_area(&self.auth(), area)
     }
 
     /// Check whether `subview` satisfies minimal active-role access requirements.
@@ -650,11 +694,24 @@ impl ConsoleState {
         self.set_skin(next)
     }
 
-    /// Resolve active dialog (enforcing mandatory `0`-Passkey gate above all dismissible dialogs).
+    /// Resolve active dialog (`UserProfile` and other modals take precedence; `PasskeyEnrollmentGate`
+    /// auto-opens when `passkey_count == 0` unless dismissed via `Not Now` / `Escape`).
     #[must_use]
     pub fn active_dialog(&self) -> Option<DialogModel> {
+        if let Some(ref local) = self.local_dialog {
+            return Some(local.clone());
+        }
+        if let Some(worker_dlg) = self.client.view().and_then(|v| v.active_dialog.as_ref()) {
+            if !matches!(worker_dlg, DialogModel::PasskeyEnrollmentGate(_))
+                || !self.passkey_gate_dismissed
+            {
+                return Some(worker_dlg.clone());
+            }
+        }
         let auth = self.auth();
-        if auth.passkey_enrollment_required || auth.status == AuthStatus::PasskeyEnrollmentRequired
+        if !self.passkey_gate_dismissed
+            && (auth.passkey_enrollment_required
+                || auth.status == AuthStatus::PasskeyEnrollmentRequired)
         {
             return Some(DialogModel::PasskeyEnrollmentGate(
                 PasskeyEnrollmentGateModel {
@@ -664,10 +721,7 @@ impl ConsoleState {
                 },
             ));
         }
-        if let Some(worker_dlg) = self.client.view().and_then(|v| v.active_dialog.as_ref()) {
-            return Some(worker_dlg.clone());
-        }
-        self.local_dialog.clone()
+        None
     }
 
     /// Currently active CI job ID selected by route, train, or queue summary.
@@ -737,6 +791,13 @@ impl ConsoleState {
         Some(UiCommand::ResumeJob { job_id })
     }
 
+    /// Record a WebAuthn browser/endpoint ceremony error for accessible status & banner feedback.
+    pub fn on_webauthn_error(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.aria_assertive = format!("Passkey ceremony failed: {msg}");
+        self.webauthn_error = Some(msg);
+    }
+
     /// Apply decoded postcard frame from the data worker and handle auth/expiry route transitions.
     pub fn on_worker_frame(&mut self, frame: &[u8]) -> ClientUpdate {
         let update = self.client.on_frame(frame);
@@ -793,6 +854,20 @@ impl ConsoleState {
 
         // Post-login landing (#50): keep route if permitted, or fall back to Dashboard if
         // stashed deep link requires a dormant role.
+        if next_status != AuthStatus::PasskeyEnrollmentRequired
+            || (self.prev_auth_status != AuthStatus::Unresolved
+                && self.prev_github_login != view.auth.github_login)
+        {
+            self.passkey_gate_dismissed = false;
+        }
+        if next_status == AuthStatus::Active
+            || !matches!(
+                next_status,
+                AuthStatus::PasskeyEnrollmentRequired | AuthStatus::Active
+            )
+        {
+            self.webauthn_error = None;
+        }
         if self.prev_auth_status != AuthStatus::Active && next_status == AuthStatus::Active {
             if let Some(stashed) = self.stashed_deep_link.take() {
                 let parsed = parse_hash(&stashed);
@@ -807,6 +882,7 @@ impl ConsoleState {
         }
 
         self.prev_auth_status = next_status;
+        self.prev_github_login.clone_from(&view.auth.github_login);
         self.prev_lease_ids = next_lease_ids;
         self.sync_rotary_from_route();
     }
@@ -815,10 +891,7 @@ impl ConsoleState {
     #[must_use]
     pub fn filtered_repos(&self) -> Vec<RepoScore> {
         let auth = self.auth();
-        if !auth.is_resolved()
-            || auth.status == AuthStatus::PasskeyEnrollmentRequired
-            || auth.anonymous_lockdown
-        {
+        if !auth.is_resolved() || auth.anonymous_lockdown {
             return Vec::new();
         }
         let allow_private =
@@ -883,10 +956,7 @@ impl ConsoleState {
     #[must_use]
     pub fn visible_ci_jobs(&self) -> Vec<CiJobSummary> {
         let auth = self.auth();
-        if !auth.is_resolved()
-            || auth.status == AuthStatus::PasskeyEnrollmentRequired
-            || auth.anonymous_lockdown
-        {
+        if !auth.is_resolved() || auth.anonymous_lockdown {
             return Vec::new();
         }
         let allow_private =
@@ -1174,8 +1244,14 @@ impl ConsoleState {
     /// Open `@user` Profile modal (`User Details | Preferences | Passkeys`).
     pub fn open_user_profile(&mut self, tab: UserProfileTab) -> Vec<UiCommand> {
         let auth = self.auth();
-        if auth.status != AuthStatus::Active {
+        if !matches!(
+            auth.status,
+            AuthStatus::Active | AuthStatus::PasskeyEnrollmentRequired
+        ) {
             return Vec::new();
+        }
+        if auth.status == AuthStatus::PasskeyEnrollmentRequired {
+            self.passkey_gate_dismissed = true;
         }
         self.profile_tab = tab;
         let profile = if let Some(p) = self.client.view().and_then(|v| v.user_profile.as_ref()) {
@@ -1414,6 +1490,7 @@ impl ConsoleState {
             if self.auth().status != AuthStatus::Active {
                 return Vec::new();
             }
+            self.webauthn_error = None;
             self.pending_webauthn = Some(WebAuthnRequest::ElevateTimedRole {
                 role_id: role_id.into(),
             });
@@ -1423,6 +1500,7 @@ impl ConsoleState {
             if self.auth().status != AuthStatus::Active {
                 return Vec::new();
             }
+            self.webauthn_error = None;
             self.pending_webauthn = Some(WebAuthnRequest::RemovePasskey {
                 credential_id: cred_id.into(),
             });
@@ -1554,22 +1632,44 @@ impl ConsoleState {
                 self.aria_polite = copy::LOADING_SESSION_TITLE.into();
                 vec![UiCommand::Retry]
             }
-            "dlg-passkey-register" | "register-passkey" | "profile-passkey-add" => {
+            "dlg-passkey-register"
+            | "register-passkey"
+            | "auth-gate-register-passkey"
+            | "hold-passkey-register"
+            | "profile-passkey-add" => {
+                let auth = self.auth();
                 if !matches!(
-                    self.auth().status,
+                    auth.status,
                     AuthStatus::PasskeyEnrollmentRequired | AuthStatus::Active
                 ) {
                     return Vec::new();
                 }
+                if matches!(id, "register-passkey" | "auth-gate-register-passkey") {
+                    self.passkey_gate_dismissed = false;
+                    self.local_dialog = None;
+                }
+                self.webauthn_error = None;
+                self.aria_polite = "Starting Passkey enrollment…".into();
+                let requires_step_up = auth.status == AuthStatus::Active && auth.passkey_count > 0;
                 let label = if self.profile_passkey_label_draft.trim().is_empty() {
                     None
                 } else {
                     Some(self.profile_passkey_label_draft.trim().to_owned())
                 };
-                self.pending_webauthn = Some(WebAuthnRequest::RegisterPasskey { label });
+                self.pending_webauthn = Some(WebAuthnRequest::RegisterPasskey {
+                    label,
+                    requires_step_up,
+                });
                 Vec::new()
             }
-            "hdr-user" | "open-profile" => self.open_user_profile(UserProfileTab::UserDetails),
+            "hdr-user" | "open-profile" => {
+                let default_tab = if self.auth().status == AuthStatus::PasskeyEnrollmentRequired {
+                    UserProfileTab::Passkeys
+                } else {
+                    UserProfileTab::UserDetails
+                };
+                self.open_user_profile(default_tab)
+            }
             "profile-tab:details" => self.open_user_profile(UserProfileTab::UserDetails),
             "profile-tab:preferences" => self.open_user_profile(UserProfileTab::Preferences),
             "profile-tab:passkeys" => self.open_user_profile(UserProfileTab::Passkeys),
@@ -1637,9 +1737,12 @@ impl ConsoleState {
                 }
                 vec![UiCommand::LockTimedRoles]
             }
-            "btn-cancel" | "btn-close" | "roles-close" | "btn-close-inv" | "dismiss-dialog" => {
-                self.dismiss_dialog()
-            }
+            "btn-cancel"
+            | "btn-close"
+            | "roles-close"
+            | "btn-close-inv"
+            | "dismiss-dialog"
+            | "dlg-passkey-dismiss" => self.dismiss_dialog(),
             "btn-confirm" | "confirm-risk" => self.confirm_risk_dialog(),
             "font-toggle" | "c2-font-switch" => vec![self.toggle_font()],
             "repo-prev" => {
@@ -1911,11 +2014,16 @@ impl ConsoleState {
         vec![cmd, UiCommand::CloseDialog]
     }
 
-    /// Dismiss active dialog when permitted (never bypasses mandatory `PasskeyEnrollmentGate`).
+    /// Dismiss active dialog (including `PasskeyEnrollmentGate` so 0-passkey users can browse public views).
     pub fn dismiss_dialog(&mut self) -> Vec<UiCommand> {
         let Some(dlg) = self.active_dialog() else {
             return Vec::new();
         };
+        if matches!(dlg, DialogModel::PasskeyEnrollmentGate(_)) {
+            self.passkey_gate_dismissed = true;
+            self.local_dialog = None;
+            return vec![UiCommand::CloseDialog];
+        }
         if !dlg.is_dismissible() {
             return Vec::new();
         }
@@ -1927,6 +2035,11 @@ impl ConsoleState {
     pub fn on_key(&mut self, key: &str, shift: bool, now_ms: u64) -> Option<UiCommand> {
         if key == "Escape" {
             if let Some(dlg) = self.active_dialog() {
+                if matches!(dlg, DialogModel::PasskeyEnrollmentGate(_)) {
+                    self.passkey_gate_dismissed = true;
+                    self.local_dialog = None;
+                    return Some(UiCommand::CloseDialog);
+                }
                 if dlg.is_dismissible() {
                     self.local_dialog = None;
                     return Some(UiCommand::CloseDialog);
@@ -2049,7 +2162,7 @@ mod tests {
     }
 
     #[test]
-    fn passkey_gate_cannot_be_dismissed_and_disabled_nav_is_inert() {
+    fn passkey_gate_auto_opens_dismisses_to_public_views_and_keeps_operator_nav_inert() {
         let mut st = ConsoleState::new();
         let vm = ViewModel {
             auth: AuthState {
@@ -2068,10 +2181,26 @@ mod tests {
             st.active_dialog(),
             Some(DialogModel::PasskeyEnrollmentGate(_))
         ));
-        assert!(st.dismiss_dialog().is_empty());
-        assert_eq!(st.on_key("Escape", false, 100), None);
+        assert_eq!(st.dismiss_dialog(), vec![UiCommand::CloseDialog]);
+        assert!(st.active_dialog().is_none());
 
-        // Disabled Platform click produces zero navigation/commands (#50).
+        // Re-opening banner/trigger brings back PasskeyEnrollmentGate cleanly; Escape dismisses it.
+        let _ = st.activate_target("register-passkey");
+        let _ = st.pending_webauthn.take();
+        assert!(matches!(
+            st.active_dialog(),
+            Some(DialogModel::PasskeyEnrollmentGate(_))
+        ));
+        assert_eq!(
+            st.on_key("Escape", false, 100),
+            Some(UiCommand::CloseDialog)
+        );
+        assert!(st.active_dialog().is_none());
+
+        // Public Dashboard & CI views are accessible; operator-only Platform stays inert.
+        assert!(st.can_access_area(Area::Dashboard));
+        assert!(st.can_access_area(Area::Ci));
+        assert!(!st.can_access_area(Area::Platform));
         assert!(st
             .on_dom_action("data-area", "platform", false, 200)
             .is_empty());

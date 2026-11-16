@@ -233,7 +233,8 @@ fn m2_50_51_authorization_denied_and_non_dismissible_passkey_gate() {
         .is_empty());
     assert!(denied.open_session_roles().is_empty());
 
-    // 0-Passkey mandatory gate -> cannot be dismissed via Escape or button, blocks all areas
+    // 0-Passkey guiding modal -> auto-opens with dismiss option, preserves baseline public
+    // Dashboard & CI access when not in anonymous_lockdown, while gating operator areas.
     let mut gate = ConsoleState::new();
     push_vm(
         &mut gate,
@@ -254,17 +255,34 @@ fn m2_50_51_authorization_denied_and_non_dismissible_passkey_gate() {
         gate.active_dialog(),
         Some(DialogModel::PasskeyEnrollmentGate(_))
     ));
-    assert!(gate.dismiss_dialog().is_empty());
-    assert!(gate.on_key("Escape", false, 1_000).is_none());
-    for area in Area::ALL {
-        assert!(!gate.can_access_area(area));
-    }
     let gate_html =
         render_console_with_skin(ConsoleSkin::Html, &gate, Viewport::new(1280.0, 800.0));
     let gate_wf =
         render_console_with_skin(ConsoleSkin::Wireframe, &gate, Viewport::new(1280.0, 800.0));
     assert!(gate_html.contains("dlg-passkey-register"));
+    assert!(gate_html.contains("dlg-passkey-dismiss"));
     assert!(gate_wf.contains("dlg-passkey-register"));
+    assert_eq!(gate.dismiss_dialog(), vec![UiCommand::CloseDialog]);
+    assert!(gate.active_dialog().is_none());
+    let _ = gate.activate_target("register-passkey");
+    let _ = gate.pending_webauthn.take();
+    assert_eq!(
+        gate.on_key("Escape", false, 1_000),
+        Some(UiCommand::CloseDialog)
+    );
+    assert!(gate.active_dialog().is_none());
+    assert!(gate.can_access_area(Area::Dashboard));
+    assert!(gate.can_access_area(Area::Ci));
+    for area in [
+        Area::Cd,
+        Area::AbDeploy,
+        Area::Repository,
+        Area::Observability,
+        Area::ModelRunner,
+        Area::Platform,
+    ] {
+        assert!(!gate.can_access_area(area));
+    }
 }
 
 #[test]

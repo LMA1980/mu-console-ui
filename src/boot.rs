@@ -27,6 +27,10 @@ use crate::state::{
     skin_slug, ConsoleState, WebAuthnRequest, ACTION_ATTRS, FONT_STORAGE_KEY,
     PENDING_HASH_STORAGE_KEY, PENDING_INVITE_STORAGE_KEY, REPO_STORAGE_KEY, SKIN_STORAGE_KEY,
 };
+use crate::webauthn::{
+    b64url_decode, b64url_encode, elevate_start_body, passkey_manage_start_body,
+    register_start_body, wrap_credential_envelope_json,
+};
 
 thread_local! {
     static WORKER: RefCell<Option<Worker>> = const { RefCell::new(None) };
@@ -327,7 +331,10 @@ fn find_action_attribute(target: &Element) -> Option<(&'static str, String)> {
     None
 }
 
-fn handle_post_action_effects(st: &mut ConsoleState, cmds: &[UiCommand], worker: &Worker) {
+fn handle_post_action_effects(
+    st: &mut ConsoleState,
+    cmds: &[UiCommand],
+) -> Option<WebAuthnRequest> {
     if let Some(ext) = st.pending_external_url.take() {
         if let Some(win) = web_sys::window() {
             let _ =
@@ -354,82 +361,7 @@ fn handle_post_action_effects(st: &mut ConsoleState, cmds: &[UiCommand], worker:
         }
     }
 
-    if let Some(req) = st.pending_webauthn.take() {
-        spawn_webauthn(worker.clone(), req);
-    }
-}
-
-fn b64url_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut i = 0;
-    while i + 3 <= bytes.len() {
-        let n =
-            (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8) | u32::from(bytes[i + 2]);
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push(TABLE[(n & 0x3f) as usize] as char);
-        i += 3;
-    }
-    match bytes.len() - i {
-        1 => {
-            let n = u32::from(bytes[i]) << 16;
-            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        }
-        2 => {
-            let n = (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8);
-            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-            out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        }
-        _ => {}
-    }
-    out
-}
-
-fn b64url_decode(input: &str) -> Vec<u8> {
-    let mut vals = Vec::with_capacity(input.len());
-    for b in input.bytes() {
-        let v = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'-' | b'+' => 62,
-            b'_' | b'/' => 63,
-            b'=' | b' ' | b'\n' | b'\r' | b'\t' => continue,
-            _ => continue,
-        };
-        vals.push(v);
-    }
-    let mut out = Vec::with_capacity((vals.len() * 3) / 4);
-    let mut idx = 0;
-    while idx + 4 <= vals.len() {
-        let n = (u32::from(vals[idx]) << 18)
-            | (u32::from(vals[idx + 1]) << 12)
-            | (u32::from(vals[idx + 2]) << 6)
-            | u32::from(vals[idx + 3]);
-        out.push(((n >> 16) & 0xff) as u8);
-        out.push(((n >> 8) & 0xff) as u8);
-        out.push((n & 0xff) as u8);
-        idx += 4;
-    }
-    match vals.len() - idx {
-        2 => {
-            let n = (u32::from(vals[idx]) << 18) | (u32::from(vals[idx + 1]) << 12);
-            out.push(((n >> 16) & 0xff) as u8);
-        }
-        3 => {
-            let n = (u32::from(vals[idx]) << 18)
-                | (u32::from(vals[idx + 1]) << 12)
-                | (u32::from(vals[idx + 2]) << 6);
-            out.push(((n >> 16) & 0xff) as u8);
-            out.push(((n >> 8) & 0xff) as u8);
-        }
-        _ => {}
-    }
-    out
+    st.pending_webauthn.take()
 }
 
 fn b64url_to_uint8_array(s: &str) -> Uint8Array {
@@ -451,6 +383,12 @@ fn decode_credential_descriptor_ids(pk: &JsValue, list_key: &str) {
     let Ok(list_val) = Reflect::get(pk, &JsValue::from_str(list_key)) else {
         return;
     };
+    if list_val.is_null() {
+        if let Ok(pk_obj) = pk.clone().dyn_into::<Object>() {
+            let _ = Reflect::delete_property(&pk_obj, &JsValue::from_str(list_key));
+        }
+        return;
+    }
     let Some(arr) = list_val.dyn_ref::<Array>() else {
         return;
     };
@@ -469,11 +407,33 @@ fn decode_credential_descriptor_ids(pk: &JsValue, list_key: &str) {
     }
 }
 
-fn prepare_create_public_key(raw: &JsValue) -> JsValue {
-    let pk = Reflect::get(raw, &JsValue::from_str("publicKey"))
+fn extract_challenge_id(raw: &JsValue) -> Option<String> {
+    Reflect::get(raw, &JsValue::from_str("challenge_id"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn unwrap_public_key_options(raw: &JsValue) -> JsValue {
+    if let Ok(opts) = Reflect::get(raw, &JsValue::from_str("options")) {
+        if opts.is_object() {
+            if let Ok(pk) = Reflect::get(&opts, &JsValue::from_str("publicKey")) {
+                if pk.is_object() {
+                    return pk;
+                }
+            }
+            return opts;
+        }
+    }
+    Reflect::get(raw, &JsValue::from_str("publicKey"))
         .ok()
         .filter(|v| v.is_object())
-        .unwrap_or_else(|| raw.clone());
+        .unwrap_or_else(|| raw.clone())
+}
+
+fn prepare_create_public_key(raw: &JsValue) -> JsValue {
+    let pk = unwrap_public_key_options(raw);
 
     if let Some(ch) = Reflect::get(&pk, &JsValue::from_str("challenge"))
         .ok()
@@ -525,10 +485,7 @@ fn prepare_create_public_key(raw: &JsValue) -> JsValue {
 }
 
 fn prepare_get_public_key(raw: &JsValue) -> JsValue {
-    let pk = Reflect::get(raw, &JsValue::from_str("publicKey"))
-        .ok()
-        .filter(|v| v.is_object())
-        .unwrap_or_else(|| raw.clone());
+    let pk = unwrap_public_key_options(raw);
     if let Some(ch) = Reflect::get(&pk, &JsValue::from_str("challenge"))
         .ok()
         .and_then(|v| v.as_string())
@@ -549,6 +506,19 @@ fn prepare_get_public_key(raw: &JsValue) -> JsValue {
     let wrapper = Object::new();
     let _ = Reflect::set(&wrapper, &JsValue::from_str("publicKey"), &pk);
     wrapper.into()
+}
+
+fn client_extension_results_obj(cred: &JsValue) -> JsValue {
+    if let Ok(get_ext) = Reflect::get(cred, &JsValue::from_str("getClientExtensionResults")) {
+        if let Ok(fn_ref) = get_ext.dyn_into::<Function>() {
+            if let Ok(res) = fn_ref.call0(cred) {
+                if res.is_object() {
+                    return res;
+                }
+            }
+        }
+    }
+    Object::new().into()
 }
 
 fn serialize_attestation_json(cred: &JsValue) -> Option<String> {
@@ -590,6 +560,11 @@ fn serialize_attestation_json(cred: &JsValue) -> Option<String> {
     );
     let _ = Reflect::set(&out, &JsValue::from_str("type"), &typ);
     let _ = Reflect::set(&out, &JsValue::from_str("response"), &resp_out);
+    let _ = Reflect::set(
+        &out,
+        &JsValue::from_str("extensions"),
+        &client_extension_results_obj(cred),
+    );
     JSON::stringify(&out).ok().and_then(|s| s.as_string())
 }
 
@@ -641,29 +616,37 @@ fn serialize_assertion_json(cred: &JsValue) -> Option<String> {
     );
     let _ = Reflect::set(&out, &JsValue::from_str("type"), &typ);
     let _ = Reflect::set(&out, &JsValue::from_str("response"), &resp_out);
+    let _ = Reflect::set(
+        &out,
+        &JsValue::from_str("extensions"),
+        &client_extension_results_obj(cred),
+    );
     JSON::stringify(&out).ok().and_then(|s| s.as_string())
 }
 
-fn promise_then(p: &Promise, on_ok: Closure<dyn FnMut(JsValue) -> JsValue>) -> Result<Promise, ()> {
+fn promise_then(
+    p: &Promise,
+    on_ok: Closure<dyn FnMut(JsValue) -> JsValue>,
+) -> Result<Promise, String> {
     let then_fn = Reflect::get(p.as_ref(), &JsValue::from_str("then"))
         .ok()
         .and_then(|v| v.dyn_into::<Function>().ok())
-        .ok_or(())?;
+        .ok_or_else(|| "Promise missing .then".to_owned())?;
     let next = then_fn
         .call1(p.as_ref(), on_ok.as_ref())
         .ok()
         .and_then(|v| v.dyn_into::<Promise>().ok())
-        .ok_or(())?;
+        .ok_or_else(|| "Promise .then invocation failed".to_owned())?;
     on_ok.forget();
     Ok(next)
 }
 
-fn fetch_json_post(url: &str, body_json: &str) -> Result<Promise, ()> {
-    let win = web_sys::window().ok_or(())?;
+fn fetch_json_post(url: &str, body_json: &str) -> Result<Promise, String> {
+    let win = web_sys::window().ok_or_else(|| "Window unavailable".to_owned())?;
     let fetch_fn = Reflect::get(&win, &JsValue::from_str("fetch"))
         .ok()
         .and_then(|v| v.dyn_into::<Function>().ok())
-        .ok_or(())?;
+        .ok_or_else(|| "window.fetch unavailable".to_owned())?;
 
     let headers = Object::new();
     let _ = Reflect::set(
@@ -694,8 +677,9 @@ fn fetch_json_post(url: &str, body_json: &str) -> Result<Promise, ()> {
         .call2(&win, &JsValue::from_str(url), &init)
         .ok()
         .and_then(|v| v.dyn_into::<Promise>().ok())
-        .ok_or(())?;
+        .ok_or_else(|| format!("POST {url} failed to start"))?;
 
+    let url_owned = url.to_owned();
     let on_resp: Closure<dyn FnMut(JsValue) -> JsValue> =
         Closure::once(move |resp: JsValue| -> JsValue {
             let ok = Reflect::get(&resp, &JsValue::from_str("ok"))
@@ -703,8 +687,14 @@ fn fetch_json_post(url: &str, body_json: &str) -> Result<Promise, ()> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if !ok {
-                return Promise::reject(&JsValue::from_str("WebAuthn start endpoint failed"))
-                    .into();
+                let status = Reflect::get(&resp, &JsValue::from_str("status"))
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .map_or(0_u16, |n| n as u16);
+                return Promise::reject(&JsValue::from_str(&format!(
+                    "HTTP {status} from {url_owned}"
+                )))
+                .into();
             }
             if let Ok(json_fn) = Reflect::get(&resp, &JsValue::from_str("json"))
                 .and_then(|v| v.dyn_into::<Function>())
@@ -719,131 +709,226 @@ fn fetch_json_post(url: &str, body_json: &str) -> Result<Promise, ()> {
     promise_then(&resp_promise, on_resp)
 }
 
-fn spawn_webauthn(worker: Worker, req: WebAuthnRequest) {
-    let Some(win) = web_sys::window() else {
-        return;
-    };
-    let origin = win.location().origin().unwrap_or_default();
-    let Ok(nav) = Reflect::get(&win, &JsValue::from_str("navigator")) else {
-        return;
-    };
-    let Ok(creds) = Reflect::get(&nav, &JsValue::from_str("credentials")) else {
-        console::warn_1(&JsValue::from_str(
-            "muconsole: WebAuthn unavailable in this browser context",
-        ));
-        return;
-    };
-
-    let is_create = matches!(req, WebAuthnRequest::RegisterPasskey { .. });
-    let (start_url, start_body) = match &req {
-        WebAuthnRequest::RegisterPasskey { label } => {
-            let body = if let Some(lbl) = label {
-                let obj = Object::new();
-                let _ = Reflect::set(&obj, &JsValue::from_str("label"), &JsValue::from_str(lbl));
-                JSON::stringify(&obj)
-                    .ok()
-                    .and_then(|s| s.as_string())
-                    .unwrap_or_else(|| "{}".to_owned())
-            } else {
-                "{}".to_owned()
-            };
-            (
-                format!("{origin}{}", paths::AUTH_PASSKEYS_REGISTER_START),
-                body,
-            )
-        }
-        WebAuthnRequest::ElevateTimedRole { role_id } => {
-            let obj = Object::new();
-            let _ = Reflect::set(
-                &obj,
-                &JsValue::from_str("role_id"),
-                &JsValue::from_str(role_id),
-            );
-            let body = JSON::stringify(&obj)
-                .ok()
-                .and_then(|s| s.as_string())
-                .unwrap_or_else(|| "{}".to_owned());
-            (format!("{origin}{}", paths::AUTH_ELEVATE_START), body)
-        }
-        WebAuthnRequest::RemovePasskey { .. } => (
-            format!("{origin}{}", paths::AUTH_ELEVATE_START),
-            "{}".to_owned(),
-        ),
-    };
-
-    let Ok(options_promise) = fetch_json_post(&start_url, &start_body) else {
-        return;
-    };
-
+fn start_webauthn_ceremony(
+    creds: &JsValue,
+    is_create: bool,
+    start_url: &str,
+    start_body: &str,
+) -> Result<Promise, String> {
+    let options_promise = fetch_json_post(start_url, start_body)?;
     let method_name = if is_create { "create" } else { "get" };
-    let Ok(cred_fn) = Reflect::get(&creds, &JsValue::from_str(method_name))
+    let cred_fn = Reflect::get(creds, &JsValue::from_str(method_name))
         .and_then(|v| v.dyn_into::<Function>())
-    else {
-        return;
-    };
+        .map_err(|_| format!("navigator.credentials.{method_name} unavailable"))?;
 
-    let creds_for_then = creds;
+    let creds_for_then = creds.clone();
     let on_options: Closure<dyn FnMut(JsValue) -> JsValue> =
         Closure::once(move |opts: JsValue| -> JsValue {
+            let challenge_id = extract_challenge_id(&opts);
             let prepared = if is_create {
                 prepare_create_public_key(&opts)
             } else {
                 prepare_get_public_key(&opts)
             };
-            match cred_fn.call1(&creds_for_then, &prepared) {
-                Ok(p) => p,
-                Err(e) => Promise::reject(&e).into(),
+            let cred_promise = match cred_fn.call1(&creds_for_then, &prepared) {
+                Ok(v) => match v.dyn_into::<Promise>() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return Promise::reject(&JsValue::from_str(
+                            "WebAuthn API did not return a Promise",
+                        ))
+                        .into();
+                    }
+                },
+                Err(e) => return Promise::reject(&e).into(),
+            };
+            let on_cred: Closure<dyn FnMut(JsValue) -> JsValue> =
+                Closure::once(move |cred: JsValue| -> JsValue {
+                    let serialized = if is_create {
+                        serialize_attestation_json(&cred)
+                    } else {
+                        serialize_assertion_json(&cred)
+                    };
+                    let Some(cred_json) = serialized else {
+                        return Promise::reject(&JsValue::from_str(
+                            "Failed to serialize WebAuthn credential",
+                        ))
+                        .into();
+                    };
+                    let pair = Array::new();
+                    pair.push(&challenge_id.map_or(JsValue::NULL, |c| JsValue::from_str(&c)));
+                    pair.push(&JsValue::from_str(&cred_json));
+                    pair.into()
+                });
+            match promise_then(&cred_promise, on_cred) {
+                Ok(next) => next.into(),
+                Err(msg) => Promise::reject(&JsValue::from_str(&msg)).into(),
             }
         });
 
-    let Ok(cred_promise) = promise_then(&options_promise, on_options) else {
+    promise_then(&options_promise, on_options)
+}
+
+fn unpack_ceremony_pair(pair: &JsValue) -> Option<(Option<String>, String)> {
+    let arr = pair.dyn_ref::<Array>()?;
+    let challenge_id = arr.get(0).as_string();
+    let cred_json = arr.get(1).as_string()?;
+    Some((challenge_id, cred_json))
+}
+
+fn js_error_message(err: &JsValue) -> String {
+    if let Some(s) = err.as_string() {
+        return s;
+    }
+    let name = Reflect::get(err, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|v| v.as_string());
+    let msg = Reflect::get(err, &JsValue::from_str("message"))
+        .ok()
+        .and_then(|v| v.as_string());
+    match (name, msg) {
+        (Some(n), Some(m)) if !m.is_empty() => format!("{n}: {m}"),
+        (_, Some(m)) if !m.is_empty() => m,
+        (Some(n), _) if !n.is_empty() => n,
+        _ => JSON::stringify(err)
+            .ok()
+            .and_then(|s| s.as_string())
+            .unwrap_or_else(|| "WebAuthn ceremony rejected".to_owned()),
+    }
+}
+
+fn report_webauthn_error(state: &Rc<RefCell<ConsoleState>>, msg: &str) {
+    console::warn_2(
+        &JsValue::from_str("muconsole: WebAuthn ceremony failed"),
+        &JsValue::from_str(msg),
+    );
+    if let Ok(mut st) = state.try_borrow_mut() {
+        st.on_webauthn_error(msg);
+        repaint(&st);
+    }
+}
+
+fn spawn_webauthn(state: Rc<RefCell<ConsoleState>>, worker: Worker, req: WebAuthnRequest) {
+    let Some(win) = web_sys::window() else {
         return;
     };
-    let worker_for_done = worker;
-    let on_cred: Closure<dyn FnMut(JsValue)> = Closure::once(move |cred: JsValue| match req {
-        WebAuthnRequest::RegisterPasskey { label } => {
-            if let Some(attestation_json) = serialize_attestation_json(&cred) {
-                send(
-                    &worker_for_done,
-                    &UiCommand::EnrollPasskey {
-                        label,
-                        attestation_json,
-                    },
-                );
-            }
+    let origin = win.location().origin().unwrap_or_default();
+    let Ok(nav) = Reflect::get(&win, &JsValue::from_str("navigator")) else {
+        report_webauthn_error(&state, "Browser navigator unavailable");
+        return;
+    };
+    let Ok(creds) = Reflect::get(&nav, &JsValue::from_str("credentials")) else {
+        report_webauthn_error(&state, "WebAuthn unavailable in this browser context");
+        return;
+    };
+    if creds.is_undefined() || creds.is_null() {
+        report_webauthn_error(&state, "WebAuthn unavailable in this browser context");
+        return;
+    }
+
+    let reg_url = format!("{origin}{}", paths::AUTH_PASSKEYS_REGISTER_START);
+    let elevate_url = format!("{origin}{}", paths::AUTH_ELEVATE_START);
+
+    let ceremony_promise = match &req {
+        WebAuthnRequest::RegisterPasskey {
+            label,
+            requires_step_up: false,
+        } => {
+            let body = register_start_body(label.as_deref(), None, None);
+            start_webauthn_ceremony(&creds, true, &reg_url, &body)
+        }
+        WebAuthnRequest::RegisterPasskey {
+            label,
+            requires_step_up: true,
+        } => {
+            let label_for_step = label.clone();
+            let creds_for_step = creds.clone();
+            let reg_url_for_step = reg_url;
+            start_webauthn_ceremony(&creds, false, &elevate_url, passkey_manage_start_body())
+                .and_then(|step_promise| {
+                    let on_step_up: Closure<dyn FnMut(JsValue) -> JsValue> =
+                        Closure::once(move |pair: JsValue| -> JsValue {
+                            let Some((step_cid, step_cred_json)) = unpack_ceremony_pair(&pair)
+                            else {
+                                return Promise::reject(&JsValue::from_str(
+                                    "Missing step-up assertion payload",
+                                ))
+                                .into();
+                            };
+                            let body = register_start_body(
+                                label_for_step.as_deref(),
+                                step_cid.as_deref(),
+                                Some(&step_cred_json),
+                            );
+                            match start_webauthn_ceremony(
+                                &creds_for_step,
+                                true,
+                                &reg_url_for_step,
+                                &body,
+                            ) {
+                                Ok(next) => next.into(),
+                                Err(msg) => Promise::reject(&JsValue::from_str(&msg)).into(),
+                            }
+                        });
+                    promise_then(&step_promise, on_step_up)
+                })
         }
         WebAuthnRequest::ElevateTimedRole { role_id } => {
-            if let Some(assertion_json) = serialize_assertion_json(&cred) {
-                send(
-                    &worker_for_done,
-                    &UiCommand::ElevateWithPasskey {
-                        role_id,
-                        assertion_json,
-                    },
-                );
-            }
+            start_webauthn_ceremony(&creds, false, &elevate_url, &elevate_start_body(role_id))
         }
-        WebAuthnRequest::RemovePasskey { credential_id } => {
-            if let Some(step_up_assertion_json) = serialize_assertion_json(&cred) {
-                send(
-                    &worker_for_done,
-                    &UiCommand::RemovePasskey {
-                        credential_id,
-                        step_up_assertion_json,
-                    },
-                );
-            }
+        WebAuthnRequest::RemovePasskey { .. } => {
+            start_webauthn_ceremony(&creds, false, &elevate_url, passkey_manage_start_body())
+        }
+    };
+
+    let ceremony_promise = match ceremony_promise {
+        Ok(p) => p,
+        Err(msg) => {
+            report_webauthn_error(&state, &msg);
+            return;
+        }
+    };
+
+    let worker_for_done = worker;
+    let state_for_done = Rc::clone(&state);
+    let on_done: Closure<dyn FnMut(JsValue)> = Closure::once(move |pair: JsValue| {
+        let Some((challenge_id, cred_json)) = unpack_ceremony_pair(&pair) else {
+            report_webauthn_error(&state_for_done, "Missing WebAuthn credential payload");
+            return;
+        };
+        let envelope = wrap_credential_envelope_json(challenge_id.as_deref(), &cred_json);
+        match req {
+            WebAuthnRequest::RegisterPasskey { label, .. } => send(
+                &worker_for_done,
+                &UiCommand::EnrollPasskey {
+                    label,
+                    attestation_json: envelope,
+                },
+            ),
+            WebAuthnRequest::ElevateTimedRole { role_id } => send(
+                &worker_for_done,
+                &UiCommand::ElevateWithPasskey {
+                    role_id,
+                    assertion_json: envelope,
+                },
+            ),
+            WebAuthnRequest::RemovePasskey { credential_id } => send(
+                &worker_for_done,
+                &UiCommand::RemovePasskey {
+                    credential_id,
+                    step_up_assertion_json: envelope,
+                },
+            ),
         }
     });
+    let state_for_err = state;
     let on_err: Closure<dyn FnMut(JsValue)> = Closure::once(move |err: JsValue| {
-        console::warn_2(
-            &JsValue::from_str("muconsole: WebAuthn ceremony failed"),
-            &err,
-        );
+        let msg = js_error_message(&err);
+        report_webauthn_error(&state_for_err, &msg);
     });
 
-    let _ = cred_promise.then2(&on_cred, &on_err);
-    on_cred.forget();
+    let _ = ceremony_promise.then2(&on_done, &on_err);
+    on_done.forget();
     on_err.forget();
 }
 
@@ -1134,15 +1219,21 @@ pub fn start() {
                     return;
                 };
                 if let Some((attr, val)) = find_action_attribute(&target) {
-                    let mut st = state_for_click.borrow_mut();
-                    let now = now_ms();
-                    let mut cmds = st.on_explicit_user_activity(now);
-                    let action_cmds = st.on_dom_action(attr, &val, ev.shift_key(), now);
-                    cmds.extend(action_cmds);
-                    handle_post_action_effects(&mut st, &cmds, &worker_for_click);
-                    send_all(&worker_for_click, &cmds);
-                    sync_browser_state(&mut st);
-                    repaint(&st);
+                    let maybe_webauthn = {
+                        let mut st = state_for_click.borrow_mut();
+                        let now = now_ms();
+                        let mut cmds = st.on_explicit_user_activity(now);
+                        let action_cmds = st.on_dom_action(attr, &val, ev.shift_key(), now);
+                        cmds.extend(action_cmds);
+                        let req = handle_post_action_effects(&mut st, &cmds);
+                        send_all(&worker_for_click, &cmds);
+                        sync_browser_state(&mut st);
+                        repaint(&st);
+                        req
+                    };
+                    if let Some(req) = maybe_webauthn {
+                        spawn_webauthn(Rc::clone(&state_for_click), worker_for_click.clone(), req);
+                    }
                 }
             });
             let _ =
