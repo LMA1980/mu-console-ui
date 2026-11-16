@@ -590,3 +590,99 @@ fn m2_54_57_universal_disabled_router_8_areas_27_subviews_and_platform_guards() 
     let _ = encode(&UiCommand::CloseDialog).expect("encode");
     let _ = (SubsystemId::Platform, PlatformSubView::Maintenance);
 }
+
+#[test]
+fn m2_user_profile_preferences_active_ux_and_opendyslexic_rendering() {
+    let mut st = active_state("ops", vec!["system:dashboard.read", "ci:queue.read"]);
+    let mut vm = st.client.view().cloned().expect("view");
+    vm.user_profile = Some(UserProfileDto {
+        github_login: "ops".into(),
+        display_name: Some("Ops".into()),
+        preferences: UserPreferencesDto {
+            skin: ConsoleSkin::Html,
+            font: CrtFont::Hurmit,
+        },
+        bound_roles: vec![],
+        passkey_count: 1,
+        passkeys: vec![],
+    });
+    push_vm(&mut st, vm);
+    st.open_user_profile(UserProfileTab::Preferences);
+
+    let (html_prefs, wf_prefs) = render_both_skins(&st);
+    assert_eq!(
+        html_prefs
+            .matches(r#"data-control-id="profile-tab:passkeys""#)
+            .count(),
+        1,
+        "profile-tab:passkeys must not be duplicated in HTML modal"
+    );
+    assert_eq!(
+        wf_prefs
+            .matches(r#"data-control-id="profile-tab:passkeys""#)
+            .count(),
+        1,
+        "profile-tab:passkeys must not be duplicated in Wireframe modal"
+    );
+    assert!(html_prefs.contains(r#"data-active-skin="html">Active: HTML Core"#));
+    assert!(html_prefs.contains(r#"data-active-font="hurmit">Active: Hurmit Mono"#));
+    assert!(html_prefs.contains(
+        r#"data-control-id="profile-skin:html" data-action="profile-skin:html" aria-pressed="true" data-selected="true"><span class="mu-signal" aria-hidden="true">●</span>HTML Core"#
+    ));
+    assert!(html_prefs.contains(
+        r#"data-control-id="profile-skin:wireframe" data-action="profile-skin:wireframe" aria-pressed="false" data-selected="false"><span class="mu-signal" aria-hidden="true">○</span>Wireframe SVG"#
+    ));
+    assert!(html_prefs.contains(
+        r#"data-control-id="profile-font:hurmit" data-action="profile-font:hurmit" aria-pressed="true" data-selected="true"><span class="mu-signal" aria-hidden="true">●</span>Hurmit Mono"#
+    ));
+    assert!(html_prefs.contains(
+        r#"data-control-id="profile-font:dyslexic" data-action="profile-font:dyslexic" aria-pressed="false" data-selected="false"><span class="mu-signal" aria-hidden="true">○</span>OpenDyslexicM"#
+    ));
+    assert!(wf_prefs.contains(r#"id="muconsole-wf-profile-extra""#));
+    assert!(wf_prefs.contains("Active: HTML Core"));
+    assert!(wf_prefs.contains("Active: Hurmit Mono"));
+    assert!(wf_prefs.contains("● HTML Core"));
+    assert!(wf_prefs.contains("○ Wireframe SVG"));
+    assert!(wf_prefs.contains("● Hurmit Mono"));
+    assert!(wf_prefs.contains("○ OpenDyslexicM"));
+
+    // Toggle both skin -> Wireframe SVG and font -> OpenDyslexicM.
+    st.on_dom_action("data-action", "profile-skin:wireframe", false, 1_000);
+    st.on_dom_action("data-action", "profile-font:dyslexic", false, 1_100);
+    let (html_after, wf_after) = render_both_skins(&st);
+    assert!(html_after.contains(r#"data-crt-font="opendyslexic""#));
+    assert!(html_after.contains(r#"--font-crt:'OpenDyslexicM Nerd Font Mono','MuCRT',monospace"#));
+    assert!(html_after.contains("font-weight:400"));
+    assert!(html_after.contains("font-weight:700"));
+    assert!(html_after.contains(r#"data-active-skin="wireframe">Active: Wireframe SVG"#));
+    assert!(html_after.contains(r#"data-active-font="opendyslexic">Active: OpenDyslexicM"#));
+    assert!(wf_after.contains("Active: Wireframe SVG"));
+    assert!(wf_after.contains("Active: OpenDyslexicM"));
+    assert!(wf_after.contains("● Wireframe SVG"));
+    assert!(wf_after.contains("● OpenDyslexicM"));
+
+    // PasskeyEnrollmentRequired session can toggle typography locally while Wireframe stays disabled.
+    let mut gate_st = ConsoleState::new();
+    let gate_vm = ViewModel {
+        auth: AuthState::from_session(&AuthSessionDto {
+            authenticated: true,
+            invite_bound: true,
+            passkey_count: 0,
+            passkey_enrollment_required: true,
+            github_login: Some("new-op".into()),
+            active_policies: vec!["system:dashboard.read".into()],
+            ..AuthSessionDto::default()
+        }),
+        ..ViewModel::default()
+    };
+    push_vm(&mut gate_st, gate_vm);
+    gate_st.open_user_profile(UserProfileTab::Preferences);
+    let cmds = gate_st.on_dom_action("data-action", "profile-font:dyslexic", false, 2_000);
+    assert_eq!(cmds, vec![UiCommand::SetCrtFont(CrtFont::OpenDyslexic)]);
+    assert_eq!(gate_st.font, CrtFont::OpenDyslexic);
+    let gate_html =
+        render_console_with_skin(ConsoleSkin::Html, &gate_st, Viewport::new(1440.0, 900.0));
+    assert!(gate_html.contains(
+        r#"data-control-id="profile-skin:wireframe" data-action="profile-skin:wireframe" aria-pressed="false" data-selected="false" disabled="disabled" aria-disabled="true""#
+    ));
+}

@@ -1110,3 +1110,75 @@ fn u24_dist_freshness_and_standalone_tokens_integrity() {
     // Keep unused DTO imports clean across feature configurations:
     let _ = (SubsystemId::Ci, PlatformUserDto::default());
 }
+
+#[test]
+fn u25_profile_preferences_ux_wireframe_zero_overflow_and_reload_persistence() {
+    let mut st = state_for_scenario(
+        Scenario::NewBranch,
+        SubView::Ci(CiSubView::Trainway),
+        CrtFont::Hurmit,
+    );
+    for tab in [
+        UserProfileTab::UserDetails,
+        UserProfileTab::Preferences,
+        UserProfileTab::Passkeys,
+    ] {
+        st.open_user_profile(tab);
+        for &(vw, vh) in &[
+            (320.0, 568.0),
+            (375.0, 667.0),
+            (874.0, 402.0),
+            (1512.0, 860.0),
+        ] {
+            let wf_svg =
+                render_console_with_skin(ConsoleSkin::Wireframe, &st, Viewport::new(vw, vh));
+            assert_svg_zero_overflow(&wf_svg, vw, vh, &format!("u25_profile_{tab:?}_{vw}x{vh}"));
+            let doc = roxmltree::Document::parse(&wf_svg).expect("valid SVG XML");
+            let mut seen_ids = std::collections::BTreeSet::new();
+            for n in doc.descendants() {
+                if let Some(cid) = n.attribute("data-control-id") {
+                    assert!(
+                        seen_ids.insert(cid.to_owned()),
+                        "duplicate data-control-id `{cid}` in Wireframe profile {tab:?} @ {vw}x{vh}"
+                    );
+                }
+            }
+            if vw >= 375.0 && vh >= 402.0 {
+                assert!(
+                    wf_svg.contains("id=\"muconsole-wf-profile-extra\""),
+                    "expected profile tab content at {vw}x{vh}"
+                );
+            }
+        }
+    }
+
+    // Reload persistence: stored OpenDyslexic + Wireframe survive default AuthSession snapshot.
+    let mut reload_st = ConsoleState::new();
+    reload_st.init_from_env("#/ci/queue-logs", "", Some("opendyslexic"));
+    reload_st.restore_stored_skin("", Some("wireframe"));
+    let vm = ViewModel {
+        auth: full_active_auth("LMA1980"),
+        user_profile: Some(UserProfileDto {
+            github_login: "LMA1980".into(),
+            display_name: Some("LMA1980".into()),
+            preferences: UserPreferencesDto {
+                skin: ConsoleSkin::Html,
+                font: CrtFont::Hurmit,
+            },
+            bound_roles: vec![],
+            passkey_count: 1,
+            passkeys: vec![],
+        }),
+        ..ViewModel::default()
+    };
+    let snap = Engine::encode_event(&DataEvent::Snapshot(vm)).expect("encode");
+    reload_st.on_worker_frame(&snap);
+    assert_eq!(reload_st.font, CrtFont::OpenDyslexic);
+    assert!(reload_st.lazy_dyslexic_loaded);
+    assert_eq!(reload_st.effective_skin(), ConsoleSkin::Wireframe);
+
+    let shell = render_html_shell("<svg></svg>", &reload_st);
+    assert!(shell.contains(r#"data-crt-font="opendyslexic""#));
+    assert!(shell.contains(r#"--font-crt:'OpenDyslexicM Nerd Font Mono','MuCRT',monospace"#));
+    assert!(shell.contains("font-weight:700"));
+}
