@@ -137,6 +137,12 @@ pub fn elevate_start_body(role_id: &str) -> String {
     format!(r#"{{"role_id":"{}"}}"#, escape_json_str(role_id.trim()))
 }
 
+/// Build the JSON request body for `POST /api/auth/roles/{role_id}/renew/start` targeting `role_id`.
+#[must_use]
+pub fn renew_start_body(role_id: &str) -> String {
+    elevate_start_body(role_id)
+}
+
 /// Canonical JSON request body for `POST /api/auth/elevate/start` with `passkey_manage` purpose.
 #[must_use]
 pub const fn passkey_manage_start_body() -> &'static str {
@@ -201,6 +207,10 @@ mod tests {
         assert_eq!(
             elevate_start_body("platform-admin"),
             r#"{"role_id":"platform-admin"}"#
+        );
+        assert_eq!(
+            renew_start_body("super-operator"),
+            r#"{"role_id":"super-operator"}"#
         );
         assert_eq!(
             passkey_manage_start_body(),

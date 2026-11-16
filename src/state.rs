@@ -76,6 +76,9 @@ pub enum WebAuthnRequest {
     ElevateTimedRole {
         role_id: String,
     },
+    RenewTimedRole {
+        role_id: String,
+    },
     RemovePasskey {
         credential_id: String,
     },
@@ -830,6 +833,24 @@ impl ConsoleState {
             .prev_lease_ids
             .iter()
             .any(|id| !next_lease_ids.iter().any(|cur| cur == id));
+        if matches!(self.local_dialog, Some(DialogModel::SessionRoles(_))) {
+            let mut roles = match &view.active_dialog {
+                Some(DialogModel::SessionRoles(sr)) if !sr.roles.is_empty() => sr.roles.clone(),
+                _ => Vec::new(),
+            };
+            if roles.is_empty() {
+                roles = self.auth().session_role_descriptors();
+            }
+            self.local_dialog = Some(DialogModel::SessionRoles(SessionRolesDialogModel {
+                github_login: view
+                    .auth
+                    .github_login
+                    .clone()
+                    .unwrap_or_else(|| "operator".into()),
+                roles,
+                lock_all_enabled: !view.auth.leases.is_empty(),
+            }));
+        }
 
         if let Some(profile) = &view.user_profile {
             if let Some(dn) = &profile.display_name {
@@ -1321,17 +1342,20 @@ impl ConsoleState {
         if auth.status != AuthStatus::Active {
             return Vec::new();
         }
-        let roles = self
+        let mut roles = self
             .client
             .view()
             .and_then(|v| {
                 if let Some(DialogModel::SessionRoles(sr)) = &v.active_dialog {
-                    Some(sr.roles.clone())
+                    (!sr.roles.is_empty()).then(|| sr.roles.clone())
                 } else {
                     None
                 }
             })
             .unwrap_or_default();
+        if roles.is_empty() {
+            roles = auth.session_role_descriptors();
+        }
         let dlg = DialogModel::SessionRoles(SessionRolesDialogModel {
             github_login: auth.github_login.unwrap_or_else(|| "operator".into()),
             roles,
@@ -1339,6 +1363,21 @@ impl ConsoleState {
         });
         self.local_dialog = Some(dlg.clone());
         vec![UiCommand::OpenDialog(dlg)]
+    }
+
+    /// Complete a Passkey-confirmed timed role renewal with the WebAuthn assertion JSON envelope.
+    pub fn complete_role_renewal(
+        &mut self,
+        role_id: impl Into<String>,
+        assertion_json: impl Into<String>,
+    ) -> Vec<UiCommand> {
+        if self.auth().status != AuthStatus::Active {
+            return Vec::new();
+        }
+        vec![UiCommand::RenewRoleWithPasskey {
+            role_id: role_id.into(),
+            assertion_json: assertion_json.into(),
+        }]
     }
 
     /// Activate an interactive control target by ID (`data-control-id` / `data-action`).
@@ -1524,6 +1563,16 @@ impl ConsoleState {
             }
             self.webauthn_error = None;
             self.pending_webauthn = Some(WebAuthnRequest::ElevateTimedRole {
+                role_id: role_id.into(),
+            });
+            return Vec::new();
+        }
+        if let Some(role_id) = id.strip_prefix("role-renew:") {
+            if self.auth().status != AuthStatus::Active {
+                return Vec::new();
+            }
+            self.webauthn_error = None;
+            self.pending_webauthn = Some(WebAuthnRequest::RenewTimedRole {
                 role_id: role_id.into(),
             });
             return Vec::new();
@@ -2122,6 +2171,18 @@ impl ConsoleState {
                     self.route_sync_dirty = true;
                 }
                 cmds.push(UiCommand::RefreshSession);
+            }
+            if matches!(self.local_dialog, Some(DialogModel::SessionRoles(_))) {
+                let roles = view.auth.session_role_descriptors();
+                self.local_dialog = Some(DialogModel::SessionRoles(SessionRolesDialogModel {
+                    github_login: view
+                        .auth
+                        .github_login
+                        .clone()
+                        .unwrap_or_else(|| "operator".into()),
+                    roles,
+                    lock_all_enabled: !view.auth.leases.is_empty(),
+                }));
             }
         }
         cmds

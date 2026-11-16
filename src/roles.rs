@@ -132,9 +132,17 @@ pub fn touch_active_leases(auth: &mut AuthState, now_ms: u64) -> bool {
     for lease in &mut auth.leases {
         if !lease.is_expired() && lease.idle_ttl_secs > 0 {
             lease.last_activity_at_ms = now_ms;
-            lease.idle_expires_at_ms =
-                now_ms.saturating_add(lease.idle_ttl_secs.saturating_mul(1_000));
-            lease.idle_timer = lease.idle_ttl_secs.min(lease.seconds_remaining);
+            let raw_idle = now_ms.saturating_add(lease.idle_ttl_secs.saturating_mul(1_000));
+            lease.idle_expires_at_ms = if lease.hard_expires_at_ms > 0 {
+                raw_idle.min(lease.hard_expires_at_ms)
+            } else {
+                raw_idle
+            };
+            if lease.hard_expires_at_ms > 0 {
+                let _ = lease.tick_at(now_ms);
+            } else {
+                lease.idle_timer = lease.idle_ttl_secs.min(lease.seconds_remaining);
+            }
             changed = true;
         }
     }
@@ -190,6 +198,7 @@ mod tests {
                     last_activity_at_ms: 0,
                     hard_expires_at_ms: rem * 1_000,
                     idle_expires_at_ms: idle * 1_000,
+                    ..RoleLeaseView::default()
                 }),
             },
             None => RoleBadgeView {

@@ -70,6 +70,8 @@ pub const LOCK_TIMED_ROLES_BTN: &str = "Lock All Timed Roles";
 pub const ENABLE_ROLE_BTN: &str = "Enable";
 pub const DISABLE_ROLE_BTN: &str = "Disable";
 pub const STEP_UP_PASSKEY_BTN: &str = "Unlock with Passkey";
+pub const RENEW_ROLE_PASSKEY_BTN: &str = "Renew +15m (Passkey)";
+pub const RENEW_BANNER_TITLE: &str = "Role renewal available";
 
 /// User profile modal tab labels.
 pub const TAB_USER_DETAILS: &str = "User Details";

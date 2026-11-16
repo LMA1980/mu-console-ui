@@ -14,9 +14,9 @@ use mu_console_protocol::{
     AbDeploySubView, Area, AuthState, AuthStatus, CanaryBundleState, CdRunState, CdSubView,
     CiJobSummary, CiSubView, CrtFont, DashboardSubView, DialogModel as ProtoDialogModel,
     GateOutcome, ModelRunnerSubView, ObservabilitySubView, PackageEcosystem, PlatformSubView,
-    RepoStatus, RepositorySubView, RiskConfirmAction, RoleActivationKind, Slot, StageState,
-    StepUpRequirement, SubView, SubsystemHealthEntry, SubsystemId, SubsystemStatus, TestState,
-    UiError, Visibility,
+    RepoStatus, RepositorySubView, RiskConfirmAction, RoleActivationKind, RoleLeaseView, Slot,
+    StageState, StepUpRequirement, SubView, SubsystemHealthEntry, SubsystemId, SubsystemStatus,
+    TestState, UiError, Visibility,
 };
 use mu_console_theme::scene::{
     self as theme_scene, ActionControl, ConsoleScene, GateChecklist, GateItem,
@@ -200,6 +200,40 @@ pub fn build_console_scene(state: &ConsoleState, _viewport: SceneViewport) -> Co
         });
     }
 
+    // 3b. Active-session WebAuthn error feedback and proactive final-2m lease renewal banners.
+    if auth.status == AuthStatus::Active {
+        if let Some(ref err) = state.webauthn_error {
+            scene.banners.push(SceneBanner {
+                id: "banner-webauthn-error".into(),
+                tone: SemanticTone::Fail,
+                title: "Passkey verification failed".into(),
+                message: err.clone(),
+                action: None,
+            });
+        }
+        for lease in &auth.leases {
+            if lease.can_renew && !lease.is_expired() {
+                let extend_mins = (lease.renew_extend_secs / 60).max(1);
+                let label = lease.display_name.as_deref().unwrap_or(&lease.role_id);
+                scene.banners.push(SceneBanner {
+                    id: format!("banner-role-renew-{}", lease.role_id),
+                    tone: SemanticTone::Warn,
+                    title: copy::RENEW_BANNER_TITLE.into(),
+                    message: format!(
+                        "{label} expires in {} (idle {}). Confirm Passkey to extend +{extend_mins}m.",
+                        RoleLeaseView::format_mm_ss(lease.seconds_remaining),
+                        RoleLeaseView::format_mm_ss(lease.idle_timer),
+                    ),
+                    action: Some(ActionControl::new(
+                        format!("role-renew:{}", lease.role_id),
+                        copy::RENEW_ROLE_PASSKEY_BTN,
+                        format!("role-renew:{}", lease.role_id),
+                    )),
+                });
+            }
+        }
+    }
+
     // 4. Anonymous lockdown (`RoleFolioIndex["anonymous"] == []`) vs AuthorizationDenied lockdown.
     if auth.anonymous_lockdown {
         if auth.status == AuthStatus::AuthorizationDenied {
@@ -362,63 +396,86 @@ pub fn build_dialog_model(state: &ConsoleState) -> Option<theme_scene::DialogMod
             }))
         }
         ProtoDialogModel::SessionRoles(sr) => {
-            let mut options: Vec<SessionRoleOption> = sr
-                .roles
-                .iter()
-                .map(|r| {
-                    let active_badge = auth.active_roles.iter().find(|b| b.role_id == r.role_id);
-                    let active = r.active || active_badge.is_some();
-                    let rem = active_badge
-                        .and_then(|b| b.lease.as_ref().map(|l| l.seconds_remaining))
-                        .or_else(|| r.lease.as_ref().map(|l| l.seconds_remaining));
-                    let is_baseline =
-                        matches!(r.activation.kind, RoleActivationKind::PinnedBaseline);
-                    let requires_step_up =
-                        matches!(r.step_up, StepUpRequirement::Passkey) && !active;
-                    let action = if is_baseline {
-                        ActionControl::new(
-                            format!("role-baseline:{}", r.role_id),
-                            "Locked Baseline",
-                            "role-baseline",
-                        )
-                        .disabled(true)
-                    } else if active {
-                        ActionControl::new(
-                            format!("role-disable:{}", r.role_id),
-                            copy::DISABLE_ROLE_BTN,
-                            format!("role-disable:{}", r.role_id),
-                        )
-                        .with_tone(SemanticTone::Warn)
-                    } else if requires_step_up {
-                        ActionControl::new(
-                            format!("role-elevate:{}", r.role_id),
-                            copy::STEP_UP_PASSKEY_BTN,
-                            format!("role-elevate:{}", r.role_id),
-                        )
-                        .with_tone(SemanticTone::Info)
+            let mut options: Vec<SessionRoleOption> = Vec::with_capacity(sr.roles.len() + 2);
+            for r in &sr.roles {
+                let active_badge = auth.active_roles.iter().find(|b| b.role_id == r.role_id);
+                let active = r.active || active_badge.is_some();
+                let active_lease = auth
+                    .leases
+                    .iter()
+                    .find(|l| l.role_id == r.role_id)
+                    .or_else(|| active_badge.and_then(|b| b.lease.as_ref()))
+                    .or(r.lease.as_ref());
+                let rem = active_lease.map(|l| l.seconds_remaining);
+                let is_baseline = matches!(r.activation.kind, RoleActivationKind::PinnedBaseline);
+                let requires_step_up = matches!(r.step_up, StepUpRequirement::Passkey) && !active;
+                let action = if is_baseline {
+                    ActionControl::new(
+                        format!("role-baseline:{}", r.role_id),
+                        "Locked Baseline",
+                        "role-baseline",
+                    )
+                    .disabled(true)
+                } else if active {
+                    ActionControl::new(
+                        format!("role-disable:{}", r.role_id),
+                        copy::DISABLE_ROLE_BTN,
+                        format!("role-disable:{}", r.role_id),
+                    )
+                    .with_tone(SemanticTone::Warn)
+                } else if requires_step_up {
+                    ActionControl::new(
+                        format!("role-elevate:{}", r.role_id),
+                        copy::STEP_UP_PASSKEY_BTN,
+                        format!("role-elevate:{}", r.role_id),
+                    )
+                    .with_tone(SemanticTone::Info)
+                } else {
+                    ActionControl::new(
+                        format!("role-enable:{}", r.role_id),
+                        copy::ENABLE_ROLE_BTN,
+                        format!("role-enable:{}", r.role_id),
+                    )
+                    .with_tone(SemanticTone::Pass)
+                };
+                options.push(SessionRoleOption {
+                    role: r.display_name.clone().unwrap_or_else(|| r.role_id.clone()),
+                    description: r.description.clone(),
+                    active,
+                    expires_at: rem.map(|s| format!("{:02}:{:02}", s / 60, s % 60)),
+                    requires_step_up,
+                    tone: if active {
+                        SemanticTone::Pass
                     } else {
-                        ActionControl::new(
-                            format!("role-enable:{}", r.role_id),
-                            copy::ENABLE_ROLE_BTN,
-                            format!("role-enable:{}", r.role_id),
-                        )
-                        .with_tone(SemanticTone::Pass)
-                    };
-                    SessionRoleOption {
-                        role: r.display_name.clone().unwrap_or_else(|| r.role_id.clone()),
-                        description: r.description.clone(),
-                        active,
-                        expires_at: rem.map(|s| format!("{:02}:{:02}", s / 60, s % 60)),
-                        requires_step_up,
-                        tone: if active {
-                            SemanticTone::Pass
-                        } else {
-                            SemanticTone::Neutral
-                        },
-                        action,
+                        SemanticTone::Neutral
+                    },
+                    action,
+                });
+                if active {
+                    if let Some(lease) = active_lease.filter(|l| l.can_renew && !l.is_expired()) {
+                        let extend_mins = (lease.renew_extend_secs / 60).max(1);
+                        let role_label = r.display_name.as_deref().unwrap_or(&r.role_id);
+                        options.push(SessionRoleOption {
+                            role: format!("{role_label} — Renew +{extend_mins}m"),
+                            description: format!(
+                                "Final {}m renewal window ({} remaining) — confirm Passkey to extend +{extend_mins}m.",
+                                (lease.renew_window_secs / 60).max(1),
+                                RoleLeaseView::format_mm_ss(lease.seconds_remaining),
+                            ),
+                            active: true,
+                            expires_at: Some(RoleLeaseView::format_mm_ss(lease.seconds_remaining)),
+                            requires_step_up: true,
+                            tone: SemanticTone::Warn,
+                            action: ActionControl::new(
+                                format!("role-renew:{}", r.role_id),
+                                copy::RENEW_ROLE_PASSKEY_BTN,
+                                format!("role-renew:{}", r.role_id),
+                            )
+                            .with_tone(SemanticTone::Info),
+                        });
                     }
-                })
-                .collect();
+                }
+            }
 
             let has_timed_active = sr.lock_all_enabled
                 || auth.active_roles.iter().any(|r| {
