@@ -29,7 +29,7 @@ use crate::state::{
 };
 use crate::webauthn::{
     b64url_decode, b64url_encode, elevate_start_body, passkey_manage_start_body,
-    register_start_body, wrap_credential_envelope_json,
+    register_start_body, renew_start_body, wrap_credential_envelope_json,
 };
 
 thread_local! {
@@ -890,6 +890,10 @@ fn spawn_webauthn(state: Rc<RefCell<ConsoleState>>, worker: Worker, req: WebAuth
         WebAuthnRequest::ElevateTimedRole { role_id } => {
             start_webauthn_ceremony(&creds, false, &elevate_url, &elevate_start_body(role_id))
         }
+        WebAuthnRequest::RenewTimedRole { role_id } => {
+            let renew_url = format!("{origin}{}", paths::role_renew_start(role_id));
+            start_webauthn_ceremony(&creds, false, &renew_url, &renew_start_body(role_id))
+        }
         WebAuthnRequest::RemovePasskey { .. } => {
             start_webauthn_ceremony(&creds, false, &elevate_url, passkey_manage_start_body())
         }
@@ -922,6 +926,13 @@ fn spawn_webauthn(state: Rc<RefCell<ConsoleState>>, worker: Worker, req: WebAuth
             WebAuthnRequest::ElevateTimedRole { role_id } => send(
                 &worker_for_done,
                 &UiCommand::ElevateWithPasskey {
+                    role_id,
+                    assertion_json: envelope,
+                },
+            ),
+            WebAuthnRequest::RenewTimedRole { role_id } => send(
+                &worker_for_done,
+                &UiCommand::RenewRoleWithPasskey {
                     role_id,
                     assertion_json: envelope,
                 },

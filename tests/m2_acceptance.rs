@@ -310,6 +310,7 @@ fn m2_52_59_header_roles_budget_activity_reset_and_selective_expiry() {
                 idle_ttl_secs: 49,
                 seconds_remaining: 99,
                 idle_timer: 49,
+                ..RoleLeaseView::default()
             }),
         },
         RoleBadgeView {
@@ -359,6 +360,7 @@ fn m2_52_59_header_roles_budget_activity_reset_and_selective_expiry() {
                 idle_ttl_secs: 15,
                 seconds_remaining: 20,
                 idle_timer: 15,
+                ..RoleLeaseView::default()
             },
             RoleLeaseView {
                 role_id: "platform-admin".into(),
@@ -371,6 +373,7 @@ fn m2_52_59_header_roles_budget_activity_reset_and_selective_expiry() {
                 idle_ttl_secs: 4,
                 seconds_remaining: 5,
                 idle_timer: 4,
+                ..RoleLeaseView::default()
             },
         ],
         active_roles: vec![
@@ -685,4 +688,174 @@ fn m2_user_profile_preferences_active_ux_and_opendyslexic_rendering() {
     assert!(gate_html.contains(
         r#"data-control-id="profile-skin:wireframe" data-action="profile-skin:wireframe" aria-pressed="false" data-selected="false" disabled="disabled" aria-disabled="true""#
     ));
+}
+
+#[test]
+fn m2_super_operator_unlocks_all_8_areas_and_surfaces_last_2m_renewal_in_both_skins() {
+    use mu_console_protocol::StepUpRequirement;
+    let mut state = ConsoleState::new();
+    let super_spec = RoleSpecDto {
+        id: "super-operator".into(),
+        display_name: Some("Super Operator".into()),
+        description: "All-access Passkey role (2m idle, 15m session, single +15m last-2m renewal)"
+            .into(),
+        activation: RoleActivationDto::super_operator(),
+        step_up: StepUpRequirement::Passkey,
+    };
+
+    let all_47_policies: Vec<String> = vec![
+        "system:status.read".into(),
+        "system:dashboard.read".into(),
+        "ci:queue.read".into(),
+        "ci:jobs.read".into(),
+        "ci:jobs.restart".into(),
+        "ci:jobs.resume".into(),
+        "ci:nodes.read".into(),
+        "ci:repos.public.read".into(),
+        "ci:repos.private.read".into(),
+        "cd:runs.read".into(),
+        "cd:steps.read".into(),
+        "ab:slots.read".into(),
+        "ab:gate.logs.read".into(),
+        "ab:rollback".into(),
+        "reg:packages.read".into(),
+        "reg:canaries.read".into(),
+        "reg:cas.read".into(),
+        "reg:taints.read".into(),
+        "reg:canaries.write".into(),
+        "obs:problems.read".into(),
+        "obs:traces.read".into(),
+        "obs:logs.read".into(),
+        "obs:metrics.read".into(),
+        "obs:ingress.write".into(),
+        "mr:models.read".into(),
+        "mr:connect.write".into(),
+        "platform:users.write".into(),
+        "platform:roles.write".into(),
+        "platform:folios.write".into(),
+        "platform:invites.write".into(),
+        "platform:maintenance.write".into(),
+    ];
+
+    let mut lease = RoleLeaseView {
+        role_id: "super-operator".into(),
+        display_name: Some("Super Operator".into()),
+        activated_at_ms: 0,
+        last_activity_at_ms: 0,
+        hard_expires_at_ms: 900_000,
+        idle_expires_at_ms: 120_000,
+        hard_ttl_secs: 900,
+        idle_ttl_secs: 120,
+        renew_window_secs: 120,
+        renew_extend_secs: 900,
+        max_renewals: 1,
+        renewals_used: 0,
+        seconds_remaining: 900,
+        idle_timer: 120,
+        can_renew: false,
+    };
+    let mut vm = ViewModel {
+        auth: AuthState::from_session(&AuthSessionDto {
+            authenticated: true,
+            github_login: Some("LMA1980".into()),
+            invite_bound: true,
+            passkey_count: 1,
+            baseline_role: Some("operator".into()),
+            bound_roles: vec!["operator".into(), "super-operator".into()],
+            bound_role_specs: vec![super_spec.clone()],
+            active_roles: vec![super_spec],
+            leases: vec![lease.clone()],
+            active_policies: all_47_policies.clone(),
+            ..AuthSessionDto::default()
+        }),
+        ..ViewModel::default()
+    };
+    push_vm(&mut state, vm.clone());
+
+    for area in Area::ALL {
+        assert!(state.can_access_area(area), "expected access to {area:?}");
+    }
+    let (init_html, init_wf) = render_both_skins(&state);
+    assert!(init_html.contains("+Super Operator[15:00][02:00]"));
+    assert!(init_wf.contains("+Super Operator[15:00][02:00]"));
+    assert!(!init_html.contains("banner-role-renew-super-operator"));
+    assert!(!init_wf.contains("role-renew:super-operator"));
+
+    // Final 2m renewal window opens at 120s remaining -> both banner and +role modal render controls.
+    lease.hard_expires_at_ms = 120_000;
+    lease.idle_expires_at_ms = 120_000;
+    lease.seconds_remaining = 120;
+    lease.can_renew = true;
+    vm.auth = AuthState::from_session(&AuthSessionDto {
+        authenticated: true,
+        github_login: Some("LMA1980".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        baseline_role: Some("operator".into()),
+        bound_roles: vec!["operator".into(), "super-operator".into()],
+        bound_role_specs: vm.auth.bound_role_specs.clone(),
+        active_roles: vec![RoleSpecDto {
+            id: "super-operator".into(),
+            display_name: Some("Super Operator".into()),
+            description: "All-access Passkey role".into(),
+            activation: RoleActivationDto::super_operator(),
+            step_up: StepUpRequirement::Passkey,
+        }],
+        leases: vec![lease.clone()],
+        active_policies: all_47_policies.clone(),
+        ..AuthSessionDto::default()
+    });
+    push_vm(&mut state, vm.clone());
+    let _ = state.open_session_roles();
+
+    let (win_html, win_wf) = render_both_skins(&state);
+    assert!(win_html.contains("banner-role-renew-super-operator"));
+    assert!(win_html.contains("role-renew:super-operator"));
+    assert!(win_wf.contains("role-renew:super-operator"));
+    assert!(win_wf.contains("Renew +15m"));
+
+    // Clicking role-renew queues WebAuthnRequest::RenewTimedRole.
+    let _ = state.activate_target("role-renew:super-operator");
+    assert_eq!(
+        state.pending_webauthn,
+        Some(mu_console_ui::state::WebAuthnRequest::RenewTimedRole {
+            role_id: "super-operator".into()
+        })
+    );
+    let renew_cmds = state.complete_role_renewal("super-operator", "{}");
+    assert_eq!(
+        renew_cmds,
+        vec![UiCommand::RenewRoleWithPasskey {
+            role_id: "super-operator".into(),
+            assertion_json: "{}".into(),
+        }]
+    );
+
+    // After single renewal (`renewals_used == 1`), renewal controls stay suppressed even <= 2m left.
+    lease.renewals_used = 1;
+    lease.can_renew = false;
+    lease.seconds_remaining = 90;
+    vm.auth = AuthState::from_session(&AuthSessionDto {
+        authenticated: true,
+        github_login: Some("LMA1980".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        baseline_role: Some("operator".into()),
+        bound_roles: vec!["operator".into(), "super-operator".into()],
+        bound_role_specs: vm.auth.bound_role_specs.clone(),
+        active_roles: vec![RoleSpecDto {
+            id: "super-operator".into(),
+            display_name: Some("Super Operator".into()),
+            description: "All-access Passkey role".into(),
+            activation: RoleActivationDto::super_operator(),
+            step_up: StepUpRequirement::Passkey,
+        }],
+        leases: vec![lease],
+        active_policies: all_47_policies,
+        ..AuthSessionDto::default()
+    });
+    push_vm(&mut state, vm);
+    let (done_html, done_wf) = render_both_skins(&state);
+    assert!(!done_html.contains("banner-role-renew-super-operator"));
+    assert!(!done_wf.contains("role-renew:super-operator"));
 }

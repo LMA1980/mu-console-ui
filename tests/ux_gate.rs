@@ -1060,6 +1060,7 @@ fn u21_u23_header_budget_and_passkey_profile_tabs() {
             idle_ttl_secs: 300,
             seconds_remaining: 90,
             idle_timer: 30,
+            ..RoleLeaseView::default()
         }),
     }];
     vm.user_profile = Some(UserProfileDto {
