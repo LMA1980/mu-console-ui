@@ -58,11 +58,11 @@ pub const FONT_DYSLEXIC_LABEL: &str = "OpenDyslexicM";
 pub const SKIN_HTML_LABEL: &str = "HTML Core";
 pub const SKIN_WIREFRAME_LABEL: &str = "Wireframe SVG";
 
-/// Session roles & mandatory Passkey gate copy.
+/// Session roles & Passkey onboarding guidance copy.
 pub const PASSKEY_GATE_TITLE: &str = "Register Passkey";
-pub const PASSKEY_GATE_REASON: &str =
-    "Passkey enrollment is required before baseline console access activates. Register a synced passkey (such as 1Password) or a physical FIDO2 security key.";
+pub const PASSKEY_GATE_REASON: &str = "Add a passkey (1Password, browser/OS passkey manager, or FIDO2 security key) to unlock operator roles, deployments, and platform controls. Choose Not Now to browse public Dashboard and CI views first.";
 pub const REGISTER_PASSKEY_BTN: &str = "Register Passkey";
+pub const DISMISS_PASSKEY_GATE_BTN: &str = "Not Now";
 pub const ROLE_HEADER_EMPTY: &str = "+role";
 pub const USER_PROFILE_TITLE: &str = "User Profile";
 pub const SESSION_ROLES_TITLE: &str = "Session Roles";

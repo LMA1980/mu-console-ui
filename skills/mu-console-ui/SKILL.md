@@ -23,7 +23,7 @@ Use these guidelines when developing or integrating `mu-console-ui`, the unified
   - Cold boot (`AuthStatus::Unresolved`) disables all 8 areas with zero cached telemetry. Strip `?invite=` into `sessionStorage` immediately without disclosing invite status in anonymous or `AuthorizationDenied` UI.
   - Do not rely solely on `AuthState::is_authenticated()`; gate active-operator capabilities strictly on `auth.status == AuthStatus::Active`.
 - **Passkey Onboarding, `+role` Leases & Risk Confirmation (`roles`, `state`)**:
-  - Zero-Passkey bound sessions enforce a non-dismissible `PasskeyEnrollmentGate` (`attestation: "none"`, `userVerification: "preferred"`, no `authenticatorAttachment`).
+  - Zero-Passkey bound sessions auto-open a dismissible guiding `PasskeyEnrollmentGate` (`attestation: "none"`, `userVerification: "preferred"`, no `authenticatorAttachment`) while preserving public Dashboard/CI navigation and `@user -> Passkeys` access unless `anonymous_lockdown` is enabled.
   - `+role[seconds_remaining][idle_timer]` adheres strictly to UTF-8 `chars().count()` bounds (`…(+N)` overflow), resets idle timers only on explicit `pointerdown`/`keydown` events, and expires only elapsed `Timed` leases on `00:00`.
   - Stateful/destructive actions (CI job restart, A|B rollback, Platform admin mutations) require `RiskConfirm` (`ResumeJob` stays 1-click); `Platform > Users & Invites` enforces the last-admin protection guard.
 

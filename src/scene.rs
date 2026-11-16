@@ -134,8 +134,18 @@ pub fn build_console_scene(state: &ConsoleState, _viewport: SceneViewport) -> Co
     // Header chrome: font toggle ONLY when anonymous/denied; @user + +role + Sign Out when active.
     populate_header_chrome(state, &auth, &mut scene);
 
-    // 2. Mandatory non-dismissible 0-Passkey onboarding gate: neutral background, zero cached ops.
+    // 2. 0-Passkey onboarding guidance: non-blocking top banner + dismissible modal, locking out
+    // all views ONLY when `anonymous_lockdown` is enabled.
     if auth.passkey_enrollment_required || auth.status == AuthStatus::PasskeyEnrollmentRequired {
+        if let Some(ref err) = state.webauthn_error {
+            scene.banners.push(SceneBanner {
+                id: "banner-webauthn-error".into(),
+                tone: SemanticTone::Fail,
+                title: "Passkey enrollment failed".into(),
+                message: err.clone(),
+                action: None,
+            });
+        }
         scene.banners.push(SceneBanner {
             id: "banner-passkey-gate".into(),
             tone: SemanticTone::Warn,
@@ -147,28 +157,30 @@ pub fn build_console_scene(state: &ConsoleState, _viewport: SceneViewport) -> Co
                 "register-passkey",
             )),
         });
-        scene.sections.push(
-            SceneSection::new("sec-passkey-hold", copy::PASSKEY_GATE_TITLE).with_component(
-                SceneComponent::KeyValueList(KeyValueList {
-                    id: "kv-passkey-hold".into(),
-                    title: "Passkey Onboarding".into(),
-                    entries: vec![KeyValueEntry {
-                        key: "Status".into(),
-                        value: "Enrollment required".into(),
-                        detail: Some(copy::PASSKEY_GATE_REASON.into()),
-                        tone: SemanticTone::Warn,
-                        mono: false,
-                        action: Some(ActionControl::new(
-                            "dlg-passkey-register",
-                            copy::REGISTER_PASSKEY_BTN,
-                            "dlg-passkey-register",
-                        )),
-                    }],
-                }),
-            ),
-        );
-        scene.footer_status = Some("Passkey gate active".into());
-        return scene;
+        if auth.anonymous_lockdown {
+            scene.sections.push(
+                SceneSection::new("sec-passkey-hold", copy::PASSKEY_GATE_TITLE).with_component(
+                    SceneComponent::KeyValueList(KeyValueList {
+                        id: "kv-passkey-hold".into(),
+                        title: "Passkey Onboarding".into(),
+                        entries: vec![KeyValueEntry {
+                            key: "Status".into(),
+                            value: "Enrollment required".into(),
+                            detail: Some(copy::PASSKEY_GATE_REASON.into()),
+                            tone: SemanticTone::Warn,
+                            mono: false,
+                            action: Some(ActionControl::new(
+                                "hold-passkey-register",
+                                copy::REGISTER_PASSKEY_BTN,
+                                "hold-passkey-register",
+                            )),
+                        }],
+                    }),
+                ),
+            );
+            scene.footer_status = Some("Passkey gate active".into());
+            return scene;
+        }
     }
 
     // 3. AuthorizationDenied notice: zero invite token disclosure.
@@ -258,7 +270,12 @@ pub fn build_dialog_model(state: &ConsoleState) -> Option<theme_scene::DialogMod
             theme_scene::DialogModel::PasskeyEnrollmentGate(PasskeyEnrollmentDialog {
                 dialog_id: "dlg-passkey-gate".into(),
                 title: copy::PASSKEY_GATE_TITLE.into(),
-                reason: copy::PASSKEY_GATE_REASON.into(),
+                reason: match state.webauthn_error.as_deref() {
+                    Some(err) => {
+                        format!("{err} — {}", copy::PASSKEY_GATE_REASON)
+                    }
+                    None => copy::PASSKEY_GATE_REASON.into(),
+                },
                 account_subject: gate.github_login,
                 passkey_count: gate.passkey_count,
                 enroll_action: ActionControl::new(
@@ -600,16 +617,16 @@ fn populate_header_chrome(state: &ConsoleState, auth: &AuthState, scene: &mut Co
         }
         AuthStatus::PasskeyEnrollmentRequired | AuthStatus::Active => {
             // Active sessions remove `[Aa]` from top bar (settings live under `@user -> Preferences`).
-            scene.font_toggle = None;
-            let gated = auth.passkey_enrollment_required
+            let role_gated = auth.passkey_enrollment_required
                 || auth.status == AuthStatus::PasskeyEnrollmentRequired;
+            scene.font_toggle = None;
             let handle = auth.github_login.as_deref().unwrap_or("operator");
             scene.header_actions.push(
-                ActionControl::new("hdr-user", format!("@{handle}"), "hdr-user").disabled(gated),
+                ActionControl::new("hdr-user", format!("@{handle}"), "hdr-user").disabled(false),
             );
             scene.header_actions.push(
                 ActionControl::new("hdr-role", state.format_header_roles(), "hdr-role")
-                    .disabled(gated)
+                    .disabled(role_gated)
                     .with_tone(SemanticTone::Info),
             );
             scene.header_actions.push(
@@ -632,10 +649,7 @@ fn font_toggle_control(font: CrtFont) -> ActionControl {
 }
 
 fn build_area_tabs(state: &ConsoleState, auth: &AuthState) -> Vec<NavTab> {
-    let gated = !auth.is_resolved()
-        || auth.passkey_enrollment_required
-        || auth.status == AuthStatus::PasskeyEnrollmentRequired
-        || auth.anonymous_lockdown;
+    let gated = !auth.is_resolved() || auth.anonymous_lockdown;
 
     AREAS
         .iter()
@@ -858,6 +872,15 @@ fn build_auth_required_section(state: &ConsoleState, auth: &AuthState) -> SceneS
             ActionControl::new("auth-gate-signin", copy::SIGN_OUT_LABEL, "auth-gate-signin")
                 .with_attr("data-href", state.sign_out_href())
                 .with_tone(SemanticTone::Warn),
+        );
+    } else if auth.status == AuthStatus::PasskeyEnrollmentRequired {
+        controls.push(
+            ActionControl::new(
+                "auth-gate-register-passkey",
+                copy::REGISTER_PASSKEY_BTN,
+                "auth-gate-register-passkey",
+            )
+            .with_tone(SemanticTone::Info),
         );
     } else if auth.status == AuthStatus::Active {
         controls.push(

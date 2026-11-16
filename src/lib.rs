@@ -18,6 +18,7 @@ pub mod roles;
 pub mod router;
 pub mod scene;
 pub mod state;
+pub mod webauthn;
 
 pub use components::{
     filter_placeholder, render_console, render_console_with_skin, render_html_shell,
