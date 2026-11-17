@@ -66,12 +66,25 @@ pub const DISMISS_PASSKEY_GATE_BTN: &str = "Not Now";
 pub const ROLE_HEADER_EMPTY: &str = "+role";
 pub const USER_PROFILE_TITLE: &str = "User Profile";
 pub const SESSION_ROLES_TITLE: &str = "Session Roles";
+pub const MANAGE_SESSION_ROLES_BTN: &str = "Manage Session Roles";
 pub const LOCK_TIMED_ROLES_BTN: &str = "Lock All Timed Roles";
 pub const ENABLE_ROLE_BTN: &str = "Enable";
 pub const DISABLE_ROLE_BTN: &str = "Disable";
+pub const UNASSIGNED_ROLE_BTN: &str = "Unassigned";
 pub const STEP_UP_PASSKEY_BTN: &str = "Unlock with Passkey";
 pub const RENEW_ROLE_PASSKEY_BTN: &str = "Renew +15m (Passkey)";
 pub const RENEW_BANNER_TITLE: &str = "Role renewal available";
+
+/// Dashboard (`Overview`) section headings and operational status copy.
+pub const DASH_APPLICATIONS_TITLE: &str = "Applications";
+pub const DASH_APPLICATIONS_MATRIX_TITLE: &str = "Application Status";
+pub const DASH_FLEET_TITLE: &str = "Fleet";
+pub const DASH_FLEET_TABLE_TITLE: &str = "Cluster Host Nodes";
+pub const DASH_NEEDS_ATTENTION_TITLE: &str = "Needs Attention";
+pub const DASH_DEGRADED_ANON_TITLE: &str = "Degraded Application Status";
+pub const DASH_NOMINAL_TITLE: &str = "All Applications Nominal";
+pub const DASH_ROLLUP_MESSAGE: &str = "Operational status across platform applications.";
+pub const NO_FLEET_NODES: &str = "No cluster host nodes reported.";
 
 /// User profile modal tab labels.
 pub const TAB_USER_DETAILS: &str = "User Details";
@@ -85,7 +98,8 @@ pub const PUBLIC_STEPS_SUBTITLE: &str =
 pub const OPEN_GITHUB_COMMIT: &str = "Open on GitHub";
 
 /// Empty states and ARIA helpers.
-pub const NO_ATTENTION_ITEMS: &str = "No active subsystem alerts or failing jobs.";
+pub const NO_ATTENTION_ITEMS: &str =
+    "No active application alerts, failing jobs, or offline nodes.";
 pub const NO_FILTER_MATCHES: &str = "No items match the current filter.";
 
 /// Human-facing label for a [`Area`] tab.

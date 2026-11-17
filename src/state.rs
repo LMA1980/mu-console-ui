@@ -9,8 +9,8 @@ use mu_console_protocol::{
     AbDeploySubView, Area, AuthState, AuthStatus, CiJobSummary, CiSubView, ConsoleSkin, CrtFont,
     DialogModel, LogSeverity, MaintenanceMode, PackageEcosystem, PasskeyEnrollmentGateModel,
     RepoId, RepoScore, RepoStatus, RiskConfirmAction, RiskConfirmDialogModel, Route,
-    SessionRolesDialogModel, SubView, SubmoduleId, SubsystemId, UiCommand, UserProfileDialogModel,
-    UserProfileTab, Visibility,
+    SessionRoleDescriptor, SessionRolesDialogModel, SubView, SubmoduleId, SubsystemId, UiCommand,
+    UserProfileDialogModel, UserProfileTab, ViewModel, Visibility,
 };
 use mu_console_theme::metrics::{CrtFontMetrics, HURMIT, OPEN_DYSLEXIC};
 
@@ -409,6 +409,7 @@ pub struct ConsoleState {
     pub route_sync_dirty: bool,
     pub prefs_dirty: bool,
     pub local_dialog: Option<DialogModel>,
+    session_roles_worker_synced: bool,
     pub passkey_gate_dismissed: bool,
     pub profile_tab: UserProfileTab,
     pub profile_display_name_draft: String,
@@ -483,6 +484,7 @@ impl ConsoleState {
             route_sync_dirty: false,
             prefs_dirty: false,
             local_dialog: None,
+            session_roles_worker_synced: false,
             passkey_gate_dismissed: false,
             profile_tab: UserProfileTab::UserDetails,
             profile_display_name_draft: String::new(),
@@ -706,14 +708,51 @@ impl ConsoleState {
         self.set_skin(next)
     }
 
-    /// Resolve active dialog (`UserProfile` and other modals take precedence; `PasskeyEnrollmentGate`
-    /// auto-opens when `passkey_count == 0` unless dismissed via `Not Now` / `Escape`).
+    /// Resolve active dialog (`UserProfile`, `RiskConfirm`, and `SessionRoles` reconcile cleanly
+    /// with worker `ViewModel::active_dialog`; `PasskeyEnrollmentGate` auto-opens when
+    /// `passkey_count == 0` unless dismissed via `Not Now` / `Escape`).
     #[must_use]
     pub fn active_dialog(&self) -> Option<DialogModel> {
+        let worker_dlg = self.client.view().and_then(|v| v.active_dialog.as_ref());
         if let Some(ref local) = self.local_dialog {
-            return Some(local.clone());
+            match local {
+                DialogModel::SessionRoles(local_sr) => {
+                    if let Some(DialogModel::InviteCreatedOnce(_)) = worker_dlg {
+                        return worker_dlg.cloned();
+                    }
+                    let mut merged = match worker_dlg {
+                        Some(DialogModel::SessionRoles(worker_sr)) => {
+                            let mut sr = worker_sr.clone();
+                            if sr.roles.is_empty() {
+                                sr.roles.clone_from(&local_sr.roles);
+                            }
+                            if sr.error_message.is_none() {
+                                sr.error_message.clone_from(&local_sr.error_message);
+                            }
+                            sr
+                        }
+                        _ => local_sr.clone(),
+                    };
+                    if merged.error_message.is_none() {
+                        merged.error_message.clone_from(&self.webauthn_error);
+                    }
+                    return Some(DialogModel::SessionRoles(merged));
+                }
+                other => return Some(other.clone()),
+            }
         }
-        if let Some(worker_dlg) = self.client.view().and_then(|v| v.active_dialog.as_ref()) {
+        if let Some(worker_dlg) = worker_dlg {
+            if let DialogModel::SessionRoles(worker_sr) = worker_dlg {
+                let mut sr = worker_sr.clone();
+                if sr.roles.is_empty() {
+                    let auth = self.auth();
+                    sr.roles = resolve_descriptors_from_view(&auth, self.client.view());
+                }
+                if sr.error_message.is_none() {
+                    sr.error_message.clone_from(&self.webauthn_error);
+                }
+                return Some(DialogModel::SessionRoles(sr));
+            }
             if !matches!(worker_dlg, DialogModel::PasskeyEnrollmentGate(_))
                 || !self.passkey_gate_dismissed
             {
@@ -807,7 +846,31 @@ impl ConsoleState {
     pub fn on_webauthn_error(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         self.aria_assertive = format!("Passkey ceremony failed: {msg}");
-        self.webauthn_error = Some(msg);
+        self.webauthn_error = Some(msg.clone());
+        if let Some(DialogModel::SessionRoles(ref mut sr)) = self.local_dialog {
+            sr.error_message = Some(msg.clone());
+        }
+        if let Some(DialogModel::SessionRoles(ref mut sr)) = self
+            .client
+            .view_mut()
+            .and_then(|v| v.active_dialog.as_mut())
+        {
+            sr.error_message = Some(msg);
+        }
+    }
+
+    fn clear_session_roles_error(&mut self) {
+        self.webauthn_error = None;
+        if let Some(DialogModel::SessionRoles(ref mut sr)) = self.local_dialog {
+            sr.error_message = None;
+        }
+        if let Some(DialogModel::SessionRoles(ref mut sr)) = self
+            .client
+            .view_mut()
+            .and_then(|v| v.active_dialog.as_mut())
+        {
+            sr.error_message = None;
+        }
     }
 
     /// Apply decoded postcard frame from the data worker and handle auth/expiry route transitions.
@@ -833,23 +896,32 @@ impl ConsoleState {
             .prev_lease_ids
             .iter()
             .any(|id| !next_lease_ids.iter().any(|cur| cur == id));
-        if matches!(self.local_dialog, Some(DialogModel::SessionRoles(_))) {
-            let mut roles = match &view.active_dialog {
-                Some(DialogModel::SessionRoles(sr)) if !sr.roles.is_empty() => sr.roles.clone(),
-                _ => Vec::new(),
-            };
-            if roles.is_empty() {
-                roles = self.auth().session_role_descriptors();
+
+        match &view.active_dialog {
+            Some(DialogModel::SessionRoles(_)) => {
+                self.session_roles_worker_synced = true;
+                if matches!(self.local_dialog, Some(DialogModel::SessionRoles(_))) {
+                    self.local_dialog = None;
+                }
             }
-            self.local_dialog = Some(DialogModel::SessionRoles(SessionRolesDialogModel {
-                github_login: view
-                    .auth
-                    .github_login
-                    .clone()
-                    .unwrap_or_else(|| "operator".into()),
-                roles,
-                lock_all_enabled: !view.auth.leases.is_empty(),
-            }));
+            Some(DialogModel::InviteCreatedOnce(_)) => {
+                self.session_roles_worker_synced = false;
+                self.local_dialog = None;
+            }
+            Some(_) => {
+                self.session_roles_worker_synced = false;
+            }
+            None => {
+                if self.client.last_frame_closed_dialog() || self.session_roles_worker_synced {
+                    self.session_roles_worker_synced = false;
+                    if matches!(self.local_dialog, Some(DialogModel::SessionRoles(_))) {
+                        self.local_dialog = None;
+                    }
+                    self.webauthn_error = None;
+                } else if let Some(DialogModel::SessionRoles(ref mut sr)) = self.local_dialog {
+                    sync_session_roles_model(sr, &view.auth, Some(view));
+                }
+            }
         }
 
         if let Some(profile) = &view.user_profile {
@@ -890,7 +962,9 @@ impl ConsoleState {
         {
             self.passkey_gate_dismissed = false;
         }
-        if next_status == AuthStatus::Active
+        let transitioned_to_active =
+            self.prev_auth_status != AuthStatus::Active && next_status == AuthStatus::Active;
+        if transitioned_to_active
             || !matches!(
                 next_status,
                 AuthStatus::PasskeyEnrollmentRequired | AuthStatus::Active
@@ -898,7 +972,7 @@ impl ConsoleState {
         {
             self.webauthn_error = None;
         }
-        if self.prev_auth_status != AuthStatus::Active && next_status == AuthStatus::Active {
+        if transitioned_to_active {
             if let Some(stashed) = self.stashed_deep_link.take() {
                 let parsed = parse_hash(&stashed);
                 self.route = parsed;
@@ -1342,25 +1416,22 @@ impl ConsoleState {
         if auth.status != AuthStatus::Active {
             return Vec::new();
         }
-        let mut roles = self
-            .client
-            .view()
-            .and_then(|v| {
-                if let Some(DialogModel::SessionRoles(sr)) = &v.active_dialog {
-                    (!sr.roles.is_empty()).then(|| sr.roles.clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+        self.webauthn_error = None;
+        let mut roles = resolve_descriptors_from_view(&auth, self.client.view());
         if roles.is_empty() {
-            roles = auth.session_role_descriptors();
+            if let Some(DialogModel::SessionRoles(sr)) =
+                self.client.view().and_then(|v| v.active_dialog.as_ref())
+            {
+                roles.clone_from(&sr.roles);
+            }
         }
         let dlg = DialogModel::SessionRoles(SessionRolesDialogModel {
             github_login: auth.github_login.unwrap_or_else(|| "operator".into()),
             roles,
             lock_all_enabled: !auth.leases.is_empty(),
+            error_message: None,
         });
+        self.session_roles_worker_synced = false;
         self.local_dialog = Some(dlg.clone());
         vec![UiCommand::OpenDialog(dlg)]
     }
@@ -1545,6 +1616,7 @@ impl ConsoleState {
             if self.auth().status != AuthStatus::Active {
                 return Vec::new();
             }
+            self.clear_session_roles_error();
             return vec![UiCommand::EnableRole {
                 role_id: role_id.into(),
             }];
@@ -1553,6 +1625,7 @@ impl ConsoleState {
             if self.auth().status != AuthStatus::Active {
                 return Vec::new();
             }
+            self.clear_session_roles_error();
             return vec![UiCommand::DisableRole {
                 role_id: role_id.into(),
             }];
@@ -1561,7 +1634,7 @@ impl ConsoleState {
             if self.auth().status != AuthStatus::Active {
                 return Vec::new();
             }
-            self.webauthn_error = None;
+            self.clear_session_roles_error();
             self.pending_webauthn = Some(WebAuthnRequest::ElevateTimedRole {
                 role_id: role_id.into(),
             });
@@ -1571,7 +1644,7 @@ impl ConsoleState {
             if self.auth().status != AuthStatus::Active {
                 return Vec::new();
             }
-            self.webauthn_error = None;
+            self.clear_session_roles_error();
             self.pending_webauthn = Some(WebAuthnRequest::RenewTimedRole {
                 role_id: role_id.into(),
             });
@@ -1785,11 +1858,12 @@ impl ConsoleState {
             }
             "profile-font:hurmit" => self.select_profile_font(CrtFont::Hurmit),
             "profile-font:dyslexic" => self.select_profile_font(CrtFont::OpenDyslexic),
-            "hdr-role" | "open-session-roles" => self.open_session_roles(),
+            "hdr-role" | "open-session-roles" | "profile-manage-roles" => self.open_session_roles(),
             "roles-lock-all" | "profile-lock-timed" => {
                 if self.auth().status != AuthStatus::Active {
                     return Vec::new();
                 }
+                self.clear_session_roles_error();
                 vec![UiCommand::LockTimedRoles]
             }
             "btn-cancel"
@@ -2077,29 +2151,33 @@ impl ConsoleState {
         if matches!(dlg, DialogModel::PasskeyEnrollmentGate(_)) {
             self.passkey_gate_dismissed = true;
             self.local_dialog = None;
+            self.session_roles_worker_synced = false;
             return vec![UiCommand::CloseDialog];
         }
         if !dlg.is_dismissible() {
             return Vec::new();
         }
+        if matches!(dlg, DialogModel::SessionRoles(_)) {
+            self.webauthn_error = None;
+        }
         self.local_dialog = None;
+        self.session_roles_worker_synced = false;
+        if let Some(view) = self.client.view_mut() {
+            if !matches!(
+                view.active_dialog,
+                Some(DialogModel::PasskeyEnrollmentGate(_))
+            ) {
+                view.active_dialog = None;
+            }
+        }
         vec![UiCommand::CloseDialog]
     }
 
     /// Handle keyboard navigation and shortcuts.
     pub fn on_key(&mut self, key: &str, shift: bool, now_ms: u64) -> Option<UiCommand> {
         if key == "Escape" {
-            if let Some(dlg) = self.active_dialog() {
-                if matches!(dlg, DialogModel::PasskeyEnrollmentGate(_)) {
-                    self.passkey_gate_dismissed = true;
-                    self.local_dialog = None;
-                    return Some(UiCommand::CloseDialog);
-                }
-                if dlg.is_dismissible() {
-                    self.local_dialog = None;
-                    return Some(UiCommand::CloseDialog);
-                }
-                return None;
+            if self.active_dialog().is_some() {
+                return self.dismiss_dialog().into_iter().next();
             }
             if self.filter_focused || !self.filter_query.is_empty() {
                 self.filter_focused = false;
@@ -2172,21 +2250,87 @@ impl ConsoleState {
                 }
                 cmds.push(UiCommand::RefreshSession);
             }
-            if matches!(self.local_dialog, Some(DialogModel::SessionRoles(_))) {
-                let roles = view.auth.session_role_descriptors();
-                self.local_dialog = Some(DialogModel::SessionRoles(SessionRolesDialogModel {
-                    github_login: view
-                        .auth
-                        .github_login
-                        .clone()
-                        .unwrap_or_else(|| "operator".into()),
-                    roles,
-                    lock_all_enabled: !view.auth.leases.is_empty(),
-                }));
+            if let Some(DialogModel::SessionRoles(ref mut sr)) = view.active_dialog {
+                let auth_snap = view.auth.clone();
+                let platform_roles = view.platform.roles.clone();
+                sync_session_roles_model_parts(sr, &auth_snap, &platform_roles);
+            }
+            if let Some(DialogModel::SessionRoles(ref mut sr)) = self.local_dialog {
+                let auth_snap = view.auth.clone();
+                let platform_roles = view.platform.roles.clone();
+                sync_session_roles_model_parts(sr, &auth_snap, &platform_roles);
             }
         }
         cmds
     }
+}
+
+fn resolve_descriptors_from_view(
+    auth: &AuthState,
+    view: Option<&ViewModel>,
+) -> Vec<SessionRoleDescriptor> {
+    let platform_roles = view.map_or(&[][..], |v| v.platform.roles.as_slice());
+    resolve_descriptors_from_parts(auth, platform_roles)
+}
+
+fn resolve_descriptors_from_parts(
+    auth: &AuthState,
+    platform_roles: &[mu_console_protocol::dto::RoleSpecDto],
+) -> Vec<SessionRoleDescriptor> {
+    let mut descs = auth.session_role_descriptors();
+    for d in &mut descs {
+        if let Some(spec) = platform_roles.iter().find(|r| r.id == d.role_id) {
+            if d.description.is_empty() && !spec.description.is_empty() {
+                d.description.clone_from(&spec.description);
+            }
+            if d.display_name.is_none() {
+                d.display_name.clone_from(&spec.display_name);
+            }
+        }
+    }
+    if auth.catalog_role_specs.is_empty() {
+        for spec in platform_roles {
+            if !descs.iter().any(|d| d.role_id == spec.id) {
+                descs.push(SessionRoleDescriptor {
+                    role_id: spec.id.clone(),
+                    display_name: spec.display_name.clone(),
+                    description: spec.description.clone(),
+                    activation: spec.activation,
+                    step_up: spec.step_up,
+                    active: false,
+                    lease: None,
+                    step_up_verified: false,
+                    unassigned: true,
+                });
+            }
+        }
+    }
+    descs
+}
+
+fn sync_session_roles_model(
+    sr: &mut SessionRolesDialogModel,
+    auth: &AuthState,
+    view: Option<&ViewModel>,
+) {
+    let platform_roles = view.map_or(&[][..], |v| v.platform.roles.as_slice());
+    sync_session_roles_model_parts(sr, auth, platform_roles);
+}
+
+fn sync_session_roles_model_parts(
+    sr: &mut SessionRolesDialogModel,
+    auth: &AuthState,
+    platform_roles: &[mu_console_protocol::dto::RoleSpecDto],
+) {
+    sr.github_login = auth
+        .github_login
+        .clone()
+        .unwrap_or_else(|| "operator".into());
+    let resolved = resolve_descriptors_from_parts(auth, platform_roles);
+    if !resolved.is_empty() || sr.roles.is_empty() {
+        sr.roles = resolved;
+    }
+    sr.lock_all_enabled = !auth.leases.is_empty();
 }
 
 #[cfg(test)]
@@ -2361,5 +2505,137 @@ mod tests {
         .expect("encode");
         st.on_worker_frame(&snap);
         assert!(st.session_probe_error().is_none());
+    }
+
+    #[test]
+    fn session_roles_worker_sync_auto_close_error_propagation_and_profile_action() {
+        use mu_console_protocol::dto::{
+            AuthSessionDto, RoleActivationDto, RoleSpecDto, UserProfileDto,
+        };
+        use mu_console_protocol::{Delta, SessionRolesDialogModel, StepUpRequirement};
+
+        let mut st = ConsoleState::new();
+        let operator_spec = RoleSpecDto {
+            id: "operator".into(),
+            display_name: Some("Operator".into()),
+            description: "Baseline read role".into(),
+            activation: RoleActivationDto::pinned_baseline(),
+            step_up: StepUpRequirement::None,
+        };
+        let sec_ops_spec = RoleSpecDto {
+            id: "sec-ops".into(),
+            display_name: Some("Sec Ops".into()),
+            description: "Security triage role".into(),
+            activation: RoleActivationDto::elective(),
+            step_up: StepUpRequirement::None,
+        };
+        let super_spec = RoleSpecDto {
+            id: "super-operator".into(),
+            display_name: Some("Super Operator".into()),
+            description: "All-access Passkey role".into(),
+            activation: RoleActivationDto::super_operator(),
+            step_up: StepUpRequirement::Passkey,
+        };
+        let auth = AuthState::from_session(&AuthSessionDto {
+            authenticated: true,
+            github_login: Some("ops".into()),
+            invite_bound: true,
+            passkey_count: 1,
+            baseline_role: Some("operator".into()),
+            bound_roles: vec!["operator".into(), "sec-ops".into()],
+            bound_role_specs: vec![operator_spec.clone(), sec_ops_spec.clone()],
+            catalog_role_specs: vec![operator_spec, sec_ops_spec, super_spec],
+            active_roles: vec![],
+            active_policies: vec!["system:dashboard.read".into()],
+            ..AuthSessionDto::default()
+        });
+        let vm = ViewModel {
+            auth: auth.clone(),
+            user_profile: Some(UserProfileDto {
+                github_login: "ops".into(),
+                display_name: Some("ops".into()),
+                preferences: Default::default(),
+                bound_roles: vec!["operator".into(), "sec-ops".into()],
+                passkey_count: 1,
+                passkeys: vec![],
+            }),
+            ..ViewModel::default()
+        };
+        let snap = encode(&DataEvent::Snapshot(vm)).expect("encode");
+        st.on_worker_frame(&snap);
+
+        // open_session_roles opens immediately with local hydration including unassigned role.
+        assert!(matches!(
+            st.open_session_roles().as_slice(),
+            [UiCommand::OpenDialog(DialogModel::SessionRoles(_))]
+        ));
+        match st.active_dialog() {
+            Some(DialogModel::SessionRoles(sr)) => {
+                assert!(sr
+                    .roles
+                    .iter()
+                    .any(|r| r.role_id == "sec-ops" && !r.unassigned));
+                assert!(sr
+                    .roles
+                    .iter()
+                    .any(|r| r.role_id == "super-operator" && r.unassigned));
+            }
+            other => panic!("expected SessionRoles dialog, got {other:?}"),
+        }
+
+        // Worker SessionRoles delta overrides local_dialog and delivers error_message.
+        let worker_sr = DialogModel::SessionRoles(SessionRolesDialogModel {
+            github_login: "ops".into(),
+            roles: auth.session_role_descriptors(),
+            lock_all_enabled: false,
+            error_message: Some("Worker validation failure".into()),
+        });
+        let sr_patch = encode(&DataEvent::Patch(vec![Delta::ActiveDialog(Some(
+            worker_sr,
+        ))]))
+        .expect("encode");
+        st.on_worker_frame(&sr_patch);
+        match st.active_dialog() {
+            Some(DialogModel::SessionRoles(sr)) => {
+                assert_eq!(
+                    sr.error_message.as_deref(),
+                    Some("Worker validation failure")
+                );
+            }
+            other => panic!("expected worker SessionRoles dialog, got {other:?}"),
+        }
+
+        // Routine SSE updates do NOT wipe webauthn_error while SessionRoles remains open.
+        st.on_webauthn_error("Passkey verification was cancelled or timed out.");
+        let ping_patch = encode(&DataEvent::Patch(vec![Delta::NodeUpsert(
+            mu_console_protocol::FabricNode::new("node-a", true),
+        )]))
+        .expect("encode");
+        st.on_worker_frame(&ping_patch);
+        assert_eq!(
+            st.webauthn_error.as_deref(),
+            Some("Passkey verification was cancelled or timed out.")
+        );
+        // Verify ActiveDialog(None) auto-closes SessionRoles and clears webauthn_error.
+        let close_patch =
+            encode(&DataEvent::Patch(vec![Delta::ActiveDialog(None)])).expect("encode");
+        st.on_worker_frame(&close_patch);
+        assert!(st.active_dialog().is_none());
+        assert!(st.webauthn_error.is_none());
+
+        // Clicking profile-manage-roles from UserProfile switches to SessionRoles.
+        let _ = st.activate_target("hdr-user");
+        assert!(matches!(
+            st.active_dialog(),
+            Some(DialogModel::UserProfile(_))
+        ));
+        assert!(matches!(
+            st.activate_target("profile-manage-roles").as_slice(),
+            [UiCommand::OpenDialog(DialogModel::SessionRoles(_))]
+        ));
+        assert!(matches!(
+            st.active_dialog(),
+            Some(DialogModel::SessionRoles(_))
+        ));
     }
 }

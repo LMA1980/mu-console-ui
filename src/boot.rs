@@ -28,8 +28,9 @@ use crate::state::{
     PENDING_HASH_STORAGE_KEY, PENDING_INVITE_STORAGE_KEY, REPO_STORAGE_KEY, SKIN_STORAGE_KEY,
 };
 use crate::webauthn::{
-    b64url_decode, b64url_encode, elevate_start_body, passkey_manage_start_body,
-    register_start_body, renew_start_body, wrap_credential_envelope_json,
+    b64url_decode, b64url_encode, elevate_start_body, extract_webauthn_http_error,
+    format_webauthn_js_error, passkey_manage_start_body, register_start_body, renew_start_body,
+    wrap_credential_envelope_json,
 };
 
 thread_local! {
@@ -705,10 +706,29 @@ fn fetch_json_post(url: &str, body_json: &str) -> Result<Promise, String> {
                     .ok()
                     .and_then(|v| v.as_f64())
                     .map_or(0_u16, |n| n as u16);
-                return Promise::reject(&JsValue::from_str(&format!(
-                    "HTTP {status} from {url_owned}"
-                )))
-                .into();
+                if let Ok(text_fn) = Reflect::get(&resp, &JsValue::from_str("text"))
+                    .and_then(|v| v.dyn_into::<Function>())
+                {
+                    if let Ok(text_promise) =
+                        text_fn.call0(&resp).and_then(|v| v.dyn_into::<Promise>())
+                    {
+                        let url_err = url_owned.clone();
+                        let on_text: Closure<dyn FnMut(JsValue) -> JsValue> =
+                            Closure::once(move |body: JsValue| -> JsValue {
+                                let msg = extract_webauthn_http_error(
+                                    status,
+                                    &url_err,
+                                    body.as_string().as_deref(),
+                                );
+                                Promise::reject(&JsValue::from_str(&msg)).into()
+                            });
+                        if let Ok(next) = promise_then(&text_promise, on_text) {
+                            return next.into();
+                        }
+                    }
+                }
+                let fallback = extract_webauthn_http_error(status, &url_owned, None);
+                return Promise::reject(&JsValue::from_str(&fallback)).into();
             }
             if let Ok(json_fn) = Reflect::get(&resp, &JsValue::from_str("json"))
                 .and_then(|v| v.dyn_into::<Function>())
@@ -800,15 +820,13 @@ fn js_error_message(err: &JsValue) -> String {
     let msg = Reflect::get(err, &JsValue::from_str("message"))
         .ok()
         .and_then(|v| v.as_string());
-    match (name, msg) {
-        (Some(n), Some(m)) if !m.is_empty() => format!("{n}: {m}"),
-        (_, Some(m)) if !m.is_empty() => m,
-        (Some(n), _) if !n.is_empty() => n,
-        _ => JSON::stringify(err)
-            .ok()
-            .and_then(|s| s.as_string())
-            .unwrap_or_else(|| "WebAuthn ceremony rejected".to_owned()),
+    if name.is_some() || msg.is_some() {
+        return format_webauthn_js_error(name.as_deref(), msg.as_deref());
     }
+    JSON::stringify(err)
+        .ok()
+        .and_then(|s| s.as_string())
+        .unwrap_or_else(|| format_webauthn_js_error(None, None))
 }
 
 fn report_webauthn_error(state: &Rc<RefCell<ConsoleState>>, msg: &str) {

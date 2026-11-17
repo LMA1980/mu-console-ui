@@ -859,3 +859,548 @@ fn m2_super_operator_unlocks_all_8_areas_and_surfaces_last_2m_renewal_in_both_sk
     assert!(!done_html.contains("banner-role-renew-super-operator"));
     assert!(!done_wf.contains("role-renew:super-operator"));
 }
+
+#[test]
+fn m2_71_dashboard_orthogonal_split_registry_copy_anonymous_gating_and_tones() {
+    use mu_console_protocol::{
+        FabricNode, HardwareMetricSeries, LogSeverity, OtelLogEntry, PurePathTrace, SloProblem,
+        SubsystemHealthEntry, SubsystemHealthSummary, SubsystemStatus,
+    };
+    use mu_console_theme::scene::{SceneComponent, SceneViewport};
+    use mu_console_theme::skin::SemanticTone;
+    use mu_console_ui::scene::build_console_scene;
+
+    let mut base_vm = ViewModel {
+        repos: vec![mu_console_protocol::RepoScore::new(RepoId::new(
+            "org", "core",
+        ))],
+        ci_jobs: vec![CiJobSummary {
+            job_id_str: "job-1000-0000701".into(),
+            job_id: 701,
+            repo: RepoId::new("org", "core"),
+            ref_name: "main".into(),
+            commit_sha: "abc1234".into(),
+            queue_state: "failed".into(),
+            tests_passed: 9,
+            tests_total: 10,
+            stages: vec![CiJobStage {
+                id: "clippy".into(),
+                name: "clippy".into(),
+                assigned_node: Some("node-a".into()),
+                threads: 4,
+                state: StageState::Failed,
+                duration_secs: 12,
+                exit_code: 1,
+                skip_reason: Some(SkipReason::Other("clippy error".into())),
+            }],
+            ..CiJobSummary::default()
+        }],
+        nodes: vec![
+            FabricNode {
+                id: "node-a".into(),
+                online: true,
+                arch: "x86_64".into(),
+                active_slots: 0,
+                max_slots: 1,
+                cpu_load_bp: 1200,
+                ..FabricNode::default()
+            },
+            FabricNode {
+                id: "worker-riscv64".into(),
+                online: false,
+                arch: "riscv64".into(),
+                active_slots: 0,
+                max_slots: 1,
+                cpu_load_bp: 0,
+                ..FabricNode::default()
+            },
+        ],
+        subsystem_health: SubsystemHealthSummary {
+            ci: SubsystemHealthEntry {
+                status: SubsystemStatus::Live,
+                summary: "Operational".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            cd: SubsystemHealthEntry {
+                status: SubsystemStatus::Live,
+                summary: "Operational".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            ab_deploy: SubsystemHealthEntry {
+                status: SubsystemStatus::InMaintenance,
+                summary: "Maint".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            repository: SubsystemHealthEntry {
+                status: SubsystemStatus::Live,
+                summary: "Operational".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            observability: SubsystemHealthEntry {
+                status: SubsystemStatus::Degraded,
+                summary: "Operational".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            model_runner: SubsystemHealthEntry {
+                status: SubsystemStatus::Offline,
+                summary: "Offline".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            platform: SubsystemHealthEntry {
+                status: SubsystemStatus::PartialMaintenance,
+                summary: "Partial".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            updated_at_ms: 1_000,
+        },
+        ..ViewModel::default()
+    };
+    base_vm.observe.logs.push(OtelLogEntry {
+        timestamp_ms: 1_000,
+        severity: LogSeverity::Info,
+        service: "gateway".into(),
+        span_id: None,
+        trace_id: "trace-1".into(),
+        message: "GET /healthz 200".into(),
+    });
+    base_vm.observe.logs.push(OtelLogEntry {
+        timestamp_ms: 1_010,
+        severity: LogSeverity::Warn,
+        service: "gateway".into(),
+        span_id: None,
+        trace_id: "trace-2".into(),
+        message: "elevated upstream latency".into(),
+    });
+    base_vm.observe.traces.push(PurePathTrace {
+        trace_id: "trace-2".into(),
+        root_service: "gateway".into(),
+        root_operation: "GET /api/ci".into(),
+        domain: "edge".into(),
+        duration_ms: 210,
+        error: false,
+        slow_p99: true,
+        started_epoch_ms: 1_010,
+        spans: vec![],
+    });
+    base_vm.observe.metrics.push(HardwareMetricSeries {
+        service: "gateway".into(),
+        hardware_class: "x86_64".into(),
+        rps: 120,
+        error_rate_bp: 10,
+        p50_ms: 8,
+        p95_ms: 40,
+        p99_ms: 210,
+        exemplar_trace_id: "trace-2".into(),
+        samples: vec![10, 40, 210],
+    });
+    base_vm.observe.problems.push(SloProblem {
+        problem_id: "slo-1".into(),
+        title: "Ingress p99 latency above SLO".into(),
+        severity: "critical".into(),
+        impacted_entity: "gateway".into(),
+        active: true,
+        ..SloProblem::default()
+    });
+
+    // 1. Authenticated operator WITH ci:nodes.read -> Applications + Fleet + Needs Attention.
+    let mut ops_full = active_state(
+        "ops",
+        vec![
+            "system:dashboard.read",
+            "ci:queue.read",
+            "ci:jobs.read",
+            "ci:repos.public.read",
+            "ci:nodes.read",
+            "cd:runs.read",
+            "reg:packages.read",
+            "obs:smartscape.read",
+            "obs:problems.read",
+            "obs:logs.read",
+            "obs:traces.read",
+            "obs:metrics.read",
+            "mr:models.read",
+            "platform:roles.read",
+        ],
+    );
+    let mut full_vm = base_vm.clone();
+    full_vm.auth = ops_full.auth();
+    push_vm(&mut ops_full, full_vm.clone());
+
+    let scene = build_console_scene(&ops_full, SceneViewport::DESKTOP);
+    let app_sec = scene
+        .sections
+        .iter()
+        .find(|s| s.id == "sec-dash-applications")
+        .expect("Applications section");
+    assert_eq!(app_sec.title, "Applications");
+    let SceneComponent::StatusMatrix(mat) = &app_sec.components[0] else {
+        panic!("expected StatusMatrix");
+    };
+    assert_eq!(mat.title, "Application Status");
+    let labels: Vec<&str> = mat.cells.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "Continuous Integration",
+            "Continuous Delivery",
+            "A|B Deployment",
+            "Registry",
+            "Observability",
+            "Model Runner",
+            "Platform",
+        ]
+    );
+    // Observability summary includes logs, traces, metrics, and active SLO problems.
+    let obs_cell = &mat.cells[4];
+    assert_eq!(
+        obs_cell.detail.as_deref(),
+        Some("2 logs · 1 traces · 1 metrics · 1 active SLO problem(s)")
+    );
+    assert_eq!(obs_cell.tone, SemanticTone::Fail);
+    assert_eq!(mat.cells[2].tone, SemanticTone::Info); // InMaintenance
+    assert_eq!(mat.cells[6].tone, SemanticTone::Info); // PartialMaintenance
+    assert_eq!(mat.cells[5].tone, SemanticTone::Fail); // Offline
+
+    let (html_full, wf_full) = render_both_skins(&ops_full);
+    for out in [&html_full, &wf_full] {
+        assert!(!out.contains("Fleet Summary"));
+        assert!(!out.contains("7 Subsystem Status Cards"));
+        assert!(!out.contains("Artifact &amp; Package Store"));
+        assert!(!out.contains("CI Build Fabric"));
+        assert!(out.contains("Applications"));
+        assert!(out.contains("Fleet"));
+        assert!(out.contains("Cluster Host Nodes"));
+        assert!(out.contains("worker-riscv64"));
+        assert!(out.contains("Needs Attention"));
+        assert!(out.contains("Ingress p99 latency above SLO"));
+        assert!(out.contains("Application"));
+    }
+
+    // Needs Attention columns: Scope, Target, Finding, Status (covering App + Fleet).
+    let att_sec = scene
+        .sections
+        .iter()
+        .find(|s| s.id == "sec-dash-attention")
+        .expect("Needs Attention section");
+    let SceneComponent::TableGrid(att_grid) = &att_sec.components[0] else {
+        panic!("expected TableGrid");
+    };
+    let col_labels: Vec<&str> = att_grid.columns.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(col_labels, vec!["Scope", "Target", "Finding", "Status"]);
+    assert!(att_grid
+        .rows
+        .iter()
+        .any(|r| r.cells[0].text == "Application"));
+    assert!(att_grid.rows.iter().any(|r| r.cells[0].text == "Fleet"));
+
+    // Verify Registry copy inside CD & Registry areas.
+    let _ = ops_full.activate_target("nav-area:cd");
+    let (cd_html, cd_wf) = render_both_skins(&ops_full);
+    assert!(cd_html.contains("Open Registry"));
+    assert!(cd_wf.contains("Open Registry"));
+    assert!(!cd_html.contains("Open Repository"));
+    let _ = ops_full.activate_target("nav-area:registry");
+    let (reg_html, reg_wf) = render_both_skins(&ops_full);
+    assert!(reg_html.contains("Registry · Packages"));
+    assert!(reg_wf.contains("Registry · Packages"));
+    assert!(!reg_html.contains("Repository · Packages"));
+
+    // 2. Active operator WITHOUT ci:nodes.read -> Fleet omitted, Applications + Needs Attention shown.
+    let mut ops_no_nodes = active_state(
+        "ops-no-nodes",
+        vec![
+            "system:dashboard.read",
+            "ci:queue.read",
+            "ci:jobs.read",
+            "ci:repos.public.read",
+        ],
+    );
+    let mut no_nodes_vm = base_vm.clone();
+    no_nodes_vm.auth = ops_no_nodes.auth();
+    push_vm(&mut ops_no_nodes, no_nodes_vm);
+    let no_nodes_scene = build_console_scene(&ops_no_nodes, SceneViewport::DESKTOP);
+    assert!(no_nodes_scene
+        .sections
+        .iter()
+        .any(|s| s.id == "sec-dash-applications"));
+    assert!(!no_nodes_scene
+        .sections
+        .iter()
+        .any(|s| s.id == "sec-dash-fleet"));
+    assert!(no_nodes_scene
+        .sections
+        .iter()
+        .any(|s| s.id == "sec-dash-attention"));
+
+    // 3. Anonymous AND AuthorizationDenied: Fleet + Needs Attention completely omitted,
+    // Degraded banner without count badges, Info/Fail parity on unpermitted cards.
+    for auth in [
+        AuthState::anonymous(vec![
+            "system:dashboard.read".into(),
+            "ci:queue.read".into(),
+            "ci:repos.public.read".into(),
+        ]),
+        AuthState {
+            status: AuthStatus::AuthorizationDenied,
+            github_login: Some("uninvited".into()),
+            reason_code: Some(AuthReasonCode::AuthorizationDenied),
+            active_policies: vec!["system:dashboard.read".into()],
+            ..AuthState::default()
+        },
+    ] {
+        let mut st = ConsoleState::new();
+        st.init_from_env("#/overview", "", None);
+        let mut restricted_vm = base_vm.clone();
+        restricted_vm.auth = auth;
+        push_vm(&mut st, restricted_vm);
+
+        let r_scene = build_console_scene(&st, SceneViewport::DESKTOP);
+        assert!(!r_scene.sections.iter().any(|s| s.id == "sec-dash-fleet"));
+        assert!(!r_scene
+            .sections
+            .iter()
+            .any(|s| s.id == "sec-dash-attention"));
+        let banner = r_scene
+            .banners
+            .iter()
+            .find(|b| b.id == "dash-rollup-banner")
+            .expect("rollup banner");
+        assert_eq!(banner.title, "Degraded Application Status");
+        assert!(!banner.title.contains("Need Attention"));
+
+        let SceneComponent::StatusMatrix(r_mat) = &r_scene.sections[0].components[0] else {
+            panic!("expected Applications StatusMatrix");
+        };
+        assert_eq!(r_mat.cells[2].tone, SemanticTone::Info); // unpermitted AbDeploy InMaintenance
+        assert!(r_mat.cells[2].detail.is_none());
+        assert_eq!(r_mat.cells[4].tone, SemanticTone::Fail); // unpermitted Observability Degraded
+        assert!(r_mat.cells[4].detail.is_none());
+
+        let (r_html, r_wf) = render_both_skins(&st);
+        for out in [&r_html, &r_wf] {
+            assert!(!out.contains("Cluster Host Nodes"));
+            assert!(!out.contains("Needs Attention"));
+            assert!(!out.contains("Item(s) Need Attention"));
+            assert!(out.contains("Degraded Application Status"));
+        }
+        assert!(r_html.contains("data-cell-id=\"dash-card:ab-deploy\" data-tone=\"info\""));
+        assert!(r_html.contains("data-cell-id=\"dash-card:observability\" data-tone=\"fail\""));
+    }
+}
+
+#[test]
+fn m2_74_session_roles_worker_sync_unassigned_errors_and_profile_dormant_roles() {
+    use mu_console_data::api::FetchKind;
+    use mu_console_data::engine::{Effect, HttpError};
+
+    fn drain_posts(effects: Vec<Effect>, st: &mut ConsoleState) {
+        for fx in effects {
+            if let Effect::Post(ev) = fx {
+                let bytes = Engine::encode_event(&ev).expect("encode DataEvent");
+                st.on_worker_frame(&bytes);
+            }
+        }
+    }
+
+    let mut engine = Engine::new(1);
+    let mut state = ConsoleState::new();
+
+    let session_json = |ci_triage_active: bool, admin_active: bool| -> String {
+        let mut active_roles = vec![
+            r#"{"id":"operator","display_name":"Operator","description":"Baseline read","activation":{"kind":"pinned_baseline"},"step_up":"none"}"#.to_owned(),
+        ];
+        let mut active_policies = vec![
+            "system:dashboard.read".to_owned(),
+            "ci:queue.read".to_owned(),
+        ];
+        let mut leases = Vec::new();
+        if ci_triage_active {
+            active_roles.push(r#"{"id":"ci-triage","display_name":"CI Triage","description":"Elective CI retry","activation":{"kind":"elective"},"step_up":"none"}"#.to_owned());
+            active_policies.push("ci:jobs.resume".into());
+        }
+        if admin_active {
+            active_roles.push(r#"{"id":"super-admin","display_name":"Super Admin","description":"Timed Passkey role","activation":{"kind":"timed","hard_ttl_secs":900,"idle_ttl_secs":300,"renew_window_secs":120,"renew_extend_secs":900,"max_renewals":1},"step_up":"passkey"}"#.to_owned());
+            active_policies.push("platform:roles.write".into());
+            leases.push(r#"{"role_id":"super-admin","granted_at_ms":1000,"hard_expires_at_ms":901000,"idle_expires_at_ms":301000,"seconds_remaining":900,"renewals_used":0,"max_renewals":1,"can_renew":false}"#);
+        }
+        let op = r#"{"id":"operator","display_name":"Operator","description":"Baseline read","activation":{"kind":"pinned_baseline"},"step_up":"none"}"#;
+        let triage = r#"{"id":"ci-triage","display_name":"CI Triage","description":"Elective CI retry","activation":{"kind":"elective"},"step_up":"none"}"#;
+        let super_admin = r#"{"id":"super-admin","display_name":"Super Admin","description":"Timed Passkey role","activation":{"kind":"timed","hard_ttl_secs":900,"idle_ttl_secs":300,"renew_window_secs":120,"renew_extend_secs":900,"max_renewals":1},"step_up":"passkey"}"#;
+        let plat_admin = r#"{"id":"platform-admin","display_name":"Platform Admin","description":"Catalog role","activation":{"kind":"timed","hard_ttl_secs":900},"step_up":"passkey"}"#;
+        let policies_json: Vec<String> = active_policies
+            .iter()
+            .map(|p| format!(r#""{p}""#))
+            .collect();
+        format!(
+            r#"{{"authenticated":true,"github_login":"ops","invite_bound":true,"passkey_count":1,"baseline_role":"operator","bound_roles":["operator","ci-triage","super-admin"],"bound_role_specs":[{op},{triage},{super_admin}],"catalog_role_specs":[{op},{triage},{super_admin},{plat_admin}],"active_roles":[{active_roles}],"leases":[{leases}],"active_policies":[{policies}],"preferences":{{"skin":"html","font":"Hurmit"}}}}"#,
+            active_roles = active_roles.join(","),
+            leases = leases.join(","),
+            policies = policies_json.join(","),
+        )
+    };
+
+    // Bootstrap worker + ConsoleState WITHOUT platform:roles.read.
+    drain_posts(
+        engine.handle(
+            UiCommand::Configure(mu_console_protocol::WorkerConfig::default()),
+            900,
+        ),
+        &mut state,
+    );
+    drain_posts(
+        engine.on_fetch(
+            &FetchKind::AuthSession,
+            Ok(session_json(false, false)),
+            1_000,
+        ),
+        &mut state,
+    );
+    let snap = engine.on_fetch(&FetchKind::Repos, Ok("[]".into()), 1_010);
+    drain_posts(snap, &mut state);
+    drain_posts(engine.tick(1_250), &mut state);
+    assert_eq!(state.auth().status, AuthStatus::Active);
+
+    // Header button displays active role(s) only (not dormant ci-triage / unassigned platform-admin).
+    let (hdr_html, hdr_wf) = render_both_skins(&state);
+    assert!(hdr_html.contains("+Operator"));
+    assert!(!hdr_html.contains("CI Triage"));
+    assert!(!hdr_html.contains("Platform Admin"));
+    assert!(hdr_wf.contains("+Operator"));
+
+    // Open @user Profile and inspect dormant roles + "Manage Session Roles" button.
+    let _ = state.activate_target("hdr-user");
+    assert!(matches!(
+        state.active_dialog(),
+        Some(DialogModel::UserProfile(_))
+    ));
+    let (prof_html, prof_wf) = render_both_skins(&state);
+    assert!(prof_html.contains("Manage Session Roles"));
+    assert!(prof_html.contains("profile-manage-roles"));
+    assert!(prof_html.contains("ci-triage") || prof_html.contains("CI Triage"));
+    assert!(prof_wf.contains("profile-manage-roles"));
+
+    // Click Manage Session Roles -> dispatches OpenDialog(SessionRoles) -> worker hydrates SessionRoles.
+    let cmds = state.activate_target("profile-manage-roles");
+    assert!(matches!(
+        cmds.as_slice(),
+        [UiCommand::OpenDialog(DialogModel::SessionRoles(_))]
+    ));
+    for c in cmds {
+        drain_posts(engine.handle(c, 2_000), &mut state);
+    }
+    drain_posts(engine.tick(2_150), &mut state);
+
+    let (sr_html, sr_wf) = render_both_skins(&state);
+    assert!(sr_html.contains("dlg-session-roles"));
+    assert!(sr_html.contains("role-enable:ci-triage"));
+    assert!(sr_html.contains("Unassigned"));
+    assert!(sr_html.contains("Platform Admin"));
+    assert!(sr_wf.contains("dlg-session-roles"));
+    assert!(sr_wf.contains("Unassigned"));
+
+    // Elective role enable succeeds -> Engine closes SessionRoles -> UI auto-closes dialog.
+    let enable_cmds = state.activate_target("role-enable:ci-triage");
+    assert_eq!(
+        enable_cmds,
+        vec![UiCommand::EnableRole {
+            role_id: "ci-triage".into()
+        }]
+    );
+    for c in enable_cmds {
+        drain_posts(engine.handle(c, 3_000), &mut state);
+    }
+    drain_posts(
+        engine.on_fetch(
+            &FetchKind::AuthEnableRole("ci-triage".into()),
+            Ok(session_json(true, false)),
+            3_020,
+        ),
+        &mut state,
+    );
+    drain_posts(engine.tick(3_150), &mut state);
+    assert!(
+        state.active_dialog().is_none(),
+        "Session Roles must auto-close after successful Elective toggle"
+    );
+
+    // Re-open Session Roles, trigger Passkey elevation, simulate WebAuthn cancellation.
+    for c in state.open_session_roles() {
+        drain_posts(engine.handle(c, 4_000), &mut state);
+    }
+    drain_posts(engine.tick(4_150), &mut state);
+    let _ = state.activate_target("role-elevate:super-admin");
+    assert_eq!(
+        state.pending_webauthn,
+        Some(mu_console_ui::state::WebAuthnRequest::ElevateTimedRole {
+            role_id: "super-admin".into(),
+        })
+    );
+    let cancel_msg = mu_console_ui::webauthn::format_webauthn_js_error(
+        Some("NotAllowedError"),
+        Some("The operation either timed out or was not allowed."),
+    );
+    state.on_webauthn_error(cancel_msg);
+    let (err_html, err_wf) = render_both_skins(&state);
+    assert!(state.active_dialog().is_some());
+    assert!(err_html.contains("Passkey verification was cancelled or timed out."));
+    assert!(err_wf.contains("Passkey verification was cancelled or timed out."));
+
+    // Server rejection also keeps Session Roles open with inline error from worker.
+    let _ = state.activate_target("role-elevate:super-admin");
+    drain_posts(
+        engine.handle(
+            UiCommand::ElevateWithPasskey {
+                role_id: "super-admin".into(),
+                assertion_json: r#"{"id":"cred"}"#.into(),
+            },
+            5_000,
+        ),
+        &mut state,
+    );
+    drain_posts(
+        engine.on_fetch(
+            &FetchKind::AuthElevateFinish {
+                role_id: "super-admin".into(),
+                assertion_json: r#"{"id":"cred"}"#.into(),
+            },
+            Err(HttpError {
+                status: 403,
+                message: r#"{"error":"Passkey assertion expired"}"#.into(),
+            }),
+            5_020,
+        ),
+        &mut state,
+    );
+    drain_posts(engine.tick(5_150), &mut state);
+    assert!(state.active_dialog().is_some());
+    let (srv_err_html, _) = render_both_skins(&state);
+    assert!(srv_err_html.contains("Passkey assertion expired"));
+
+    // Successful Passkey elevation auto-closes Session Roles and updates header badge with timer.
+    drain_posts(
+        engine.handle(
+            UiCommand::ElevateWithPasskey {
+                role_id: "super-admin".into(),
+                assertion_json: r#"{"id":"cred2"}"#.into(),
+            },
+            6_000,
+        ),
+        &mut state,
+    );
+    drain_posts(
+        engine.on_fetch(
+            &FetchKind::AuthElevateFinish {
+                role_id: "super-admin".into(),
+                assertion_json: r#"{"id":"cred2"}"#.into(),
+            },
+            Ok(session_json(true, true)),
+            6_020,
+        ),
+        &mut state,
+    );
+    drain_posts(engine.tick(6_150), &mut state);
+    assert!(state.active_dialog().is_none());
+    let (done_html, done_wf) = render_both_skins(&state);
+    assert!(done_html.contains("+Super Admin["));
+    assert!(done_wf.contains("+Super Admin["));
+}
