@@ -1183,3 +1183,103 @@ fn u25_profile_preferences_ux_wireframe_zero_overflow_and_reload_persistence() {
     assert!(shell.contains(r#"--font-crt:'OpenDyslexicM Nerd Font Mono','MuCRT',monospace"#));
     assert!(shell.contains("font-weight:700"));
 }
+
+#[test]
+fn u26_dashboard_split_and_profile_session_roles_wireframe_zero_overflow() {
+    use mu_console_protocol::{AuthStatus, DashboardSubView, FabricNode, StepUpRequirement};
+
+    // 1. Active Dashboard with Applications + Fleet + Needs Attention zero-overflow check.
+    let mut active_st = state_for_scenario(
+        Scenario::NewBranch,
+        SubView::Dashboard(DashboardSubView::Overview),
+        CrtFont::Hurmit,
+    );
+    let active_auth = full_active_auth("LMA1980");
+    let mut active_vm = active_st.client.view().cloned().unwrap_or_default();
+    active_vm.auth = active_auth;
+    if active_vm.nodes.is_empty() {
+        active_vm.nodes.push(FabricNode {
+            id: "worker-riscv64".into(),
+            online: false,
+            arch: "riscv64".into(),
+            active_slots: 0,
+            max_slots: 1,
+            cpu_load_bp: 0,
+            ..FabricNode::default()
+        });
+    }
+    let snap = Engine::encode_event(&DataEvent::Snapshot(active_vm)).expect("encode");
+    active_st.on_worker_frame(&snap);
+    for &(vw, vh) in &[(375.0, 667.0), (402.0, 720.0), (1512.0, 860.0)] {
+        let svg =
+            render_console_with_skin(ConsoleSkin::Wireframe, &active_st, Viewport::new(vw, vh));
+        assert_svg_zero_overflow(&svg, vw, vh, &format!("u26_dash_active_{vw}x{vh}"));
+    }
+
+    // 2. UserProfile with dormant roles + Manage Session Roles and SessionRoles with inline error.
+    let mut role_st = ConsoleState::new();
+    let op_spec = RoleSpecDto {
+        id: "operator".into(),
+        display_name: Some("Operator".into()),
+        description: "Baseline read".into(),
+        activation: RoleActivationDto::pinned_baseline(),
+        step_up: StepUpRequirement::None,
+    };
+    let triage_spec = RoleSpecDto {
+        id: "ci-triage".into(),
+        display_name: Some("CI Triage".into()),
+        description: "Elective retry".into(),
+        activation: RoleActivationDto::elective(),
+        step_up: StepUpRequirement::None,
+    };
+    let super_spec = RoleSpecDto {
+        id: "super-operator".into(),
+        display_name: Some("Super Operator".into()),
+        description: "Passkey role".into(),
+        activation: RoleActivationDto::super_operator(),
+        step_up: StepUpRequirement::Passkey,
+    };
+    let vm = ViewModel {
+        auth: AuthState::from_session(&AuthSessionDto {
+            authenticated: true,
+            github_login: Some("LMA1980".into()),
+            invite_bound: true,
+            passkey_count: 1,
+            baseline_role: Some("operator".into()),
+            bound_roles: vec!["operator".into(), "ci-triage".into()],
+            bound_role_specs: vec![op_spec.clone(), triage_spec.clone()],
+            catalog_role_specs: vec![op_spec, triage_spec, super_spec],
+            active_policies: all_operator_policies(),
+            ..AuthSessionDto::default()
+        }),
+        user_profile: Some(UserProfileDto {
+            github_login: "LMA1980".into(),
+            display_name: Some("LMA1980".into()),
+            preferences: UserPreferencesDto::default(),
+            bound_roles: vec!["operator".into(), "ci-triage".into()],
+            passkey_count: 1,
+            passkeys: vec![],
+        }),
+        ..ViewModel::default()
+    };
+    assert_eq!(vm.auth.status, AuthStatus::Active);
+    let snap = Engine::encode_event(&DataEvent::Snapshot(vm)).expect("encode");
+    role_st.on_worker_frame(&snap);
+
+    let _ = role_st.activate_target("hdr-user");
+    assert!(matches!(
+        role_st.active_dialog(),
+        Some(DialogModel::UserProfile(_))
+    ));
+    for &(vw, vh) in &[(375.0, 667.0), (402.0, 720.0), (1512.0, 860.0)] {
+        let svg = render_console_with_skin(ConsoleSkin::Wireframe, &role_st, Viewport::new(vw, vh));
+        assert_svg_zero_overflow(&svg, vw, vh, &format!("u26_profile_dormant_{vw}x{vh}"));
+    }
+
+    let _ = role_st.activate_target("profile-manage-roles");
+    role_st.on_webauthn_error("Passkey verification was cancelled or timed out.");
+    for &(vw, vh) in &[(375.0, 667.0), (402.0, 720.0), (1512.0, 860.0)] {
+        let svg = render_console_with_skin(ConsoleSkin::Wireframe, &role_st, Viewport::new(vw, vh));
+        assert_svg_zero_overflow(&svg, vw, vh, &format!("u26_session_roles_err_{vw}x{vh}"));
+    }
+}

@@ -161,6 +161,82 @@ pub fn wrap_credential_envelope_json(challenge_id: Option<&str>, credential_json
     }
 }
 
+/// Normalize a browser WebAuthn `DOMException` or rejection payload into concise UI error copy.
+#[must_use]
+pub fn format_webauthn_js_error(name: Option<&str>, message: Option<&str>) -> String {
+    let clean_name = name.map(str::trim).filter(|s| !s.is_empty());
+    let clean_msg = message.map(str::trim).filter(|s| !s.is_empty());
+    if matches!(clean_name, Some("NotAllowedError" | "AbortError")) {
+        return "Passkey verification was cancelled or timed out.".to_owned();
+    }
+    match (clean_name, clean_msg) {
+        (Some(n), Some(m)) => format!("{n}: {m}"),
+        (_, Some(m)) => m.to_owned(),
+        (Some(n), _) => n.to_owned(),
+        (None, None) => "WebAuthn ceremony rejected".to_owned(),
+    }
+}
+
+fn extract_json_string_field(json: &str, key: &str) -> Option<String> {
+    let needle = format!(r#""{key}""#);
+    let mut rest = json;
+    while let Some(pos) = rest.find(&needle) {
+        let after_key = rest[pos + needle.len()..].trim_start();
+        if let Some(after_colon) = after_key.strip_prefix(':') {
+            let val = after_colon.trim_start();
+            if let Some(inner) = val.strip_prefix('"') {
+                let mut out = String::new();
+                let mut chars = inner.chars();
+                while let Some(ch) = chars.next() {
+                    match ch {
+                        '"' => {
+                            let trimmed = out.trim();
+                            return (!trimmed.is_empty()).then(|| trimmed.to_owned());
+                        }
+                        '\\' => match chars.next() {
+                            Some('"') => out.push('"'),
+                            Some('\\') => out.push('\\'),
+                            Some('/') => out.push('/'),
+                            Some('b') => out.push('\u{08}'),
+                            Some('f') => out.push('\u{0C}'),
+                            Some('n') => out.push('\n'),
+                            Some('r') => out.push('\r'),
+                            Some('t') => out.push('\t'),
+                            Some(other) => out.push(other),
+                            None => return None,
+                        },
+                        other => out.push(other),
+                    }
+                }
+            }
+        }
+        rest = &rest[pos + needle.len()..];
+    }
+    None
+}
+
+/// Extract a concise error message from a failed WebAuthn start HTTP response body.
+#[must_use]
+pub fn extract_webauthn_http_error(status: u16, url: &str, body: Option<&str>) -> String {
+    if let Some(raw) = body.map(str::trim).filter(|s| !s.is_empty()) {
+        if raw.starts_with('{') {
+            if let Some(msg) = extract_json_string_field(raw, "error")
+                .or_else(|| extract_json_string_field(raw, "message"))
+            {
+                return msg;
+            }
+        }
+        if !raw.starts_with('<') && !raw.starts_with('{') {
+            return raw.to_owned();
+        }
+    }
+    if status == 0 {
+        format!("Network error calling {url}")
+    } else {
+        format!("HTTP {status} from {url}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +303,42 @@ mod tests {
         assert_eq!(
             wrap_credential_envelope_json(None, r#"{"id":"pk1"}"#),
             r#"{"credential":{"id":"pk1"}}"#
+        );
+    }
+
+    #[test]
+    fn webauthn_error_formatting_and_http_extraction_handle_cancellation_and_json() {
+        assert_eq!(
+            format_webauthn_js_error(Some("NotAllowedError"), Some("The operation timed out")),
+            "Passkey verification was cancelled or timed out."
+        );
+        assert_eq!(
+            format_webauthn_js_error(Some("AbortError"), None),
+            "Passkey verification was cancelled or timed out."
+        );
+        assert_eq!(
+            format_webauthn_js_error(Some("SecurityError"), Some("Invalid RP ID")),
+            "SecurityError: Invalid RP ID"
+        );
+        assert_eq!(
+            extract_webauthn_http_error(
+                403,
+                "/api/auth/elevate/start",
+                Some(r#"{"error":"Role \"super-operator\" is not bound"}"#),
+            ),
+            r#"Role "super-operator" is not bound"#
+        );
+        assert_eq!(
+            extract_webauthn_http_error(
+                400,
+                "/api/auth/elevate/start",
+                Some(r#"{"message":"Step-up challenge expired"}"#),
+            ),
+            "Step-up challenge expired"
+        );
+        assert_eq!(
+            extract_webauthn_http_error(502, "/api/auth/elevate/start", Some("<html>502</html>")),
+            "HTTP 502 from /api/auth/elevate/start"
         );
     }
 }

@@ -7,8 +7,8 @@
 //! bind to [`DataClient`]; Phase 2 only logs it.
 
 use mu_console_protocol::{
-    apply_all, decode, encode, AreaBadges, CodecError, ConnState, DataEvent, DataSource, UiCommand,
-    UiError, ViewModel,
+    apply_all, decode, encode, AreaBadges, CodecError, ConnState, DataEvent, DataSource, Delta,
+    UiCommand, UiError, ViewModel,
 };
 
 /// Root-absolute URL of the worker loader shim emitted by Trunk or build-dist.sh
@@ -39,6 +39,7 @@ pub struct DataClient {
     badges: AreaBadges,
     reload_required: Option<(u32, u32)>,
     last_error: Option<UiError>,
+    last_frame_closed_dialog: bool,
     frames: u32,
 }
 
@@ -86,6 +87,13 @@ impl DataClient {
         self.last_error = None;
     }
 
+    /// Return `true` when the most recent worker frame explicitly cleared `active_dialog` via
+    /// `Delta::ActiveDialog(None)`.
+    #[must_use]
+    pub const fn last_frame_closed_dialog(&self) -> bool {
+        self.last_frame_closed_dialog
+    }
+
     /// Encode a command for the worker.
     ///
     /// # Errors
@@ -117,6 +125,7 @@ impl DataClient {
         match ev {
             DataEvent::Ready { source, .. } => ClientUpdate::Ready(source),
             DataEvent::Snapshot(v) => {
+                self.last_frame_closed_dialog = false;
                 if v.auth.is_resolved() {
                     self.last_error = None;
                 }
@@ -124,6 +133,8 @@ impl DataClient {
                 ClientUpdate::View
             }
             DataEvent::Patch(p) => {
+                self.last_frame_closed_dialog =
+                    p.iter().any(|d| matches!(d, Delta::ActiveDialog(None)));
                 if let Some(v) = self.view.as_mut() {
                     apply_all(v, &p);
                     if v.auth.is_resolved() {
@@ -251,5 +262,22 @@ mod tests {
         assert_eq!(c.reload_required(), Some((9, PROTOCOL_VERSION)));
         assert!(reload_banner_text(2, 3).contains("Reload required"));
         assert!(matches!(c.on_frame(&[]), ClientUpdate::Error(_)));
+    }
+
+    #[test]
+    fn last_frame_closed_dialog_tracks_worker_active_dialog_none_patches() {
+        let mut c = DataClient::new();
+        assert!(!c.last_frame_closed_dialog());
+
+        c.on_frame(&frame(&DataEvent::Snapshot(ViewModel::default())));
+        assert!(!c.last_frame_closed_dialog());
+
+        c.on_frame(&frame(&DataEvent::Patch(vec![Delta::ActiveDialog(None)])));
+        assert!(c.last_frame_closed_dialog());
+
+        c.on_frame(&frame(&DataEvent::Patch(vec![Delta::NodeUpsert(
+            FabricNode::new("node-a", true),
+        )])));
+        assert!(!c.last_frame_closed_dialog());
     }
 }

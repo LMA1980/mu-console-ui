@@ -203,13 +203,18 @@ pub fn build_console_scene(state: &ConsoleState, _viewport: SceneViewport) -> Co
     // 3b. Active-session WebAuthn error feedback and proactive final-2m lease renewal banners.
     if auth.status == AuthStatus::Active {
         if let Some(ref err) = state.webauthn_error {
-            scene.banners.push(SceneBanner {
-                id: "banner-webauthn-error".into(),
-                tone: SemanticTone::Fail,
-                title: "Passkey verification failed".into(),
-                message: err.clone(),
-                action: None,
-            });
+            if !matches!(
+                state.active_dialog(),
+                Some(ProtoDialogModel::SessionRoles(_))
+            ) {
+                scene.banners.push(SceneBanner {
+                    id: "banner-webauthn-error".into(),
+                    tone: SemanticTone::Fail,
+                    title: "Passkey verification failed".into(),
+                    message: err.clone(),
+                    action: None,
+                });
+            }
         }
         for lease in &auth.leases {
             if lease.can_renew && !lease.is_expired() {
@@ -350,6 +355,26 @@ pub fn build_dialog_model(state: &ConsoleState) -> Option<theme_scene::DialogMod
                     }
                 })
                 .collect();
+            let dormant_badges: Vec<RoleBadge> = auth
+                .dormant_role_badges()
+                .into_iter()
+                .map(|r| {
+                    let is_timed = matches!(r.activation.kind, RoleActivationKind::Timed);
+                    RoleBadge {
+                        role: r.effective_label().to_owned(),
+                        tone: if is_timed {
+                            SemanticTone::Info
+                        } else {
+                            SemanticTone::Neutral
+                        },
+                        detail: Some(match r.activation.kind {
+                            RoleActivationKind::Timed => "Timed (Passkey)".into(),
+                            RoleActivationKind::Elective => "Elective".into(),
+                            RoleActivationKind::PinnedBaseline => "Baseline".into(),
+                        }),
+                    }
+                })
+                .collect();
             let display_name = if !state.profile_display_name_draft.is_empty() {
                 state.profile_display_name_draft.clone()
             } else {
@@ -375,10 +400,20 @@ pub fn build_dialog_model(state: &ConsoleState) -> Option<theme_scene::DialogMod
                 subject_id: handle,
                 email: None,
                 active_roles: role_badges,
+                dormant_roles: dormant_badges,
                 session_expires_at: up
                     .max_session_expires_epoch_ms
                     .map(|ms| format!("{}s", ms / 1000)),
                 passkey_count: up.profile.passkey_count.max(auth.passkey_count),
+                manage_roles_action: Some(
+                    ActionControl::new(
+                        "profile-manage-roles",
+                        copy::MANAGE_SESSION_ROLES_BTN,
+                        "profile-manage-roles",
+                    )
+                    .disabled(auth.status != AuthStatus::Active)
+                    .with_tone(SemanticTone::Info),
+                ),
                 lock_action: Some(
                     ActionControl::new(
                         "profile-lock-timed",
@@ -398,18 +433,42 @@ pub fn build_dialog_model(state: &ConsoleState) -> Option<theme_scene::DialogMod
         ProtoDialogModel::SessionRoles(sr) => {
             let mut options: Vec<SessionRoleOption> = Vec::with_capacity(sr.roles.len() + 2);
             for r in &sr.roles {
-                let active_badge = auth.active_roles.iter().find(|b| b.role_id == r.role_id);
-                let active = r.active || active_badge.is_some();
-                let active_lease = auth
-                    .leases
-                    .iter()
-                    .find(|l| l.role_id == r.role_id)
-                    .or_else(|| active_badge.and_then(|b| b.lease.as_ref()))
-                    .or(r.lease.as_ref());
+                let is_unassigned = r.unassigned;
+                let active_badge = if is_unassigned {
+                    None
+                } else {
+                    auth.active_roles.iter().find(|b| b.role_id == r.role_id)
+                };
+                let active = !is_unassigned && (r.active || active_badge.is_some());
+                let active_lease = if is_unassigned {
+                    None
+                } else {
+                    auth.leases
+                        .iter()
+                        .find(|l| l.role_id == r.role_id && !l.is_expired())
+                        .or_else(|| {
+                            active_badge
+                                .and_then(|b| b.lease.as_ref())
+                                .filter(|l| !l.is_expired())
+                        })
+                        .or_else(|| r.lease.as_ref().filter(|l| !l.is_expired()))
+                };
                 let rem = active_lease.map(|l| l.seconds_remaining);
-                let is_baseline = matches!(r.activation.kind, RoleActivationKind::PinnedBaseline);
-                let requires_step_up = matches!(r.step_up, StepUpRequirement::Passkey) && !active;
-                let action = if is_baseline {
+                let is_baseline = !is_unassigned
+                    && matches!(r.activation.kind, RoleActivationKind::PinnedBaseline);
+                let requires_step_up = !is_unassigned
+                    && !active
+                    && !is_baseline
+                    && (matches!(r.step_up, StepUpRequirement::Passkey)
+                        || matches!(r.activation.kind, RoleActivationKind::Timed));
+                let action = if is_unassigned {
+                    ActionControl::new(
+                        format!("role-unassigned:{}", r.role_id),
+                        copy::UNASSIGNED_ROLE_BTN,
+                        format!("role-unassigned:{}", r.role_id),
+                    )
+                    .disabled(true)
+                } else if is_baseline {
                     ActionControl::new(
                         format!("role-baseline:{}", r.role_id),
                         "Locked Baseline",
@@ -498,12 +557,23 @@ pub fn build_dialog_model(state: &ConsoleState) -> Option<theme_scene::DialogMod
                 .with_tone(SemanticTone::Warn),
             });
 
+            let inline_error = sr
+                .error_message
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    state
+                        .webauthn_error
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                });
+
             Some(theme_scene::DialogModel::SessionRoles(SessionRolesDialog {
                 dialog_id: "dlg-session-roles".into(),
                 title: copy::SESSION_ROLES_TITLE.into(),
                 subject_handle: sr.github_login,
                 step_up_verified: !auth.leases.is_empty(),
                 roles: options,
+                error_message: inline_error,
                 close_action: ActionControl::new("roles-close", "Close", "roles-close"),
             }))
         }
@@ -714,7 +784,7 @@ fn build_area_tabs(state: &ConsoleState, auth: &AuthState) -> Vec<NavTab> {
                 tone: if !permitted {
                     SemanticTone::Neutral
                 } else if area == Area::Dashboard && failing_attention_count(state) > 0 {
-                    SemanticTone::Warn
+                    SemanticTone::Fail
                 } else {
                     SemanticTone::Info
                 },
@@ -957,75 +1027,80 @@ fn build_auth_required_section(state: &ConsoleState, auth: &AuthState) -> SceneS
     )
 }
 
-fn build_dashboard_sections(state: &ConsoleState, _auth: &AuthState, scene: &mut ConsoleScene) {
-    let attention_rows = build_attention_rows(state);
-    let attention_count = attention_rows.len();
-    let health = state.client.view().map(|v| &v.subsystem_health);
-
-    let rollup_tone = if attention_count > 0 {
-        SemanticTone::Warn
+fn build_dashboard_sections(state: &ConsoleState, auth: &AuthState, scene: &mut ConsoleScene) {
+    let is_active = auth.status == AuthStatus::Active;
+    let attention_rows = if is_active {
+        build_attention_rows(state, auth)
     } else {
-        SemanticTone::Pass
+        Vec::new()
+    };
+    let cells = build_application_cells(state);
+    let any_app_fail = cells.iter().any(|c| c.tone == SemanticTone::Fail);
+
+    let (rollup_tone, rollup_title) = if is_active && !attention_rows.is_empty() {
+        (
+            SemanticTone::Fail,
+            format!("{} Item(s) Need Attention", attention_rows.len()),
+        )
+    } else if any_app_fail {
+        (SemanticTone::Fail, copy::DASH_DEGRADED_ANON_TITLE.into())
+    } else {
+        (SemanticTone::Pass, copy::DASH_NOMINAL_TITLE.into())
     };
     scene.banners.push(SceneBanner {
         id: "dash-rollup-banner".into(),
         tone: rollup_tone,
-        title: if attention_count == 0 {
-            "All Subsystems Nominal".into()
-        } else {
-            format!("{attention_count} Item(s) Need Attention")
-        },
-        message: "Fleet health roll-up across accessible platform subsystems.".into(),
+        title: rollup_title,
+        message: copy::DASH_ROLLUP_MESSAGE.into(),
         action: None,
     });
 
-    let subsystems: [(Area, SubsystemId, &str); 7] = [
-        (Area::Ci, SubsystemId::Ci, "CI Build Fabric"),
+    scene.sections.push(
+        SceneSection::new("sec-dash-applications", copy::DASH_APPLICATIONS_TITLE).with_component(
+            SceneComponent::StatusMatrix(StatusMatrix {
+                id: "dash-subsystem-cards".into(),
+                title: copy::DASH_APPLICATIONS_MATRIX_TITLE.into(),
+                cells,
+            }),
+        ),
+    );
+
+    if is_active && auth.has_policy("ci:nodes.read") {
+        scene.sections.push(build_fleet_section(state));
+    }
+
+    if is_active {
+        scene
+            .sections
+            .push(build_attention_section(state, attention_rows));
+    }
+}
+
+fn build_application_cells(state: &ConsoleState) -> Vec<MatrixCell> {
+    let health = state.client.view().map(|v| &v.subsystem_health);
+    let applications: [(Area, SubsystemId, &str); 7] = [
+        (Area::Ci, SubsystemId::Ci, "Continuous Integration"),
         (Area::Cd, SubsystemId::Cd, "Continuous Delivery"),
-        (
-            Area::AbDeploy,
-            SubsystemId::AbDeploy,
-            "A|B Deployment Slots",
-        ),
-        (
-            Area::Repository,
-            SubsystemId::Repository,
-            "Artifact & Package Store",
-        ),
+        (Area::AbDeploy, SubsystemId::AbDeploy, "A|B Deployment"),
+        (Area::Repository, SubsystemId::Repository, "Registry"),
         (
             Area::Observability,
             SubsystemId::Observability,
-            "Observability Telemetry",
+            "Observability",
         ),
-        (
-            Area::ModelRunner,
-            SubsystemId::ModelRunner,
-            "Model Runner Nodes",
-        ),
-        (
-            Area::Platform,
-            SubsystemId::Platform,
-            "Platform & Policy IAM",
-        ),
+        (Area::ModelRunner, SubsystemId::ModelRunner, "Model Runner"),
+        (Area::Platform, SubsystemId::Platform, "Platform"),
     ];
 
-    let cells: Vec<MatrixCell> = subsystems
+    applications
         .iter()
         .map(|&(area, sub_id, title)| {
             let permitted = state.can_access_area(area);
             let slug = area.slug();
             let entry: Option<&SubsystemHealthEntry> = health.and_then(|h| h.get(sub_id));
-            let tone = subsystem_tone(state, area, entry);
-            let fallback_status = match tone {
-                SemanticTone::Pass | SemanticTone::Neutral => SubsystemStatus::Live,
-                SemanticTone::Warn => SubsystemStatus::Degraded,
-                SemanticTone::Fail => SubsystemStatus::Offline,
-                SemanticTone::Info => SubsystemStatus::InMaintenance,
-            };
+            let (status, tone) = subsystem_status_and_tone(state, area, entry);
             // Generic status word ONLY on unpermitted cards (#50, #55).
-            let status_word = entry
-                .map(|e| copy::subsystem_status_word(e.status))
-                .unwrap_or_else(|| copy::subsystem_status_word(fallback_status));
+            let status_word = copy::subsystem_status_word(status);
             let detail = if permitted {
                 Some(subsystem_permitted_detail(state, area, entry))
             } else {
@@ -1045,144 +1120,380 @@ fn build_dashboard_sections(state: &ConsoleState, _auth: &AuthState, scene: &mut
                         format!("dash-card:{slug}"),
                     )
                     .with_area(slug)
+                    .with_tone(tone)
                     .disabled(!permitted),
                 ),
             }
         })
-        .collect();
-
-    scene.sections.push(
-        SceneSection::new("sec-dash-overview", "Fleet Summary & Needs Attention")
-            .with_component(SceneComponent::StatusMatrix(StatusMatrix {
-                id: "dash-subsystem-cards".into(),
-                title: "7 Subsystem Status Cards".into(),
-                cells,
-            }))
-            .with_component(SceneComponent::TableGrid(TableGrid {
-                id: "dash-attention-table".into(),
-                title: "Needs Attention".into(),
-                columns: vec![
-                    TableColumn {
-                        key: "area".into(),
-                        label: "Subsystem".into(),
-                        numeric: false,
-                    },
-                    TableColumn {
-                        key: "item".into(),
-                        label: "Finding".into(),
-                        numeric: false,
-                    },
-                    TableColumn {
-                        key: "status".into(),
-                        label: "Status".into(),
-                        numeric: false,
-                    },
-                ],
-                rows: attention_rows,
-                empty_message: Some(if state.filter_query.is_empty() {
-                    copy::NO_ATTENTION_ITEMS.into()
-                } else {
-                    copy::NO_FILTER_MATCHES.into()
-                }),
-                pagination: None,
-            })),
-    );
+        .collect()
 }
 
-fn build_attention_rows(state: &ConsoleState) -> Vec<TableRow> {
+fn build_fleet_section(state: &ConsoleState) -> SceneSection {
     let q = state.filter_query.trim().to_ascii_lowercase();
-    let mut rows = Vec::new();
-    if state.can_access_area(Area::Ci) {
-        for job in state.visible_ci_jobs() {
-            if job.queue_state.eq_ignore_ascii_case("failed") {
-                let hay = format!(
-                    "{}/{} #{} ({})",
-                    job.repo.owner, job.repo.repo, job.job_id, job.ref_name
-                );
-                if q.is_empty() || hay.to_ascii_lowercase().contains(&q) {
-                    rows.push(TableRow {
-                        id: format!("att-ci-{}", job.job_id),
-                        tone: SemanticTone::Fail,
+    let rows: Vec<TableRow> = state
+        .client
+        .view()
+        .map(|v| {
+            v.nodes
+                .iter()
+                .filter(|n| {
+                    q.is_empty()
+                        || n.id.to_ascii_lowercase().contains(&q)
+                        || n.arch.to_ascii_lowercase().contains(&q)
+                })
+                .map(|n| {
+                    let node_tone = if n.online {
+                        SemanticTone::Pass
+                    } else {
+                        SemanticTone::Fail
+                    };
+                    let status_label = if n.online { "Online" } else { "Offline" };
+                    TableRow {
+                        id: format!("dash-fleet-{}", n.id),
+                        tone: node_tone,
                         cells: vec![
                             TableCell {
-                                text: "CI".into(),
-                                tone: SemanticTone::Fail,
-                                signal: Some(SignalGlyph::BlockFailed),
+                                text: n.id.clone(),
+                                tone: SemanticTone::Info,
+                                signal: Some(if n.online {
+                                    SignalGlyph::BlockPassed
+                                } else {
+                                    SignalGlyph::BlockFailed
+                                }),
                                 mono: true,
                                 action: None,
                             },
                             TableCell {
-                                text: hay,
-                                tone: SemanticTone::Fail,
+                                text: n.arch.clone(),
+                                tone: SemanticTone::Neutral,
                                 signal: None,
                                 mono: true,
                                 action: None,
                             },
                             TableCell {
-                                text: format!("{}/{} tests", job.tests_passed, job.tests_total),
-                                tone: SemanticTone::Fail,
+                                text: status_label.into(),
+                                tone: node_tone,
                                 signal: None,
                                 mono: true,
                                 action: None,
                             },
-                        ],
-                        row_action: Some(ActionControl::new(
-                            format!("ci-job:{}", job.job_id),
-                            "Inspect",
-                            format!("ci-job:{}", job.job_id),
-                        )),
-                    });
-                }
-            }
-        }
-    }
-    if state.can_access_area(Area::Observability) {
-        if let Some(view) = state.client.view() {
-            for prob in &view.observe.problems {
-                if prob.active && (q.is_empty() || prob.title.to_ascii_lowercase().contains(&q)) {
-                    rows.push(TableRow {
-                        id: format!("att-obs-{}", prob.problem_id),
-                        tone: SemanticTone::Warn,
-                        cells: vec![
                             TableCell {
-                                text: "Observability".into(),
-                                tone: SemanticTone::Warn,
-                                signal: Some(SignalGlyph::BlockFailed),
+                                text: format!("{}/{}", n.active_slots, n.max_slots),
+                                tone: SemanticTone::Neutral,
+                                signal: None,
                                 mono: true,
                                 action: None,
                             },
                             TableCell {
-                                text: prob.title.clone(),
-                                tone: SemanticTone::Warn,
-                                signal: None,
-                                mono: false,
-                                action: None,
-                            },
-                            TableCell {
-                                text: prob.impacted_entity.clone(),
+                                text: format!("{:.1}%", f64::from(n.cpu_load_bp) / 100.0),
                                 tone: SemanticTone::Neutral,
                                 signal: None,
                                 mono: true,
                                 action: None,
                             },
                         ],
-                        row_action: Some(
-                            ActionControl::new(
-                                "nav-area:observability",
-                                "Inspect",
-                                "nav-area:observability",
-                            )
-                            .with_area("observability"),
-                        ),
-                    });
-                }
-            }
-        }
+                        row_action: None,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    SceneSection::new("sec-dash-fleet", copy::DASH_FLEET_TITLE).with_component(
+        SceneComponent::TableGrid(TableGrid {
+            id: "dash-fleet-table".into(),
+            title: copy::DASH_FLEET_TABLE_TITLE.into(),
+            columns: vec![
+                TableColumn {
+                    key: "node".into(),
+                    label: "Node".into(),
+                    numeric: false,
+                },
+                TableColumn {
+                    key: "arch".into(),
+                    label: "Arch".into(),
+                    numeric: false,
+                },
+                TableColumn {
+                    key: "status".into(),
+                    label: "Status".into(),
+                    numeric: false,
+                },
+                TableColumn {
+                    key: "slots".into(),
+                    label: "Slots".into(),
+                    numeric: true,
+                },
+                TableColumn {
+                    key: "cpu".into(),
+                    label: "CPU Load".into(),
+                    numeric: true,
+                },
+            ],
+            rows,
+            empty_message: Some(if state.filter_query.is_empty() {
+                copy::NO_FLEET_NODES.into()
+            } else {
+                copy::NO_FILTER_MATCHES.into()
+            }),
+            pagination: None,
+        }),
+    )
+}
+
+fn build_attention_section(state: &ConsoleState, rows: Vec<TableRow>) -> SceneSection {
+    SceneSection::new("sec-dash-attention", copy::DASH_NEEDS_ATTENTION_TITLE).with_component(
+        SceneComponent::TableGrid(TableGrid {
+            id: "dash-attention-table".into(),
+            title: copy::DASH_NEEDS_ATTENTION_TITLE.into(),
+            columns: vec![
+                TableColumn {
+                    key: "scope".into(),
+                    label: "Scope".into(),
+                    numeric: false,
+                },
+                TableColumn {
+                    key: "target".into(),
+                    label: "Target".into(),
+                    numeric: false,
+                },
+                TableColumn {
+                    key: "finding".into(),
+                    label: "Finding".into(),
+                    numeric: false,
+                },
+                TableColumn {
+                    key: "status".into(),
+                    label: "Status".into(),
+                    numeric: false,
+                },
+            ],
+            rows,
+            empty_message: Some(if state.filter_query.is_empty() {
+                copy::NO_ATTENTION_ITEMS.into()
+            } else {
+                copy::NO_FILTER_MATCHES.into()
+            }),
+            pagination: None,
+        }),
+    )
+}
+
+fn build_attention_rows(state: &ConsoleState, auth: &AuthState) -> Vec<TableRow> {
+    if auth.status != AuthStatus::Active {
+        return Vec::new();
+    }
+    let q = state.filter_query.trim().to_ascii_lowercase();
+    let mut rows = Vec::new();
+    if state.can_access_area(Area::Ci) {
+        append_ci_attention_rows(state, &q, &mut rows);
+    }
+    if state.can_access_area(Area::Observability) {
+        append_obs_attention_rows(state, &q, &mut rows);
+    }
+    if auth.has_policy("ci:nodes.read") {
+        append_fleet_attention_rows(state, &q, &mut rows);
     }
     rows
 }
 
+fn append_ci_attention_rows(state: &ConsoleState, q: &str, rows: &mut Vec<TableRow>) {
+    for job in state.visible_ci_jobs() {
+        if !job.queue_state.eq_ignore_ascii_case("failed") {
+            continue;
+        }
+        let target = format!(
+            "{}/{} #{} ({})",
+            job.repo.owner, job.repo.repo, job.job_id, job.ref_name
+        );
+        let finding = if job.tests_total > 0 {
+            format!("{}/{} tests passed", job.tests_passed, job.tests_total)
+        } else {
+            "Pipeline run failed".into()
+        };
+        if !q.is_empty()
+            && !target.to_ascii_lowercase().contains(q)
+            && !finding.to_ascii_lowercase().contains(q)
+        {
+            continue;
+        }
+        rows.push(TableRow {
+            id: format!("att-ci-{}", job.job_id),
+            tone: SemanticTone::Fail,
+            cells: vec![
+                TableCell {
+                    text: "Application".into(),
+                    tone: SemanticTone::Fail,
+                    signal: Some(SignalGlyph::BlockFailed),
+                    mono: true,
+                    action: None,
+                },
+                TableCell {
+                    text: target,
+                    tone: SemanticTone::Fail,
+                    signal: None,
+                    mono: true,
+                    action: None,
+                },
+                TableCell {
+                    text: finding,
+                    tone: SemanticTone::Fail,
+                    signal: None,
+                    mono: true,
+                    action: None,
+                },
+                TableCell {
+                    text: "Failed".into(),
+                    tone: SemanticTone::Fail,
+                    signal: None,
+                    mono: true,
+                    action: None,
+                },
+            ],
+            row_action: Some(ActionControl::new(
+                format!("ci-job:{}", job.job_id),
+                "Inspect",
+                format!("ci-job:{}", job.job_id),
+            )),
+        });
+    }
+}
+
+fn append_obs_attention_rows(state: &ConsoleState, q: &str, rows: &mut Vec<TableRow>) {
+    let Some(view) = state.client.view() else {
+        return;
+    };
+    let obs_slug = Area::Observability.slug();
+    for prob in &view.observe.problems {
+        if !prob.active {
+            continue;
+        }
+        let target = if prob.impacted_entity.is_empty() {
+            "Observability".into()
+        } else {
+            prob.impacted_entity.clone()
+        };
+        if !q.is_empty()
+            && !prob.title.to_ascii_lowercase().contains(q)
+            && !target.to_ascii_lowercase().contains(q)
+        {
+            continue;
+        }
+        let status = if prob.severity.is_empty() {
+            "Active".into()
+        } else {
+            prob.severity.clone()
+        };
+        rows.push(TableRow {
+            id: format!("att-obs-{}", prob.problem_id),
+            tone: SemanticTone::Fail,
+            cells: vec![
+                TableCell {
+                    text: "Application".into(),
+                    tone: SemanticTone::Fail,
+                    signal: Some(SignalGlyph::BlockFailed),
+                    mono: true,
+                    action: None,
+                },
+                TableCell {
+                    text: target,
+                    tone: SemanticTone::Fail,
+                    signal: None,
+                    mono: true,
+                    action: None,
+                },
+                TableCell {
+                    text: prob.title.clone(),
+                    tone: SemanticTone::Fail,
+                    signal: None,
+                    mono: false,
+                    action: None,
+                },
+                TableCell {
+                    text: status,
+                    tone: SemanticTone::Fail,
+                    signal: None,
+                    mono: true,
+                    action: None,
+                },
+            ],
+            row_action: Some(
+                ActionControl::new(
+                    format!("nav-area:{obs_slug}"),
+                    "Inspect",
+                    format!("nav-area:{obs_slug}"),
+                )
+                .with_area(obs_slug),
+            ),
+        });
+    }
+}
+
+fn append_fleet_attention_rows(state: &ConsoleState, q: &str, rows: &mut Vec<TableRow>) {
+    let Some(view) = state.client.view() else {
+        return;
+    };
+    let ci_slug = Area::Ci.slug();
+    for node in &view.nodes {
+        if node.online {
+            continue;
+        }
+        let finding = if node.arch.is_empty() {
+            "Node unreachable".into()
+        } else {
+            format!("{} worker unreachable", node.arch)
+        };
+        if !q.is_empty()
+            && !node.id.to_ascii_lowercase().contains(q)
+            && !finding.to_ascii_lowercase().contains(q)
+        {
+            continue;
+        }
+        rows.push(TableRow {
+            id: format!("att-fleet-{}", node.id),
+            tone: SemanticTone::Fail,
+            cells: vec![
+                TableCell {
+                    text: "Fleet".into(),
+                    tone: SemanticTone::Fail,
+                    signal: Some(SignalGlyph::BlockFailed),
+                    mono: true,
+                    action: None,
+                },
+                TableCell {
+                    text: node.id.clone(),
+                    tone: SemanticTone::Fail,
+                    signal: None,
+                    mono: true,
+                    action: None,
+                },
+                TableCell {
+                    text: finding,
+                    tone: SemanticTone::Fail,
+                    signal: None,
+                    mono: false,
+                    action: None,
+                },
+                TableCell {
+                    text: "Offline".into(),
+                    tone: SemanticTone::Fail,
+                    signal: None,
+                    mono: true,
+                    action: None,
+                },
+            ],
+            row_action: Some(
+                ActionControl::new("nav-ci:nodes", "Inspect", "nav-ci:nodes").with_area(ci_slug),
+            ),
+        });
+    }
+}
+
 fn failing_attention_count(state: &ConsoleState) -> usize {
+    let auth = state.auth();
+    if auth.status != AuthStatus::Active {
+        return 0;
+    }
     let ci = if state.can_access_area(Area::Ci) {
         state
             .visible_ci_jobs()
@@ -1199,53 +1510,62 @@ fn failing_attention_count(state: &ConsoleState) -> usize {
     } else {
         0
     };
-    ci + obs
+    let fleet = if auth.has_policy("ci:nodes.read") {
+        state
+            .client
+            .view()
+            .map_or(0, |v| v.nodes.iter().filter(|n| !n.online).count())
+    } else {
+        0
+    };
+    ci + obs + fleet
 }
 
-fn subsystem_tone(
+fn area_has_active_failure(state: &ConsoleState, area: Area) -> bool {
+    match area {
+        Area::Ci => state
+            .visible_ci_jobs()
+            .iter()
+            .any(|j| j.queue_state.eq_ignore_ascii_case("failed")),
+        Area::Cd => state
+            .client
+            .view()
+            .is_some_and(|v| v.cd_runs.iter().any(|r| r.state == CdRunState::Failed)),
+        Area::Observability => state
+            .client
+            .view()
+            .is_some_and(|v| v.observe.problems.iter().any(|p| p.active)),
+        _ => false,
+    }
+}
+
+fn subsystem_status_and_tone(
     state: &ConsoleState,
     area: Area,
     entry: Option<&SubsystemHealthEntry>,
-) -> SemanticTone {
+) -> (SubsystemStatus, SemanticTone) {
     if let Some(e) = entry {
         return match e.status {
-            SubsystemStatus::Live => SemanticTone::Pass,
-            SubsystemStatus::InMaintenance | SubsystemStatus::PartialMaintenance => {
-                SemanticTone::Info
+            SubsystemStatus::Live => {
+                if area_has_active_failure(state, area) {
+                    (SubsystemStatus::Degraded, SemanticTone::Fail)
+                } else {
+                    (SubsystemStatus::Live, SemanticTone::Pass)
+                }
             }
-            SubsystemStatus::Degraded => SemanticTone::Warn,
-            SubsystemStatus::Offline => SemanticTone::Fail,
+            SubsystemStatus::InMaintenance | SubsystemStatus::PartialMaintenance => {
+                (e.status, SemanticTone::Info)
+            }
+            SubsystemStatus::Degraded | SubsystemStatus::Offline => (e.status, SemanticTone::Fail),
         };
     }
-    match area {
-        Area::Ci => {
-            let jobs = state.visible_ci_jobs();
-            if jobs
-                .iter()
-                .any(|j| j.queue_state.eq_ignore_ascii_case("failed"))
-            {
-                SemanticTone::Fail
-            } else if jobs.is_empty() {
-                SemanticTone::Neutral
-            } else {
-                SemanticTone::Pass
-            }
-        }
-        Area::Cd => state.client.view().map_or(SemanticTone::Neutral, |v| {
-            if v.cd_runs.iter().any(|r| r.state == CdRunState::Failed) {
-                SemanticTone::Warn
-            } else {
-                SemanticTone::Pass
-            }
-        }),
-        Area::Observability => state.client.view().map_or(SemanticTone::Neutral, |v| {
-            if v.observe.problems.iter().any(|p| p.active) {
-                SemanticTone::Warn
-            } else {
-                SemanticTone::Pass
-            }
-        }),
-        _ => SemanticTone::Pass,
+    if state.client.view().is_none() {
+        return (SubsystemStatus::Live, SemanticTone::Neutral);
+    }
+    if area_has_active_failure(state, area) {
+        (SubsystemStatus::Degraded, SemanticTone::Fail)
+    } else {
+        (SubsystemStatus::Live, SemanticTone::Pass)
     }
 }
 
@@ -1254,12 +1574,19 @@ fn subsystem_permitted_detail(
     area: Area,
     entry: Option<&SubsystemHealthEntry>,
 ) -> String {
+    let view = state.client.view();
     if let Some(e) = entry {
-        if !e.summary.is_empty() {
+        let obs_override = area == Area::Observability
+            && view.is_some_and(|v| {
+                e.summary.is_empty()
+                    || e.summary.eq_ignore_ascii_case("operational")
+                    || v.observe.problems.iter().any(|p| p.active)
+            });
+        if !e.summary.is_empty() && !obs_override {
             return e.summary.clone();
         }
     }
-    let Some(view) = state.client.view() else {
+    let Some(view) = view else {
         return "Idle".into();
     };
     match area {
@@ -1270,7 +1597,24 @@ fn subsystem_permitted_detail(
             |g| format!("{}/{}: {:?}", g.passed(), g.total(), g.outcome),
         ),
         Area::Repository => format!("{} package(s)", view.registry.packages.len()),
-        Area::Observability => format!("{} metric series", view.observe.metrics.len()),
+        Area::Observability => {
+            let active_problems = view.observe.problems.iter().filter(|p| p.active).count();
+            if active_problems > 0 {
+                format!(
+                    "{} logs · {} traces · {} metrics · {active_problems} active SLO problem(s)",
+                    view.observe.logs.len(),
+                    view.observe.traces.len(),
+                    view.observe.metrics.len(),
+                )
+            } else {
+                format!(
+                    "{} logs · {} traces · {} metrics",
+                    view.observe.logs.len(),
+                    view.observe.traces.len(),
+                    view.observe.metrics.len(),
+                )
+            }
+        }
         Area::ModelRunner => view.model_runner.status.as_ref().map_or_else(
             || "Model runner idle".into(),
             |s| format!("queue={}", s.total_queue_depth),
@@ -1858,11 +2202,11 @@ fn build_cd_sections(
                 attributes: entries,
                 controls: vec![
                     ActionControl::new(
-                        "nav-area:repository",
-                        "Open Repository",
-                        "nav-area:repository",
+                        format!("nav-area:{}", Area::Repository.slug()),
+                        "Open Registry",
+                        format!("nav-area:{}", Area::Repository.slug()),
                     )
-                    .with_area("repository")
+                    .with_area(Area::Repository.slug())
                     .disabled(!can_repo),
                     ActionControl::new(
                         "nav-area:ab-deploy",
@@ -2183,7 +2527,7 @@ fn build_repo_sections(state: &ConsoleState, subview: RepositorySubView, scene: 
     let view = state.client.view();
     let mut sec = SceneSection::new(
         "sec-repo",
-        format!("Repository · {}", SubView::Repository(subview).label()),
+        format!("Registry · {}", SubView::Repository(subview).label()),
     );
     match subview {
         RepositorySubView::Packages => {
