@@ -1092,6 +1092,16 @@ fn m2_71_dashboard_orthogonal_split_registry_copy_anonymous_gating_and_tones() {
         .iter()
         .any(|r| r.cells[0].text == "Application"));
     assert!(att_grid.rows.iter().any(|r| r.cells[0].text == "Fleet"));
+    for row in &att_grid.rows {
+        assert!(
+            matches!(
+                row.cells[3].text.as_str(),
+                "Degraded" | "Down" | "Missing" | "Failed"
+            ),
+            "unexpected Needs Attention Status label: {:?}",
+            row.cells[3].text
+        );
+    }
 
     // Verify Registry copy inside CD & Registry areas.
     let _ = ops_full.activate_target("nav-area:cd");
@@ -1403,4 +1413,178 @@ fn m2_74_session_roles_worker_sync_unassigned_errors_and_profile_dormant_roles()
     let (done_html, done_wf) = render_both_skins(&state);
     assert!(done_html.contains("+Super Admin["));
     assert!(done_wf.contains("+Super Admin["));
+}
+
+#[test]
+fn m2_86_needs_attention_status_labels_and_target_placement() {
+    use mu_console_protocol::{FabricNode, ProblemCategory, SloProblem};
+    use mu_console_theme::scene::{SceneComponent, SceneViewport};
+    use mu_console_ui::scene::build_console_scene;
+
+    let mut st = active_state(
+        "ops",
+        vec![
+            "system:dashboard.read",
+            "ci:queue.read",
+            "ci:jobs.read",
+            "ci:repos.public.read",
+            "ci:nodes.read",
+            "obs:problems.read",
+        ],
+    );
+    st.init_from_env("#/dashboard/overview", "", None);
+
+    let mut vm = ViewModel {
+        auth: st.auth(),
+        ci_jobs: vec![CiJobSummary {
+            job_id: 99,
+            repo: RepoId::new("LMA1980", "mu-console"),
+            ref_name: "main".into(),
+            queue_state: "failed".into(),
+            tests_passed: 8,
+            tests_total: 9,
+            ..CiJobSummary::default()
+        }],
+        nodes: vec![FabricNode {
+            id: "worker-riscv64".into(),
+            online: false,
+            arch: "riscv64".into(),
+            active_slots: 0,
+            max_slots: 1,
+            cpu_load_bp: 0,
+            ..FabricNode::default()
+        }],
+        ..ViewModel::default()
+    };
+    vm.observe.problems = vec![
+        SloProblem {
+            problem_id: "PROB-LAT-99".into(),
+            title: "Gateway p99 latency above SLO".into(),
+            category: ProblemCategory::LatencyRegression,
+            severity: "critical".into(),
+            impacted_entity: "mu-ingress".into(),
+            active: true,
+            ..SloProblem::default()
+        },
+        SloProblem {
+            problem_id: "PROB-CANARY-99".into(),
+            title: "Canary Taint / Crash Telemetry on mu-ci-controller".into(),
+            category: ProblemCategory::CanaryTaint,
+            severity: "warning".into(),
+            impacted_entity: "mu-ci-controller".into(),
+            active: true,
+            ..SloProblem::default()
+        },
+        SloProblem {
+            problem_id: "PROB-HEARTBEAT-node-a".into(),
+            title: "Node Heartbeat Staleness on node-a".into(),
+            category: ProblemCategory::ErrorRateSpike,
+            severity: "warning".into(),
+            impacted_entity: "node-a".into(),
+            active: true,
+            ..SloProblem::default()
+        },
+        SloProblem {
+            problem_id: "PROB-ERR-99".into(),
+            title: "Worker offline error spike".into(),
+            category: ProblemCategory::ErrorRateSpike,
+            severity: "error".into(),
+            impacted_entity: "mu-observable-hub".into(),
+            active: true,
+            ..SloProblem::default()
+        },
+    ];
+    push_vm(&mut st, vm);
+
+    let scene = build_console_scene(&st, SceneViewport::DESKTOP);
+    let att_sec = scene
+        .sections
+        .iter()
+        .find(|s| s.id == "sec-dash-attention")
+        .expect("Needs Attention section");
+    let SceneComponent::TableGrid(grid) = &att_sec.components[0] else {
+        panic!("expected dash-attention-table TableGrid");
+    };
+    assert_eq!(grid.id, "dash-attention-table");
+    let headers: Vec<&str> = grid.columns.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(headers, vec!["Scope", "Target", "Finding", "Status"]);
+    assert_eq!(grid.rows.len(), 6);
+
+    let allowed = ["Degraded", "Down", "Missing", "Failed"];
+    let forbidden_raw = ["critical", "warning", "error", "Offline", "Active"];
+    for row in &grid.rows {
+        let target = row.cells[1].text.as_str();
+        let status = row.cells[3].text.as_str();
+        assert!(
+            allowed.contains(&status),
+            "row {} had invalid Status {status:?}",
+            row.id
+        );
+        assert_ne!(status, target, "row {} leaked target into Status", row.id);
+        assert!(
+            !forbidden_raw.contains(&status),
+            "row {} exposed raw status {status:?}",
+            row.id
+        );
+    }
+
+    let find_row = |id: &str| {
+        grid.rows
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("missing row {id}"))
+    };
+    assert_eq!(find_row("att-ci-99").cells[3].text, "Failed");
+    assert_eq!(find_row("att-obs-PROB-LAT-99").cells[1].text, "mu-ingress");
+    assert_eq!(find_row("att-obs-PROB-LAT-99").cells[3].text, "Degraded");
+    assert_eq!(
+        find_row("att-obs-PROB-CANARY-99").cells[1].text,
+        "mu-ci-controller"
+    );
+    assert_eq!(find_row("att-obs-PROB-CANARY-99").cells[3].text, "Down");
+    assert_eq!(
+        find_row("att-obs-PROB-HEARTBEAT-node-a").cells[1].text,
+        "node-a"
+    );
+    assert_eq!(
+        find_row("att-obs-PROB-HEARTBEAT-node-a").cells[3].text,
+        "Missing"
+    );
+    assert_eq!(
+        find_row("att-obs-PROB-ERR-99").cells[1].text,
+        "mu-observable-hub"
+    );
+    assert_eq!(find_row("att-obs-PROB-ERR-99").cells[3].text, "Down");
+    assert_eq!(
+        find_row("att-fleet-worker-riscv64").cells[1].text,
+        "worker-riscv64"
+    );
+    assert_eq!(find_row("att-fleet-worker-riscv64").cells[3].text, "Down");
+
+    // Verify rendered HTML and Wireframe SVG output on #/dashboard/overview.
+    let (html_out, wf_out) = render_both_skins(&st);
+    let att_html_start = html_out
+        .find("data-component-id=\"dash-attention-table\"")
+        .expect("dash-attention-table in HTML");
+    let att_html_tail = &html_out[att_html_start..];
+    let att_html_end = att_html_tail
+        .find("</table>")
+        .expect("closing table for dash-attention-table");
+    let att_table_html = &att_html_tail[..att_html_end];
+    for lbl in ["Degraded", "Down", "Missing", "Failed"] {
+        assert!(att_table_html.contains(lbl), "HTML missing {lbl}");
+        assert!(wf_out.contains(lbl), "Wireframe missing {lbl}");
+    }
+    for raw in [
+        ">critical<",
+        ">warning<",
+        ">error<",
+        ">Offline<",
+        ">Active<",
+    ] {
+        assert!(
+            !att_table_html.contains(raw),
+            "HTML attention table leaked raw status {raw}"
+        );
+    }
 }

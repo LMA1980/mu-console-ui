@@ -6,7 +6,9 @@
 //! Security invariant: unauthenticated, cold-boot, and authorization-denied copy must
 //! never mention invitations or disclose internal account binding rules.
 
-use mu_console_protocol::{Area, AuthReasonCode, CdEcosystem, SkipReason, SubsystemStatus};
+use mu_console_protocol::{
+    Area, AuthReasonCode, CdEcosystem, ProblemCategory, SkipReason, SloProblem, SubsystemStatus,
+};
 
 /// Root document language attribute (`<html lang="en">`).
 pub const HTML_LANG: &str = "en";
@@ -181,6 +183,34 @@ pub fn cd_ecosystem_label(eco: &CdEcosystem) -> &str {
 #[must_use]
 pub fn announce_route(area: Area, subview_label: &str) -> String {
     format!("Viewing {} — {}", area.label(), subview_label)
+}
+
+/// Map an active Observability [`SloProblem`] strictly to `{Degraded, Down, Missing}`
+/// for the `Needs Attention` table `Status` column.
+#[must_use]
+pub fn attention_obs_status_label(prob: &SloProblem) -> &'static str {
+    let contains_any = |needles: &[&str]| {
+        [
+            prob.problem_id.as_str(),
+            prob.title.as_str(),
+            prob.summary.as_str(),
+        ]
+        .into_iter()
+        .any(|hay| {
+            let lower = hay.to_ascii_lowercase();
+            needles.iter().any(|needle| lower.contains(needle))
+        })
+    };
+
+    if contains_any(&["heartbeat", "staleness", "missing"]) {
+        "Missing"
+    } else if matches!(prob.category, ProblemCategory::CanaryTaint)
+        || contains_any(&["crash", "down", "offline"])
+    {
+        "Down"
+    } else {
+        "Degraded"
+    }
 }
 
 /// Format polite announcement when a disabled nav item or card is activated.

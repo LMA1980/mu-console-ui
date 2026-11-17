@@ -8,6 +8,7 @@
 //! across both skins.
 
 use crate::copy;
+pub use crate::copy::attention_obs_status_label;
 use crate::router::{self, can_access_subview};
 use crate::state::{ConsoleState, AREAS};
 use mu_console_protocol::{
@@ -1379,11 +1380,7 @@ fn append_obs_attention_rows(state: &ConsoleState, q: &str, rows: &mut Vec<Table
         {
             continue;
         }
-        let status = if prob.severity.is_empty() {
-            "Active".into()
-        } else {
-            prob.severity.clone()
-        };
+        let status = copy::attention_obs_status_label(prob);
         rows.push(TableRow {
             id: format!("att-obs-{}", prob.problem_id),
             tone: SemanticTone::Fail,
@@ -1410,7 +1407,7 @@ fn append_obs_attention_rows(state: &ConsoleState, q: &str, rows: &mut Vec<Table
                     action: None,
                 },
                 TableCell {
-                    text: status,
+                    text: status.into(),
                     tone: SemanticTone::Fail,
                     signal: None,
                     mono: true,
@@ -1475,7 +1472,7 @@ fn append_fleet_attention_rows(state: &ConsoleState, q: &str, rows: &mut Vec<Tab
                     action: None,
                 },
                 TableCell {
-                    text: "Offline".into(),
+                    text: "Down".into(),
                     tone: SemanticTone::Fail,
                     signal: None,
                     mono: true,
@@ -3589,5 +3586,196 @@ fn stage_state_tone(st: StageState) -> SemanticTone {
         StageState::Failed => SemanticTone::Fail,
         StageState::Running => SemanticTone::Info,
         StageState::Pending | StageState::Skipped => SemanticTone::Neutral,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mu_console_protocol::{
+        encode, CiJobSummary, DataEvent, FabricNode, ProblemCategory, RepoId, SloProblem, ViewModel,
+    };
+
+    #[test]
+    fn attention_obs_status_label_maps_strictly_to_allowed_labels() {
+        let base = SloProblem {
+            problem_id: "PROB-LAT-1".into(),
+            title: "Latency regression".into(),
+            category: ProblemCategory::LatencyRegression,
+            severity: "critical".into(),
+            impacted_entity: "mu-ingress".into(),
+            active: true,
+            ..SloProblem::default()
+        };
+        assert_eq!(attention_obs_status_label(&base), "Degraded");
+
+        let mut error_prob = base.clone();
+        error_prob.category = ProblemCategory::ErrorRateSpike;
+        error_prob.severity = "error".into();
+        assert_eq!(attention_obs_status_label(&error_prob), "Degraded");
+
+        let mut flaky_prob = base.clone();
+        flaky_prob.category = ProblemCategory::FlakyTest;
+        flaky_prob.severity = "warning".into();
+        assert_eq!(attention_obs_status_label(&flaky_prob), "Degraded");
+
+        let mut canary_prob = base.clone();
+        canary_prob.category = ProblemCategory::CanaryTaint;
+        assert_eq!(attention_obs_status_label(&canary_prob), "Down");
+
+        let mut crash_prob = base.clone();
+        crash_prob.title = "Worker Crash loop".into();
+        assert_eq!(attention_obs_status_label(&crash_prob), "Down");
+
+        let mut offline_prob = base.clone();
+        offline_prob.summary = "Upstream target offline".into();
+        assert_eq!(attention_obs_status_label(&offline_prob), "Down");
+
+        let mut down_prob = base.clone();
+        down_prob.problem_id = "PROB-DOWN-svc".into();
+        assert_eq!(attention_obs_status_label(&down_prob), "Down");
+
+        let mut hb_prob = base.clone();
+        hb_prob.problem_id = "PROB-HEARTBEAT-node-a".into();
+        hb_prob.title = "Node Heartbeat Staleness on node-a".into();
+        assert_eq!(attention_obs_status_label(&hb_prob), "Missing");
+
+        let mut missing_prob = base;
+        missing_prob.category = ProblemCategory::CanaryTaint;
+        missing_prob.summary = "Missing span heartbeat".into();
+        assert_eq!(attention_obs_status_label(&missing_prob), "Missing");
+    }
+
+    #[test]
+    fn dash_attention_table_places_entity_in_target_and_canonical_labels_in_status() {
+        let mut st = ConsoleState::new();
+        st.init_from_env("#/dashboard/overview", "", None);
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec![
+                    "system:dashboard.read".into(),
+                    "ci:queue.read".into(),
+                    "ci:jobs.read".into(),
+                    "ci:nodes.read".into(),
+                    "obs:problems.read".into(),
+                ],
+                ..AuthState::default()
+            },
+            ci_jobs: vec![CiJobSummary {
+                job_id: 42,
+                repo: RepoId::new("LMA1980", "mu-console-ui"),
+                ref_name: "main".into(),
+                queue_state: "failed".into(),
+                tests_passed: 3,
+                tests_total: 4,
+                ..CiJobSummary::default()
+            }],
+            nodes: vec![FabricNode {
+                id: "worker-riscv64".into(),
+                online: false,
+                arch: "riscv64".into(),
+                max_slots: 1,
+                ..FabricNode::default()
+            }],
+            observe: mu_console_protocol::ObserveView {
+                problems: vec![
+                    SloProblem {
+                        problem_id: "PROB-LAT-1".into(),
+                        title: "Gateway latency spike".into(),
+                        category: ProblemCategory::LatencyRegression,
+                        severity: "critical".into(),
+                        impacted_entity: "mu-ingress".into(),
+                        active: true,
+                        ..SloProblem::default()
+                    },
+                    SloProblem {
+                        problem_id: "PROB-CANARY-1".into(),
+                        title: "Canary Taint / Crash Telemetry".into(),
+                        category: ProblemCategory::CanaryTaint,
+                        severity: "warning".into(),
+                        impacted_entity: "mu-ci-controller".into(),
+                        active: true,
+                        ..SloProblem::default()
+                    },
+                    SloProblem {
+                        problem_id: "PROB-HEARTBEAT-node-a".into(),
+                        title: "Node Heartbeat Staleness on node-a".into(),
+                        category: ProblemCategory::ErrorRateSpike,
+                        severity: "error".into(),
+                        impacted_entity: "node-a".into(),
+                        active: true,
+                        ..SloProblem::default()
+                    },
+                ],
+                ..mu_console_protocol::ObserveView::default()
+            },
+            ..ViewModel::default()
+        };
+        let frame = encode(&DataEvent::Snapshot(vm)).expect("encode ViewModel");
+        st.on_worker_frame(&frame);
+
+        let scene = build_console_scene(&st, SceneViewport::DESKTOP);
+        let att_sec = scene
+            .sections
+            .iter()
+            .find(|s| s.id == "sec-dash-attention")
+            .expect("Needs Attention section");
+        let SceneComponent::TableGrid(grid) = &att_sec.components[0] else {
+            panic!("expected dash-attention-table TableGrid");
+        };
+        assert_eq!(grid.id, "dash-attention-table");
+        let headers: Vec<&str> = grid.columns.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(headers, vec!["Scope", "Target", "Finding", "Status"]);
+
+        assert_eq!(grid.rows.len(), 5);
+        for row in &grid.rows {
+            let status = row.cells[3].text.as_str();
+            assert!(
+                matches!(status, "Degraded" | "Down" | "Missing" | "Failed"),
+                "unexpected Status cell: {status:?}"
+            );
+            assert_ne!(status, row.cells[1].text.as_str());
+        }
+
+        let obs_lat = grid
+            .rows
+            .iter()
+            .find(|r| r.id == "att-obs-PROB-LAT-1")
+            .expect("latency row");
+        assert_eq!(obs_lat.cells[1].text, "mu-ingress");
+        assert_eq!(obs_lat.cells[3].text, "Degraded");
+
+        let obs_canary = grid
+            .rows
+            .iter()
+            .find(|r| r.id == "att-obs-PROB-CANARY-1")
+            .expect("canary row");
+        assert_eq!(obs_canary.cells[1].text, "mu-ci-controller");
+        assert_eq!(obs_canary.cells[3].text, "Down");
+
+        let obs_hb = grid
+            .rows
+            .iter()
+            .find(|r| r.id == "att-obs-PROB-HEARTBEAT-node-a")
+            .expect("heartbeat row");
+        assert_eq!(obs_hb.cells[1].text, "node-a");
+        assert_eq!(obs_hb.cells[3].text, "Missing");
+
+        let fleet_row = grid
+            .rows
+            .iter()
+            .find(|r| r.id == "att-fleet-worker-riscv64")
+            .expect("fleet row");
+        assert_eq!(fleet_row.cells[1].text, "worker-riscv64");
+        assert_eq!(fleet_row.cells[3].text, "Down");
+
+        let ci_row = grid
+            .rows
+            .iter()
+            .find(|r| r.id == "att-ci-42")
+            .expect("ci row");
+        assert_eq!(ci_row.cells[3].text, "Failed");
     }
 }
