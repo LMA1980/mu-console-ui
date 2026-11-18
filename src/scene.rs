@@ -15,9 +15,9 @@ use mu_console_protocol::{
     AbDeploySubView, Area, AuthState, AuthStatus, CanaryBundleState, CdRunState, CdSubView,
     CiJobSummary, CiSubView, CrtFont, DashboardSubView, DialogModel as ProtoDialogModel,
     GateOutcome, ModelRunnerSubView, ObservabilitySubView, PackageEcosystem, PlatformSubView,
-    RepoStatus, RepositorySubView, RiskConfirmAction, RoleActivationKind, RoleLeaseView, Slot,
-    StageState, StepUpRequirement, SubView, SubsystemHealthEntry, SubsystemId, SubsystemStatus,
-    TestState, UiError, Visibility,
+    ProblemCategory, RepoStatus, RepositorySubView, RiskConfirmAction, RoleActivationKind,
+    RoleLeaseView, SloProblem, Slot, StageState, StepUpRequirement, SubView, SubsystemHealthEntry,
+    SubsystemId, SubsystemStatus, TestState, UiError, Visibility,
 };
 use mu_console_theme::scene::{
     self as theme_scene, ActionControl, ConsoleScene, GateChecklist, GateItem,
@@ -816,7 +816,14 @@ fn area_badge(state: &ConsoleState, area: Area, permitted: bool) -> Option<u32> 
             .client
             .view()
             .and_then(|v| {
-                u32::try_from(v.observe.problems.iter().filter(|p| p.active).count()).ok()
+                u32::try_from(
+                    v.observe
+                        .problems
+                        .iter()
+                        .filter(|p| p.active && !is_ci_inner_step_problem(p))
+                        .count(),
+                )
+                .ok()
             })
             .filter(|&n| n > 0),
         _ => None,
@@ -1300,6 +1307,31 @@ fn build_attention_rows(state: &ConsoleState, auth: &AuthState) -> Vec<TableRow>
     rows
 }
 
+fn is_ci_inner_step_problem(prob: &SloProblem) -> bool {
+    matches!(prob.category, ProblemCategory::FlakyTest)
+        || prob.problem_id.starts_with("PROB-TEST-")
+        || prob.problem_id.starts_with("PROB-BENCH-")
+}
+
+fn ci_job_failure_finding(job: &CiJobSummary) -> String {
+    if let Some(st) = job.stages.iter().find(|s| s.state == StageState::Failed) {
+        if st.exit_code != 0 {
+            return format!("Stage '{}' failed (exit {})", st.id, st.exit_code);
+        }
+        return format!("Stage '{}' failed", st.id);
+    }
+    if job.tests_total > 0 && job.tests_passed < job.tests_total {
+        format!("{}/{} tests passed", job.tests_passed, job.tests_total)
+    } else if job.tests_total > 0 {
+        format!(
+            "CI job failed ({}/{} unit tests passed)",
+            job.tests_passed, job.tests_total
+        )
+    } else {
+        "CI job execution failed".into()
+    }
+}
+
 fn append_ci_attention_rows(state: &ConsoleState, q: &str, rows: &mut Vec<TableRow>) {
     for job in state.visible_ci_jobs() {
         if !job.queue_state.eq_ignore_ascii_case("failed") {
@@ -1309,11 +1341,7 @@ fn append_ci_attention_rows(state: &ConsoleState, q: &str, rows: &mut Vec<TableR
             "{}/{} #{} ({})",
             job.repo.owner, job.repo.repo, job.job_id, job.ref_name
         );
-        let finding = if job.tests_total > 0 {
-            format!("{}/{} tests passed", job.tests_passed, job.tests_total)
-        } else {
-            "Pipeline run failed".into()
-        };
+        let finding = ci_job_failure_finding(&job);
         if !q.is_empty()
             && !target.to_ascii_lowercase().contains(q)
             && !finding.to_ascii_lowercase().contains(q)
@@ -1325,7 +1353,7 @@ fn append_ci_attention_rows(state: &ConsoleState, q: &str, rows: &mut Vec<TableR
             tone: SemanticTone::Fail,
             cells: vec![
                 TableCell {
-                    text: "Application".into(),
+                    text: "CI Job".into(),
                     tone: SemanticTone::Fail,
                     signal: Some(SignalGlyph::BlockFailed),
                     mono: true,
@@ -1368,7 +1396,7 @@ fn append_obs_attention_rows(state: &ConsoleState, q: &str, rows: &mut Vec<Table
     };
     let obs_slug = Area::Observability.slug();
     for prob in &view.observe.problems {
-        if !prob.active {
+        if !prob.active || is_ci_inner_step_problem(prob) {
             continue;
         }
         let target = if prob.impacted_entity.is_empty() {
@@ -1504,7 +1532,11 @@ fn failing_attention_count(state: &ConsoleState) -> usize {
     };
     let obs = if state.can_access_area(Area::Observability) {
         state.client.view().map_or(0, |v| {
-            v.observe.problems.iter().filter(|p| p.active).count()
+            v.observe
+                .problems
+                .iter()
+                .filter(|p| p.active && !is_ci_inner_step_problem(p))
+                .count()
         })
     } else {
         0
@@ -1522,18 +1554,12 @@ fn failing_attention_count(state: &ConsoleState) -> usize {
 
 fn area_has_active_failure(state: &ConsoleState, area: Area) -> bool {
     match area {
-        Area::Ci => state
-            .visible_ci_jobs()
-            .iter()
-            .any(|j| j.queue_state.eq_ignore_ascii_case("failed")),
-        Area::Cd => state
-            .client
-            .view()
-            .is_some_and(|v| v.cd_runs.iter().any(|r| r.state == CdRunState::Failed)),
-        Area::Observability => state
-            .client
-            .view()
-            .is_some_and(|v| v.observe.problems.iter().any(|p| p.active)),
+        Area::Observability => state.client.view().is_some_and(|v| {
+            v.observe
+                .problems
+                .iter()
+                .any(|p| p.active && !is_ci_inner_step_problem(p))
+        }),
         _ => false,
     }
 }
@@ -1579,7 +1605,10 @@ fn subsystem_permitted_detail(
             && view.is_some_and(|v| {
                 e.summary.is_empty()
                     || e.summary.eq_ignore_ascii_case("operational")
-                    || v.observe.problems.iter().any(|p| p.active)
+                    || v.observe
+                        .problems
+                        .iter()
+                        .any(|p| p.active && !is_ci_inner_step_problem(p))
             });
         if !e.summary.is_empty() && !obs_override {
             return e.summary.clone();
@@ -1597,7 +1626,12 @@ fn subsystem_permitted_detail(
         ),
         Area::Repository => format!("{} package(s)", view.registry.packages.len()),
         Area::Observability => {
-            let active_problems = view.observe.problems.iter().filter(|p| p.active).count();
+            let active_problems = view
+                .observe
+                .problems
+                .iter()
+                .filter(|p| p.active && !is_ci_inner_step_problem(p))
+                .count();
             if active_problems > 0 {
                 format!(
                     "{} logs · {} traces · {} metrics · {active_problems} active SLO problem(s)",
@@ -3024,6 +3058,7 @@ fn build_observe_sections(
                     v.observe
                         .problems
                         .iter()
+                        .filter(|p| !is_ci_inner_step_problem(p))
                         .map(|p| TableRow {
                             id: format!("prob-{}", p.problem_id),
                             tone: if p.active {
@@ -3778,6 +3813,177 @@ mod tests {
             .iter()
             .find(|r| r.id == "att-ci-42")
             .expect("ci row");
+        assert_eq!(ci_row.cells[0].text, "CI Job");
+        assert_eq!(ci_row.cells[2].text, "3/4 tests passed");
         assert_eq!(ci_row.cells[3].text, "Failed");
+    }
+
+    #[test]
+    fn ci_failures_and_inner_step_problems_do_not_degrade_apps_or_obs_slos() {
+        use mu_console_protocol::{
+            CiJobStage, SubsystemHealthEntry, SubsystemHealthSummary, SubsystemStatus,
+        };
+
+        let mut st = ConsoleState::new();
+        st.init_from_env("#/dashboard/overview", "", None);
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec![
+                    "system:dashboard.read".into(),
+                    "ci:queue.read".into(),
+                    "ci:jobs.read".into(),
+                    "obs:problems.read".into(),
+                ],
+                ..AuthState::default()
+            },
+            subsystem_health: SubsystemHealthSummary {
+                ci: SubsystemHealthEntry {
+                    status: SubsystemStatus::Live,
+                    summary: "Operational".into(),
+                    ..SubsystemHealthEntry::default()
+                },
+                observability: SubsystemHealthEntry {
+                    status: SubsystemStatus::Live,
+                    summary: "Operational".into(),
+                    ..SubsystemHealthEntry::default()
+                },
+                ..SubsystemHealthSummary::default()
+            },
+            ci_jobs: vec![
+                CiJobSummary {
+                    job_id: 101,
+                    repo: RepoId::new("LMA1980", "jero-core"),
+                    ref_name: "main".into(),
+                    queue_state: "failed".into(),
+                    tests_passed: 639,
+                    tests_total: 639,
+                    ..CiJobSummary::default()
+                },
+                CiJobSummary {
+                    job_id: 102,
+                    repo: RepoId::new("LMA1980", "mu-console"),
+                    ref_name: "main".into(),
+                    queue_state: "failed".into(),
+                    tests_passed: 10,
+                    tests_total: 10,
+                    stages: vec![CiJobStage {
+                        id: "miri-check".into(),
+                        name: "Miri".into(),
+                        assigned_node: Some("node-a".into()),
+                        threads: 6,
+                        state: StageState::Failed,
+                        duration_secs: 15,
+                        exit_code: 1,
+                        skip_reason: None,
+                    }],
+                    ..CiJobSummary::default()
+                },
+            ],
+            observe: mu_console_protocol::ObserveView {
+                problems: vec![
+                    SloProblem {
+                        problem_id: "PROB-TEST-jero-core-miri".into(),
+                        title: "Flaky / Failing Test jero-core::foo (cargo-miri)".into(),
+                        category: ProblemCategory::FlakyTest,
+                        severity: "warning".into(),
+                        impacted_entity: "lma1980/jero-core".into(),
+                        active: true,
+                        ..SloProblem::default()
+                    },
+                    SloProblem {
+                        problem_id: "PROB-BENCH-jero-core-loop".into(),
+                        title: "Benchmark Regression in jero-core::loop".into(),
+                        category: ProblemCategory::LatencyRegression,
+                        severity: "error".into(),
+                        impacted_entity: "lma1980/jero-core".into(),
+                        active: true,
+                        ..SloProblem::default()
+                    },
+                ],
+                ..mu_console_protocol::ObserveView::default()
+            },
+            ..ViewModel::default()
+        };
+        let frame = encode(&DataEvent::Snapshot(vm)).expect("encode ViewModel");
+        st.on_worker_frame(&frame);
+
+        let scene = build_console_scene(&st, SceneViewport::DESKTOP);
+
+        // 1. Applications cards stay Live/Pass despite failed CI jobs and CI inner-step items.
+        let app_sec = scene
+            .sections
+            .iter()
+            .find(|s| s.id == "sec-dash-applications")
+            .expect("Applications section");
+        let SceneComponent::StatusMatrix(mat) = &app_sec.components[0] else {
+            panic!("expected StatusMatrix");
+        };
+        assert_eq!(mat.cells[0].id, "dash-card:ci");
+        assert_eq!(mat.cells[0].value, "Live");
+        assert_eq!(mat.cells[0].tone, SemanticTone::Pass);
+        assert_eq!(mat.cells[4].id, "dash-card:observability");
+        assert_eq!(mat.cells[4].value, "Live");
+        assert_eq!(mat.cells[4].tone, SemanticTone::Pass);
+        assert_eq!(
+            mat.cells[4].detail.as_deref(),
+            Some("0 logs · 0 traces · 0 metrics")
+        );
+
+        // 2. Needs Attention shows only CI Job rows (zero PROB-TEST / PROB-BENCH rows).
+        let att_sec = scene
+            .sections
+            .iter()
+            .find(|s| s.id == "sec-dash-attention")
+            .expect("Needs Attention section");
+        let SceneComponent::TableGrid(grid) = &att_sec.components[0] else {
+            panic!("expected TableGrid");
+        };
+        assert_eq!(grid.rows.len(), 2);
+        let j101 = grid
+            .rows
+            .iter()
+            .find(|r| r.id == "att-ci-101")
+            .expect("job 101 row");
+        assert_eq!(j101.cells[0].text, "CI Job");
+        assert_eq!(
+            j101.cells[2].text,
+            "CI job failed (639/639 unit tests passed)"
+        );
+        assert_eq!(j101.cells[3].text, "Failed");
+        assert_eq!(
+            j101.row_action.as_ref().map(|a| a.action.as_str()),
+            Some("ci-job:101")
+        );
+
+        let j102 = grid
+            .rows
+            .iter()
+            .find(|r| r.id == "att-ci-102")
+            .expect("job 102 row");
+        assert_eq!(j102.cells[0].text, "CI Job");
+        assert_eq!(j102.cells[2].text, "Stage 'miri-check' failed (exit 1)");
+        assert_eq!(j102.cells[3].text, "Failed");
+
+        // 3. Observability tab badge & Problems/SLOs view also exclude CI inner-step items.
+        let obs_tab = scene
+            .area_tabs
+            .iter()
+            .find(|t| t.id == "observability")
+            .expect("obs tab");
+        assert_eq!(obs_tab.badge, None);
+
+        st.select_subview(SubView::Observability(ObservabilitySubView::ProblemsSlos));
+        let obs_scene = build_console_scene(&st, SceneViewport::DESKTOP);
+        let obs_sec = obs_scene
+            .sections
+            .iter()
+            .find(|s| s.id == "sec-observe")
+            .expect("sec-observe");
+        let SceneComponent::TableGrid(obs_grid) = &obs_sec.components[0] else {
+            panic!("expected obs-problems-table");
+        };
+        assert!(obs_grid.rows.is_empty());
     }
 }
