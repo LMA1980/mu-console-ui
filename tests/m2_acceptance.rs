@@ -1907,3 +1907,138 @@ fn m2_93_ci_job_scope_and_live_application_cards_exclude_ci_inner_step_alerts() 
     assert!(!obs_wf.contains("Flaky / Failing Test"));
     assert!(!obs_wf.contains("Benchmark Regression"));
 }
+
+#[test]
+fn m2_95_active_failing_test_surfaces_across_skins_and_clears_immediately_when_fixed() {
+    use mu_console_protocol::{
+        ObservabilitySubView, ProblemCategory, SloProblem, SubsystemHealthEntry,
+        SubsystemHealthSummary, SubsystemStatus,
+    };
+    use mu_console_theme::scene::SceneComponent;
+    use mu_console_theme::skin::SemanticTone;
+    use mu_console_ui::scene::build_console_scene;
+
+    let mut st = active_state(
+        "ops",
+        vec![
+            "system:dashboard.read",
+            "ci:queue.read",
+            "ci:jobs.read",
+            "ci:repos.public.read",
+            "obs:problems.read",
+        ],
+    );
+    st.init_from_env("#/dashboard/overview", "", None);
+
+    let auth = st.auth();
+    let mk_vm = |jobs: Vec<CiJobSummary>, problems: Vec<SloProblem>| ViewModel {
+        auth: auth.clone(),
+        subsystem_health: SubsystemHealthSummary {
+            ci: SubsystemHealthEntry {
+                status: SubsystemStatus::Live,
+                summary: "Operational".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            observability: SubsystemHealthEntry {
+                status: SubsystemStatus::Live,
+                summary: "Operational".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            ..SubsystemHealthSummary::default()
+        },
+        ci_jobs: jobs,
+        observe: mu_console_protocol::ObserveView {
+            problems,
+            ..mu_console_protocol::ObserveView::default()
+        },
+        ..ViewModel::default()
+    };
+
+    // 1. Failing test (severity = "error") and failing CI job surface across both skins without degrading Live cards.
+    push_vm(
+        &mut st,
+        mk_vm(
+            vec![CiJobSummary {
+                job_id: 301,
+                repo: RepoId::new("LMA1980", "jero-core"),
+                ref_name: "main".into(),
+                queue_state: "failed".into(),
+                tests_passed: 638,
+                tests_total: 639,
+                ..CiJobSummary::default()
+            }],
+            vec![SloProblem {
+                problem_id: "PROB-TEST-jero-core-cargo-test-test_alpha".into(),
+                title: "Failing Test jero-core::test_alpha (cargo-test)".into(),
+                category: ProblemCategory::FlakyTest,
+                severity: "error".into(),
+                impacted_entity: "lma1980/jero-core".into(),
+                active: true,
+                ..SloProblem::default()
+            }],
+        ),
+    );
+
+    let (dash_html_1, dash_wf_1) = render_both_skins(&st);
+    assert!(dash_html_1.contains("CI Test"));
+    assert!(dash_wf_1.contains("CI Test"));
+    assert!(dash_html_1.contains("Failing Test jero-core::test_alpha"));
+    assert!(dash_wf_1.contains("Failing Test jero-core::test_alpha"));
+
+    let scene1 = build_console_scene(&st, mu_console_theme::scene::SceneViewport::DESKTOP);
+    let app_sec1 = scene1
+        .sections
+        .iter()
+        .find(|s| s.id == "sec-dash-applications")
+        .unwrap();
+    let SceneComponent::StatusMatrix(mat1) = &app_sec1.components[0] else {
+        panic!("expected StatusMatrix");
+    };
+    assert_eq!(mat1.cells[4].value, "Live");
+    assert_eq!(mat1.cells[4].tone, SemanticTone::Pass);
+
+    st.select_subview(SubView::Observability(ObservabilitySubView::ProblemsSlos));
+    let (obs_html_1, obs_wf_1) = render_both_skins(&st);
+    assert!(obs_html_1.contains("Failing Test jero-core::test_alpha"));
+    assert!(obs_wf_1.contains("Failing Test jero-core::test_alpha"));
+
+    // 2. Passing run on newer job_id = 302 clears both CI Job and PROB-TEST alerts immediately.
+    push_vm(
+        &mut st,
+        mk_vm(
+            vec![
+                CiJobSummary {
+                    job_id: 302,
+                    repo: RepoId::new("LMA1980", "jero-core"),
+                    ref_name: "main".into(),
+                    queue_state: "passed".into(),
+                    tests_passed: 639,
+                    tests_total: 639,
+                    ..CiJobSummary::default()
+                },
+                CiJobSummary {
+                    job_id: 301,
+                    repo: RepoId::new("LMA1980", "jero-core"),
+                    ref_name: "main".into(),
+                    queue_state: "failed".into(),
+                    tests_passed: 638,
+                    tests_total: 639,
+                    ..CiJobSummary::default()
+                },
+            ],
+            Vec::new(),
+        ),
+    );
+    let (obs_html_2, obs_wf_2) = render_both_skins(&st);
+    assert!(obs_html_2.contains("Zero open SLO alerts"));
+    assert!(!obs_wf_2.contains("PROB-TEST-"));
+    assert!(!obs_html_2.contains("Failing Test jero-core::test_alpha"));
+    assert!(!obs_wf_2.contains("Failing Test jero-core::test_alpha"));
+
+    st.select_subview(SubView::Dashboard(DashboardSubView::Overview));
+    let (dash_html_2, dash_wf_2) = render_both_skins(&st);
+    assert!(!dash_html_2.contains("Failing Test jero-core::test_alpha"));
+    assert!(!dash_wf_2.contains("Failing Test jero-core::test_alpha"));
+    assert!(!dash_html_2.contains("#301"));
+    assert!(!dash_wf_2.contains("#301"));
+}
