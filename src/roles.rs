@@ -94,6 +94,178 @@ pub fn format_active_roles(roles: &[RoleBadgeView], max_chars: u32) -> String {
     truncate_chars(&segments[0], cap)
 }
 
+fn escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    mu_console_theme::svg::escape_into(&mut out, s);
+    out
+}
+
+struct RoleSegment {
+    role_id: String,
+    plain_prefix: String,
+    plain_timer: Option<String>,
+    plain_full: String,
+    html_full: String,
+}
+
+fn build_role_segment(badge: &RoleBadgeView) -> RoleSegment {
+    let label = badge.effective_label();
+    let display = if label.is_empty() {
+        badge.role_id.as_str()
+    } else {
+        label
+    };
+    let plain_prefix = format!("+{display}");
+    let plain_timer =
+        if matches!(badge.activation.kind, RoleActivationKind::Timed) || badge.lease.is_some() {
+            badge.lease.as_ref().map(|lease| {
+                format!(
+                    "[{}][{}]",
+                    RoleLeaseView::format_mm_ss(lease.seconds_remaining),
+                    RoleLeaseView::format_mm_ss(lease.idle_timer)
+                )
+            })
+        } else {
+            None
+        };
+    let plain_full = match &plain_timer {
+        Some(t) => format!("{plain_prefix}{t}"),
+        None => plain_prefix.clone(),
+    };
+    let html_full = match &plain_timer {
+        Some(t) => format!(
+            "{}<span class=\"mu-lease-timer\" data-lease-timer=\"hdr:{}\">{}</span>",
+            escape_text(&plain_prefix),
+            escape_text(&badge.role_id),
+            escape_text(t),
+        ),
+        None => escape_text(&plain_prefix),
+    };
+    RoleSegment {
+        role_id: badge.role_id.clone(),
+        plain_prefix,
+        plain_timer,
+        plain_full,
+        html_full,
+    }
+}
+
+fn format_truncated_segment_html(seg: &RoleSegment, content_budget: usize, tail: &str) -> String {
+    let prefix_chars = seg.plain_prefix.chars().count();
+    if content_budget <= prefix_chars {
+        let head: String = seg.plain_prefix.chars().take(content_budget).collect();
+        return format!("{}{}", escape_text(&head), escape_text(tail));
+    }
+    if let Some(timer) = &seg.plain_timer {
+        let avail = content_budget - prefix_chars;
+        let timer_slice: String = timer.chars().take(avail).collect();
+        return format!(
+            "{}<span class=\"mu-lease-timer\" data-lease-timer=\"hdr-trunc:{}:{avail}\">{}</span>{}",
+            escape_text(&seg.plain_prefix),
+            escape_text(&seg.role_id),
+            escape_text(&timer_slice),
+            escape_text(tail),
+        );
+    }
+    let head: String = seg.plain_full.chars().take(content_budget).collect();
+    format!("{}{}", escape_text(&head), escape_text(tail))
+}
+
+/// Format active roles as HTML wrapping only `[seconds_remaining][idle_timer]` values in
+/// `<span class="mu-lease-timer" data-lease-timer="...">` so timer ticks never redraw static badges.
+#[must_use]
+pub fn format_active_roles_html(roles: &[RoleBadgeView], max_chars: u32) -> String {
+    let cap = max_chars as usize;
+    if cap == 0 {
+        return String::new();
+    }
+    if roles.is_empty() {
+        return escape_text(&truncate_chars(copy::ROLE_HEADER_EMPTY, cap));
+    }
+
+    let segs: Vec<RoleSegment> = roles.iter().map(build_role_segment).collect();
+    let full_chars: usize = segs.iter().map(|s| s.plain_full.chars().count()).sum();
+    if full_chars <= cap {
+        return segs.iter().map(|s| s.html_full.as_str()).collect();
+    }
+
+    for keep in (1..segs.len()).rev() {
+        let hidden = segs.len() - keep;
+        let suffix = format!("…(+{hidden})");
+        let suffix_len = suffix.chars().count();
+        let prefix_len: usize = segs[..keep]
+            .iter()
+            .map(|s| s.plain_full.chars().count())
+            .sum();
+        if prefix_len + suffix_len <= cap {
+            let mut out: String = segs[..keep].iter().map(|s| s.html_full.as_str()).collect();
+            out.push_str(&escape_text(&suffix));
+            return out;
+        }
+    }
+
+    if segs.len() > 1 {
+        let suffix = format!("…(+{})", segs.len() - 1);
+        let suffix_len = suffix.chars().count();
+        if suffix_len < cap {
+            return format_truncated_segment_html(&segs[0], cap - suffix_len, &suffix);
+        }
+        return escape_text(&suffix.chars().take(cap).collect::<String>());
+    }
+
+    if cap == 1 {
+        return "…".to_owned();
+    }
+    format_truncated_segment_html(&segs[0], cap - 1, "…")
+}
+
+/// Resolve the live display text for a `[data-lease-timer="..."]` element key from `auth`.
+#[must_use]
+pub fn resolve_lease_timer_text(auth: &AuthState, key: &str) -> Option<String> {
+    if let Some(role_id) = key.strip_prefix("hdr:") {
+        let lease = auth.leases.iter().find(|l| l.role_id == role_id)?;
+        return Some(format!(
+            "[{}][{}]",
+            RoleLeaseView::format_mm_ss(lease.seconds_remaining),
+            RoleLeaseView::format_mm_ss(lease.idle_timer),
+        ));
+    }
+    if let Some(rest) = key.strip_prefix("hdr-trunc:") {
+        let (role_id, avail_str) = rest.rsplit_once(':')?;
+        let avail: usize = avail_str.parse().ok()?;
+        let lease = auth.leases.iter().find(|l| l.role_id == role_id)?;
+        let full = format!(
+            "[{}][{}]",
+            RoleLeaseView::format_mm_ss(lease.seconds_remaining),
+            RoleLeaseView::format_mm_ss(lease.idle_timer),
+        );
+        return Some(full.chars().take(avail).collect());
+    }
+    if let Some(role_id) = key
+        .strip_prefix("renew-rem:")
+        .or_else(|| key.strip_prefix("dlg-rem:"))
+    {
+        let lease = auth.leases.iter().find(|l| l.role_id == role_id)?;
+        return Some(RoleLeaseView::format_mm_ss(lease.seconds_remaining));
+    }
+    if let Some(rest) = key.strip_prefix("dlg-rem-trunc:") {
+        let (role_id, avail_str) = rest.rsplit_once(':')?;
+        let avail: usize = avail_str.parse().ok()?;
+        let lease = auth.leases.iter().find(|l| l.role_id == role_id)?;
+        let full = RoleLeaseView::format_mm_ss(lease.seconds_remaining);
+        return Some(full.chars().take(avail).collect());
+    }
+    if let Some(role_id) = key.strip_prefix("renew-idle:") {
+        let lease = auth.leases.iter().find(|l| l.role_id == role_id)?;
+        return Some(RoleLeaseView::format_mm_ss(lease.idle_timer));
+    }
+    if let Some(role_id) = key.strip_prefix("profile-secs:") {
+        let lease = auth.leases.iter().find(|l| l.role_id == role_id)?;
+        return Some(format!("{}s", lease.seconds_remaining));
+    }
+    None
+}
+
 /// Advance local `Timed` lease countdowns to `now_ms`.
 ///
 /// Returns the IDs of `Timed` roles that reached `00:00` and were deactivated from `auth`.
@@ -318,5 +490,71 @@ mod tests {
         let mut ab_route = Route::for_area(Area::AbDeploy);
         assert!(redirect_if_lacking_access(&auth, &mut ab_route));
         assert_eq!(ab_route.area, Area::Dashboard);
+    }
+
+    fn strip_html_tags(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_tag = false;
+        for ch in s.chars() {
+            match ch {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => out.push(ch),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn format_active_roles_html_matches_plain_budget_and_resolves_all_timer_keys() {
+        let viewer = badge("viewer", Some("Viewer"), None);
+        let super_op = badge("super-operator", Some("Super Operator"), Some((899, 118)));
+        let roles = [super_op.clone(), viewer.clone()];
+
+        for cap in 0..=60 {
+            let html = format_active_roles_html(&roles, cap);
+            let plain = format_active_roles(&roles, cap);
+            assert_eq!(strip_html_tags(&html), escape_text(&plain), "cap={cap}");
+
+            let single_html = format_active_roles_html(std::slice::from_ref(&super_op), cap);
+            let single_plain = format_active_roles(std::slice::from_ref(&super_op), cap);
+            assert_eq!(
+                strip_html_tags(&single_html),
+                escape_text(&single_plain),
+                "single cap={cap}"
+            );
+        }
+
+        let auth = AuthState {
+            status: AuthStatus::Active,
+            leases: vec![super_op.lease.unwrap()],
+            ..AuthState::default()
+        };
+        assert_eq!(
+            resolve_lease_timer_text(&auth, "hdr:super-operator").as_deref(),
+            Some("[14:59][01:58]")
+        );
+        assert_eq!(
+            resolve_lease_timer_text(&auth, "hdr-trunc:super-operator:7").as_deref(),
+            Some("[14:59]")
+        );
+        assert_eq!(
+            resolve_lease_timer_text(&auth, "renew-rem:super-operator").as_deref(),
+            Some("14:59")
+        );
+        assert_eq!(
+            resolve_lease_timer_text(&auth, "renew-idle:super-operator").as_deref(),
+            Some("01:58")
+        );
+        assert_eq!(
+            resolve_lease_timer_text(&auth, "dlg-rem:super-operator").as_deref(),
+            Some("14:59")
+        );
+        assert_eq!(
+            resolve_lease_timer_text(&auth, "profile-secs:super-operator").as_deref(),
+            Some("899s")
+        );
+        assert_eq!(resolve_lease_timer_text(&auth, "hdr:missing"), None);
     }
 }

@@ -17,7 +17,8 @@ use mu_console_theme::metrics::{CrtFontMetrics, HURMIT, OPEN_DYSLEXIC};
 use crate::client::{ClientUpdate, DataClient};
 use crate::copy;
 use crate::roles::{
-    expire_timed_leases, format_active_roles, redirect_if_lacking_access, touch_active_leases,
+    expire_timed_leases, format_active_roles, format_active_roles_html, redirect_if_lacking_access,
+    touch_active_leases,
 };
 use crate::router::{
     can_access_subview, escape_up, format_hash, has_explicit_route, parse_hash,
@@ -636,6 +637,18 @@ impl ConsoleState {
         format_active_roles(&auth.active_roles, max_chars)
     }
 
+    /// Format active header role pill as HTML with `[MM:SS][MM:SS]` wrapped in `[data-lease-timer]`.
+    #[must_use]
+    pub fn format_header_roles_html(&self) -> String {
+        let auth = self.auth();
+        let max_chars = self
+            .client
+            .view()
+            .map(|v| v.max_active_roles_header_chars)
+            .unwrap_or(mu_console_protocol::DEFAULT_MAX_ACTIVE_ROLES_HEADER_CHARS);
+        format_active_roles_html(&auth.active_roles, max_chars)
+    }
+
     /// Return sign-in URL preserving the current deep-link path/hash cleanly across OAuth.
     #[must_use]
     pub fn sign_in_href(&self) -> String {
@@ -876,13 +889,25 @@ impl ConsoleState {
     /// Apply decoded postcard frame from the data worker and handle auth/expiry route transitions.
     pub fn on_worker_frame(&mut self, frame: &[u8]) -> ClientUpdate {
         let update = self.client.on_frame(frame);
-        if matches!(
-            update,
-            ClientUpdate::View | ClientUpdate::ReloadRequired { .. }
-        ) {
-            self.sync_from_view_model();
+        match update {
+            ClientUpdate::View | ClientUpdate::ReloadRequired { .. } => {
+                self.sync_from_view_model();
+            }
+            ClientUpdate::LeaseTimers => {
+                self.sync_lease_timers_from_view_model();
+            }
+            _ => {}
         }
         update
+    }
+
+    fn sync_lease_timers_from_view_model(&mut self) {
+        let Some(view) = self.client.view() else {
+            return;
+        };
+        if let Some(DialogModel::SessionRoles(ref mut sr)) = self.local_dialog {
+            sync_session_roles_model(sr, &view.auth, Some(view));
+        }
     }
 
     fn sync_from_view_model(&mut self) {

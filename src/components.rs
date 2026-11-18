@@ -12,7 +12,7 @@ use crate::state::ConsoleState;
 use mu_console_layout::{SafeArea, Viewport};
 use mu_console_protocol::{
     Area, AuthStatus, ConsoleSkin, CrtFont, DialogModel as ProtoDialogModel, RiskConfirmAction,
-    UserProfileTab,
+    RoleActivationKind, RoleLeaseView, UserProfileTab,
 };
 use mu_console_theme::html::HtmlCoreSkin;
 use mu_console_theme::scene::{SceneRenderer, SceneViewport};
@@ -69,13 +69,435 @@ pub fn render_console_with_skin(skin: ConsoleSkin, state: &ConsoleState, vp: Vie
     match skin {
         ConsoleSkin::Wireframe => {
             let svg = WireframeSkin.render_scene_with_dialog(&scene, dialog.as_ref(), scene_vp);
-            enrich_wireframe_dialog(svg, state, scene_vp)
+            let enriched = enrich_wireframe_dialog(svg, state, scene_vp);
+            enrich_wireframe_lease_timers(enriched, state)
         }
         ConsoleSkin::Html => {
             let html = HtmlCoreSkin.render_scene_with_dialog(&scene, dialog.as_ref(), scene_vp);
-            enrich_html_dialog(html, state)
+            let enriched = enrich_html_dialog(html, state);
+            enrich_html_lease_timers(enriched, state)
         }
     }
+}
+
+fn strip_bracketed_mm_ss(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        if let Some(close) = after.find(']') {
+            let inner = &after[..close];
+            if !inner.is_empty()
+                && inner.contains(':')
+                && inner.bytes().all(|b| b.is_ascii_digit() || b == b':')
+            {
+                out.push_str("[__T__]");
+                rest = &after[close + 1..];
+                continue;
+            }
+        }
+        out.push('[');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Normalize dynamic `[data-lease-timer]` text nodes and `hdr-role` `aria-label` timer strings
+/// so structural equality checks skip DOM replacement when only countdown digits ticked.
+#[must_use]
+pub fn strip_lease_timer_values(markup: &str) -> String {
+    let mut out = markup.to_owned();
+
+    for (open_pat, close_tag) in [
+        (
+            r#"<span class="mu-lease-timer" data-lease-timer=""#,
+            "</span>",
+        ),
+        (
+            r#"<tspan class="mu-lease-timer" data-lease-timer=""#,
+            "</tspan>",
+        ),
+    ] {
+        let mut cursor = 0;
+        while let Some(rel) = out[cursor..].find(open_pat) {
+            let start = cursor + rel;
+            let Some(rel_gt) = out[start..].find('>') else {
+                break;
+            };
+            let body_start = start + rel_gt + 1;
+            let Some(rel_end) = out[body_start..].find(close_tag) else {
+                break;
+            };
+            let body_end = body_start + rel_end;
+            out.replace_range(body_start..body_end, "__TIMER__");
+            cursor = body_start + "__TIMER__".len() + close_tag.len();
+        }
+    }
+
+    let mut cursor = 0;
+    while let Some(rel) = out[cursor..].find(r#"data-action="hdr-role""#) {
+        let marker = cursor + rel;
+        let Some(tag_start) = out[..marker].rfind('<') else {
+            cursor = marker + 1;
+            continue;
+        };
+        let Some(rel_tag_end) = out[marker..].find('>') else {
+            break;
+        };
+        let tag_end = marker + rel_tag_end;
+        if let Some(rel_aria) = out[tag_start..tag_end].find(r#"aria-label=""#) {
+            let val_start = tag_start + rel_aria + r#"aria-label=""#.len();
+            if let Some(rel_quote) = out[val_start..tag_end].find('"') {
+                let val_end = val_start + rel_quote;
+                let normalized = strip_bracketed_mm_ss(&out[val_start..val_end]);
+                out.replace_range(val_start..val_end, &normalized);
+                cursor = val_start + normalized.len() + 1;
+                continue;
+            }
+        }
+        cursor = tag_end + 1;
+    }
+
+    out
+}
+
+/// Wrap HTML lease timer numerals in `[data-lease-timer]` spans so background countdown
+/// ticks update only timer text nodes without redrawing banners, buttons, or modals.
+#[must_use]
+pub fn enrich_html_lease_timers(mut html: String, state: &ConsoleState) -> String {
+    let auth = state.auth();
+    if auth.leases.is_empty() {
+        return html;
+    }
+
+    let roles_plain_esc = escape_html(&state.format_header_roles());
+    let roles_html = state.format_header_roles_html();
+    if roles_html != roles_plain_esc {
+        let mut cursor = 0;
+        while let Some(rel) = html[cursor..].find(r#"data-action="hdr-role""#) {
+            let marker = cursor + rel;
+            let Some(rel_gt) = html[marker..].find('>') else {
+                break;
+            };
+            let body_start = marker + rel_gt + 1;
+            let Some(rel_end) = html[body_start..].find("</button>") else {
+                break;
+            };
+            let body_end = body_start + rel_end;
+            if html[body_start..body_end] == roles_plain_esc {
+                html.replace_range(body_start..body_end, &roles_html);
+                break;
+            }
+            cursor = body_end;
+        }
+    }
+
+    for lease in &auth.leases {
+        if !(lease.can_renew && !lease.is_expired()) {
+            continue;
+        }
+        let id_esc = escape_html(&lease.role_id);
+        let rem = RoleLeaseView::format_mm_ss(lease.seconds_remaining);
+        let idle = RoleLeaseView::format_mm_ss(lease.idle_timer);
+        let banner_attr = format!(r#"data-banner-id="banner-role-renew-{id_esc}""#);
+        if let Some(b_pos) = html.find(&banner_attr) {
+            let next_banner = html[b_pos + 1..]
+                .find(r#"data-banner-id=""#)
+                .map_or(html.len(), |n| b_pos + 1 + n);
+            let grid_pos = html[b_pos..]
+                .find(r#"class="mu-scene-grid""#)
+                .map_or(html.len(), |n| b_pos + n);
+            let b_limit = next_banner.min(grid_pos);
+            if let Some(rel_p_start) = html[b_pos..b_limit].find("<p>") {
+                let p_start = b_pos + rel_p_start;
+                if let Some(rel_p_end) = html[p_start..b_limit].find("</p>") {
+                    let p_end = p_start + rel_p_end;
+                    let mut seg = html[p_start..p_end].to_owned();
+                    let rem_from = format!("expires in {rem}");
+                    let rem_to = format!(
+                        r#"expires in <span class="mu-lease-timer" data-lease-timer="renew-rem:{id_esc}">{rem}</span>"#
+                    );
+                    if let Some(idx) = seg.find(&rem_from) {
+                        seg.replace_range(idx..idx + rem_from.len(), &rem_to);
+                    }
+                    let idle_from = format!("(idle {idle})");
+                    let idle_to = format!(
+                        r#"(idle <span class="mu-lease-timer" data-lease-timer="renew-idle:{id_esc}">{idle}</span>)"#
+                    );
+                    if let Some(idx) = seg.find(&idle_from) {
+                        seg.replace_range(idx..idx + idle_from.len(), &idle_to);
+                    }
+                    html.replace_range(p_start..p_end, &seg);
+                }
+            }
+        }
+    }
+
+    if let Some(dlg_start) = html.find(r#"id="dlg-session-roles""#) {
+        let dlg_end = html[dlg_start..]
+            .find("</dialog>")
+            .map_or(html.len(), |n| dlg_start + n);
+        let mut dlg_seg = html[dlg_start..dlg_end].to_owned();
+        for lease in &auth.leases {
+            let id_esc = escape_html(&lease.role_id);
+            let rem = RoleLeaseView::format_mm_ss(lease.seconds_remaining);
+            let old_exp = format!(r#"<span class="mu-role-expiry">Expires {rem}</span>"#);
+            let new_exp = format!(
+                r#"<span class="mu-role-expiry">Expires <span class="mu-lease-timer" data-lease-timer="dlg-rem:{id_esc}">{rem}</span></span>"#
+            );
+            let disable_marker = format!(r#"data-control-id="role-disable:{id_esc}""#);
+            if let Some(btn_pos) = dlg_seg.find(&disable_marker) {
+                let li_start = dlg_seg[..btn_pos].rfind("<li ").unwrap_or(0);
+                let li_end = dlg_seg[btn_pos..]
+                    .find("</li>")
+                    .map_or(dlg_seg.len(), |n| btn_pos + n);
+                if let Some(rel) = dlg_seg[li_start..li_end].find(&old_exp) {
+                    let abs = li_start + rel;
+                    dlg_seg.replace_range(abs..abs + old_exp.len(), &new_exp);
+                }
+            }
+            let renew_marker = format!(r#"data-control-id="role-renew:{id_esc}""#);
+            if let Some(btn_pos) = dlg_seg.find(&renew_marker) {
+                let li_start = dlg_seg[..btn_pos].rfind("<li ").unwrap_or(0);
+                let li_end = dlg_seg[btn_pos..]
+                    .find("</li>")
+                    .map_or(dlg_seg.len(), |n| btn_pos + n);
+                let old_rem = format!("({rem} remaining)");
+                let new_rem = format!(
+                    r#"(<span class="mu-lease-timer" data-lease-timer="dlg-rem:{id_esc}">{rem}</span> remaining)"#
+                );
+                if let Some(rel) = dlg_seg[li_start..li_end].find(&old_rem) {
+                    let abs = li_start + rel;
+                    dlg_seg.replace_range(abs..abs + old_rem.len(), &new_rem);
+                }
+                let li_end = dlg_seg[btn_pos..]
+                    .find("</li>")
+                    .map_or(dlg_seg.len(), |n| btn_pos + n);
+                if let Some(rel) = dlg_seg[li_start..li_end].find(&old_exp) {
+                    let abs = li_start + rel;
+                    dlg_seg.replace_range(abs..abs + old_exp.len(), &new_exp);
+                }
+            }
+        }
+        html.replace_range(dlg_start..dlg_end, &dlg_seg);
+    }
+
+    if let Some(dlg_start) = html.find(r#"id="dlg-user-profile""#) {
+        let dlg_end = html[dlg_start..]
+            .find("</dialog>")
+            .map_or(html.len(), |n| dlg_start + n);
+        if let Some(rel_grp) = html[dlg_start..dlg_end].find(r#"data-role-state="active""#) {
+            let grp_start = dlg_start + rel_grp;
+            let grp_end = html[grp_start..dlg_end]
+                .find("</ul>")
+                .map_or(dlg_end, |n| grp_start + n);
+            let mut grp_seg = html[grp_start..grp_end].to_owned();
+            for badge in &auth.active_roles {
+                if !(matches!(badge.activation.kind, RoleActivationKind::Timed)
+                    || badge.lease.is_some())
+                {
+                    continue;
+                }
+                let Some(lease) = badge
+                    .lease
+                    .as_ref()
+                    .or_else(|| auth.leases.iter().find(|l| l.role_id == badge.role_id))
+                else {
+                    continue;
+                };
+                let id_esc = escape_html(&badge.role_id);
+                let role_esc = escape_html(badge.effective_label());
+                let secs = format!("{}s", lease.seconds_remaining);
+                let old = format!(">{role_esc} ({secs} remaining)</li>");
+                let new = format!(
+                    r#">{role_esc} (<span class="mu-lease-timer" data-lease-timer="profile-secs:{id_esc}">{secs}</span> remaining)</li>"#
+                );
+                if let Some(idx) = grp_seg.find(&old) {
+                    grp_seg.replace_range(idx..idx + old.len(), &new);
+                }
+            }
+            html.replace_range(grp_start..grp_end, &grp_seg);
+        }
+    }
+
+    html
+}
+
+/// Wrap Wireframe SVG lease timer numerals in `<tspan class="mu-lease-timer" data-lease-timer="...">`
+/// so background countdown ticks update only the SVG text spans in-place.
+#[must_use]
+pub fn enrich_wireframe_lease_timers(mut svg: String, state: &ConsoleState) -> String {
+    let auth = state.auth();
+    if auth.leases.is_empty() {
+        return svg;
+    }
+
+    let roles_plain_esc = escape_html(&state.format_header_roles());
+    let aria_needle = format!(r#"aria-label="{roles_plain_esc}""#);
+    let mut cursor = 0;
+    while let Some(rel) = svg[cursor..].find(r#"data-action="hdr-role""#) {
+        let marker = cursor + rel;
+        let Some(g_start) = svg[..marker].rfind("<g") else {
+            cursor = marker + 1;
+            continue;
+        };
+        let Some(rel_g_end) = svg[marker..].find("</g>") else {
+            break;
+        };
+        let g_end = marker + rel_g_end;
+        if svg[g_start..g_end].contains(&aria_needle) {
+            if let Some(rel_text) = svg[g_start..g_end].find("<text ") {
+                let t_open = g_start + rel_text;
+                if let Some(rel_gt) = svg[t_open..g_end].find('>') {
+                    let body_start = t_open + rel_gt + 1;
+                    if let Some(rel_end) = svg[body_start..g_end].find("</text>") {
+                        let body_end = body_start + rel_end;
+                        let mut body = svg[body_start..body_end].to_owned();
+                        let mut search_pos = 0;
+                        for badge in &auth.active_roles {
+                            if !(matches!(badge.activation.kind, RoleActivationKind::Timed)
+                                || badge.lease.is_some())
+                            {
+                                continue;
+                            }
+                            let Some(lease) = &badge.lease else {
+                                continue;
+                            };
+                            let label_esc = escape_html(&format!("+{}", badge.effective_label()));
+                            let id_esc = escape_html(&badge.role_id);
+                            let timer_full = format!(
+                                "[{}][{}]",
+                                RoleLeaseView::format_mm_ss(lease.seconds_remaining),
+                                RoleLeaseView::format_mm_ss(lease.idle_timer)
+                            );
+                            if let Some(rel_idx) = body[search_pos..].find(&label_esc) {
+                                let after_idx = search_pos + rel_idx + label_esc.len();
+                                let after = &body[after_idx..];
+                                if after.starts_with(&timer_full) {
+                                    let repl = format!(
+                                        r#"<tspan class="mu-lease-timer" data-lease-timer="hdr:{id_esc}">{timer_full}</tspan>"#
+                                    );
+                                    body.replace_range(
+                                        after_idx..after_idx + timer_full.len(),
+                                        &repl,
+                                    );
+                                    search_pos = after_idx + repl.len();
+                                } else if after.starts_with('[') {
+                                    let slice = after
+                                        .split('<')
+                                        .next()
+                                        .unwrap_or("")
+                                        .split('…')
+                                        .next()
+                                        .unwrap_or("");
+                                    if !slice.is_empty() && timer_full.starts_with(slice) {
+                                        let avail = slice.chars().count();
+                                        let repl = format!(
+                                            r#"<tspan class="mu-lease-timer" data-lease-timer="hdr-trunc:{id_esc}:{avail}">{slice}</tspan>"#
+                                        );
+                                        body.replace_range(
+                                            after_idx..after_idx + slice.len(),
+                                            &repl,
+                                        );
+                                        search_pos = after_idx + repl.len();
+                                    }
+                                }
+                            }
+                        }
+                        svg.replace_range(body_start..body_end, &body);
+                        break;
+                    }
+                }
+            }
+        }
+        cursor = g_end + "</g>".len();
+    }
+
+    for lease in &auth.leases {
+        if !(lease.can_renew && !lease.is_expired()) {
+            continue;
+        }
+        let id_esc = escape_html(&lease.role_id);
+        let label_esc = escape_html(lease.display_name.as_deref().unwrap_or(&lease.role_id));
+        let rem = RoleLeaseView::format_mm_ss(lease.seconds_remaining);
+        let idle = RoleLeaseView::format_mm_ss(lease.idle_timer);
+        let marker = format!(
+            ">{}: {label_esc} expires in ",
+            escape_html(copy::RENEW_BANNER_TITLE)
+        );
+        if let Some(m_pos) = svg.find(&marker) {
+            let text_start = m_pos + 1;
+            if let Some(rel_end) = svg[text_start..].find("</text>") {
+                let text_end = text_start + rel_end;
+                let mut t = svg[text_start..text_end].to_owned();
+                let rem_from = format!("expires in {rem}");
+                let rem_to = format!(
+                    r#"expires in <tspan class="mu-lease-timer" data-lease-timer="renew-rem:{id_esc}">{rem}</tspan>"#
+                );
+                if let Some(idx) = t.find(&rem_from) {
+                    t.replace_range(idx..idx + rem_from.len(), &rem_to);
+                }
+                let idle_from = format!("(idle {idle})");
+                let idle_to = format!(
+                    r#"(idle <tspan class="mu-lease-timer" data-lease-timer="renew-idle:{id_esc}">{idle}</tspan>)"#
+                );
+                if let Some(idx) = t.find(&idle_from) {
+                    t.replace_range(idx..idx + idle_from.len(), &idle_to);
+                }
+                svg.replace_range(text_start..text_end, &t);
+            }
+        }
+    }
+
+    if let Some(dlg_start) = svg.find(r#"id="dlg-session-roles""#) {
+        let mut dlg_seg = svg[dlg_start..].to_owned();
+        let mut search_pos = 0;
+        for lease in &auth.leases {
+            if !(lease.can_renew && !lease.is_expired()) {
+                continue;
+            }
+            let id_esc = escape_html(&lease.role_id);
+            let label_esc = escape_html(lease.display_name.as_deref().unwrap_or(&lease.role_id));
+            let rem = RoleLeaseView::format_mm_ss(lease.seconds_remaining);
+            let row_hint = format!("{label_esc} — Renew");
+            let marker = "renewal window (";
+            let scope_from = dlg_seg[search_pos..]
+                .find(&row_hint)
+                .map_or(search_pos, |idx| search_pos + idx);
+            if let Some(m_rel) = dlg_seg[scope_from..].find(marker) {
+                let val_start = scope_from + m_rel + marker.len();
+                let after = &dlg_seg[val_start..];
+                if after.starts_with(&rem) {
+                    let new = format!(
+                        r#"<tspan class="mu-lease-timer" data-lease-timer="dlg-rem:{id_esc}">{rem}</tspan>"#
+                    );
+                    dlg_seg.replace_range(val_start..val_start + rem.len(), &new);
+                    search_pos = val_start + new.len();
+                } else {
+                    let slice = after
+                        .split('<')
+                        .next()
+                        .unwrap_or("")
+                        .split('…')
+                        .next()
+                        .unwrap_or("");
+                    if !slice.is_empty() && rem.starts_with(slice) {
+                        let avail = slice.chars().count();
+                        let new = format!(
+                            r#"<tspan class="mu-lease-timer" data-lease-timer="dlg-rem-trunc:{id_esc}:{avail}">{slice}</tspan>"#
+                        );
+                        dlg_seg.replace_range(val_start..val_start + slice.len(), &new);
+                        search_pos = val_start + new.len();
+                    }
+                }
+            }
+        }
+        svg.replace_range(dlg_start.., &dlg_seg);
+    }
+
+    svg
 }
 
 /// Enrich HTML5 `<dialog>` panels with interactive fields beyond the core
@@ -619,10 +1041,11 @@ pub fn render_html_shell(content: &str, state: &ConsoleState) -> String {
                 ""
             };
             let handle = escape_html(auth.github_login.as_deref().unwrap_or("operator"));
-            let roles_text = escape_html(&state.format_header_roles());
+            let roles_plain = escape_html(&state.format_header_roles());
+            let roles_html = state.format_header_roles_html();
             let href = escape_html(&state.sign_out_href());
             format!(
-                r##"<button id="muconsole-user-btn" type="button" data-control-id="hdr-user" data-action="hdr-user">@{handle}</button><button id="muconsole-roles-btn" type="button" data-control-id="hdr-role" data-action="hdr-role"{role_gated_attr}>{roles_text}</button><a id="muconsole-auth-link" href="{href}" data-auth-state="active">{}</a>"##,
+                r##"<button id="muconsole-user-btn" type="button" data-control-id="hdr-user" data-action="hdr-user">@{handle}</button><button id="muconsole-roles-btn" type="button" data-control-id="hdr-role" data-action="hdr-role" aria-label="{roles_plain}"{role_gated_attr}>{roles_html}</button><a id="muconsole-auth-link" href="{href}" data-auth-state="active">{}</a>"##,
                 escape_html(copy::SIGN_OUT_LABEL),
             )
         }

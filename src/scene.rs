@@ -745,8 +745,10 @@ fn populate_header_chrome(state: &ConsoleState, auth: &AuthState, scene: &mut Co
             scene.header_actions.push(
                 ActionControl::new("hdr-user", format!("@{handle}"), "hdr-user").disabled(false),
             );
+            let roles_plain = state.format_header_roles();
             scene.header_actions.push(
-                ActionControl::new("hdr-role", state.format_header_roles(), "hdr-role")
+                ActionControl::new("hdr-role", roles_plain.clone(), "hdr-role")
+                    .with_aria_label(roles_plain)
                     .disabled(role_gated)
                     .with_tone(SemanticTone::Info),
             );

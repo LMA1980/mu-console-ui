@@ -1588,3 +1588,193 @@ fn m2_86_needs_attention_status_labels_and_target_placement() {
         );
     }
 }
+
+#[test]
+fn m2_91_timer_only_dom_patching_preserves_banner_and_navigation_under_super_operator() {
+    use mu_console_protocol::{Delta, StepUpRequirement};
+    use mu_console_ui::client::ClientUpdate;
+    use mu_console_ui::components::{render_html_shell, strip_lease_timer_values};
+    use mu_console_ui::roles::resolve_lease_timer_text;
+
+    let mut state = ConsoleState::new();
+    let super_spec = RoleSpecDto {
+        id: "super-operator".into(),
+        display_name: Some("Super Operator".into()),
+        description: "All-access Passkey role".into(),
+        activation: RoleActivationDto::super_operator(),
+        step_up: StepUpRequirement::Passkey,
+    };
+    let make_lease = |rem: u64, idle: u64, act_ms: u64| RoleLeaseView {
+        role_id: "super-operator".into(),
+        display_name: Some("Super Operator".into()),
+        activated_at_ms: 0,
+        last_activity_at_ms: act_ms,
+        hard_expires_at_ms: 900_000,
+        idle_expires_at_ms: act_ms + idle * 1_000,
+        hard_ttl_secs: 900,
+        idle_ttl_secs: 120,
+        renew_window_secs: 120,
+        renew_extend_secs: 900,
+        max_renewals: 1,
+        renewals_used: 0,
+        seconds_remaining: rem,
+        idle_timer: idle,
+        can_renew: true,
+    };
+    let make_auth = |rem: u64, idle: u64, act_ms: u64| {
+        let mut a = AuthState::from_session(&AuthSessionDto {
+            authenticated: true,
+            github_login: Some("LMA1980".into()),
+            invite_bound: true,
+            passkey_count: 1,
+            baseline_role: Some("operator".into()),
+            bound_roles: vec!["operator".into(), "super-operator".into()],
+            bound_role_specs: vec![super_spec.clone()],
+            active_roles: vec![super_spec.clone()],
+            leases: vec![make_lease(rem, idle, act_ms)],
+            active_policies: vec![
+                "system:dashboard.read".into(),
+                "ci:queue.read".into(),
+                "platform:users.read".into(),
+            ],
+            ..AuthSessionDto::default()
+        });
+        a.leases[0].can_renew = true;
+        if let Some(l) = a.active_roles[0].lease.as_mut() {
+            l.can_renew = true;
+        }
+        a
+    };
+
+    let init_vm = ViewModel {
+        auth: make_auth(120, 118, 0),
+        user_profile: Some(UserProfileDto {
+            github_login: "LMA1980".into(),
+            display_name: Some("LMA1980".into()),
+            preferences: UserPreferencesDto::default(),
+            bound_roles: vec!["operator".into(), "super-operator".into()],
+            passkey_count: 1,
+            passkeys: vec![],
+        }),
+        ..ViewModel::default()
+    };
+    push_vm(&mut state, init_vm);
+
+    // 1. Both Desktop and Phone HTML/Wireframe outputs emit [data-lease-timer] nodes and valid XML.
+    let desktop = Viewport::new(1512.0, 860.0);
+    let phone = Viewport::new(402.0, 720.0);
+    let html_t0 = render_console_with_skin(ConsoleSkin::Html, &state, desktop);
+    let wf_t0 = render_console_with_skin(ConsoleSkin::Wireframe, &state, desktop);
+    let wf_phone_t0 = render_console_with_skin(ConsoleSkin::Wireframe, &state, phone);
+    let shell_t0 = render_html_shell("<svg></svg>", &state);
+    roxmltree::Document::parse(&wf_t0).expect("desktop wireframe XML");
+    roxmltree::Document::parse(&wf_phone_t0).expect("phone wireframe XML");
+    roxmltree::Document::parse(&shell_t0).expect("shell XML");
+
+    assert!(shell_t0.contains(r#"data-lease-timer="hdr:super-operator""#));
+    assert!(html_t0.contains(r#"data-lease-timer="hdr:super-operator""#));
+    assert!(html_t0.contains(r#"data-lease-timer="renew-rem:super-operator""#));
+    assert!(html_t0.contains(r#"data-lease-timer="renew-idle:super-operator""#));
+    assert!(wf_t0.contains(r#"data-lease-timer="renew-rem:super-operator""#));
+    assert!(wf_t0.contains(r#"data-lease-timer="renew-idle:super-operator""#));
+
+    // When a Wireframe header badge fits the countdown inside its 340px header strip,
+    // WireframeSkin also wraps ONLY the `[MM:SS][MM:SS]` or truncated prefix in `<tspan>`.
+    let mut short_auth = make_auth(120, 118, 0);
+    short_auth.active_roles[0].display_name = Some("S".into());
+    short_auth.leases[0].display_name = Some("S".into());
+    let mut short_st = ConsoleState::new();
+    push_vm(
+        &mut short_st,
+        ViewModel {
+            auth: short_auth,
+            ..ViewModel::default()
+        },
+    );
+    let short_wf = render_console_with_skin(ConsoleSkin::Wireframe, &short_st, desktop);
+    roxmltree::Document::parse(&short_wf).expect("short wireframe XML");
+    assert!(
+        short_wf.contains(r#"data-lease-timer="hdr:super-operator""#)
+            || short_wf.contains(r#"data-lease-timer="hdr-trunc:super-operator:"#),
+        "expected Wireframe hdr <tspan> timer in {short_wf}"
+    );
+
+    // 2. Worker countdown patch returns ClientUpdate::LeaseTimers and leaves stripped scene & banner byte-identical.
+    let patch_t1 = encode(&DataEvent::Patch(vec![Delta::Auth(make_auth(119, 117, 0))])).unwrap();
+    assert_eq!(state.on_worker_frame(&patch_t1), ClientUpdate::LeaseTimers);
+
+    let html_t1 = render_console_with_skin(ConsoleSkin::Html, &state, desktop);
+    let wf_t1 = render_console_with_skin(ConsoleSkin::Wireframe, &state, desktop);
+    assert_ne!(html_t0, html_t1);
+    assert_eq!(
+        strip_lease_timer_values(&html_t0),
+        strip_lease_timer_values(&html_t1),
+        "HTML banner and scene must not structurally change on 1s timer tick"
+    );
+    assert_eq!(
+        strip_lease_timer_values(&wf_t0),
+        strip_lease_timer_values(&wf_t1),
+        "Wireframe banner and scene must not structurally change on 1s timer tick"
+    );
+    assert_eq!(
+        strip_lease_timer_values(&state.format_header_roles_html()),
+        strip_lease_timer_values(
+            r#"+Super Operator<span class="mu-lease-timer" data-lease-timer="hdr:super-operator">[02:00][01:58]</span>"#
+        )
+    );
+
+    // 3. Explicit activity touch resets idle_timer cleanly (117s -> 119s) and resolves updated [data-lease-timer] values.
+    let _ = state.on_explicit_user_activity(781_000);
+    let cur_auth = state.auth();
+    assert_eq!(
+        resolve_lease_timer_text(&cur_auth, "renew-rem:super-operator").as_deref(),
+        Some("01:59")
+    );
+    assert_eq!(
+        resolve_lease_timer_text(&cur_auth, "renew-idle:super-operator").as_deref(),
+        Some("01:59")
+    );
+
+    // 4. Open SessionRoles and UserProfile dialogs also carry [data-lease-timer] spans/tspans without structural churn.
+    let _ = state.open_session_roles();
+    let sr_html_0 = render_console_with_skin(ConsoleSkin::Html, &state, desktop);
+    let sr_wf_0 = render_console_with_skin(ConsoleSkin::Wireframe, &state, desktop);
+    roxmltree::Document::parse(&sr_wf_0).expect("SessionRoles wireframe XML");
+    assert!(sr_html_0.contains(r#"data-lease-timer="dlg-rem:super-operator""#));
+    assert!(
+        sr_wf_0.contains(r#"data-lease-timer="dlg-rem:super-operator""#)
+            || sr_wf_0.contains(r#"data-lease-timer="dlg-rem-trunc:super-operator:"#),
+        "expected SessionRoles wireframe timer <tspan> in {sr_wf_0}"
+    );
+
+    let patch_t2 = encode(&DataEvent::Patch(vec![Delta::Auth(make_auth(118, 116, 0))])).unwrap();
+    assert_eq!(state.on_worker_frame(&patch_t2), ClientUpdate::LeaseTimers);
+    let sr_html_1 = render_console_with_skin(ConsoleSkin::Html, &state, desktop);
+    let sr_wf_1 = render_console_with_skin(ConsoleSkin::Wireframe, &state, desktop);
+    assert_eq!(
+        strip_lease_timer_values(&sr_html_0),
+        strip_lease_timer_values(&sr_html_1)
+    );
+    assert_eq!(
+        strip_lease_timer_values(&sr_wf_0),
+        strip_lease_timer_values(&sr_wf_1)
+    );
+    let _ = state.dismiss_dialog();
+
+    let _ = state.open_user_profile(UserProfileTab::UserDetails);
+    let up_html_0 = render_console_with_skin(ConsoleSkin::Html, &state, desktop);
+    assert!(up_html_0.contains(r#"data-lease-timer="profile-secs:super-operator""#));
+    let patch_t3 = encode(&DataEvent::Patch(vec![Delta::Auth(make_auth(117, 115, 0))])).unwrap();
+    assert_eq!(state.on_worker_frame(&patch_t3), ClientUpdate::LeaseTimers);
+    let up_html_1 = render_console_with_skin(ConsoleSkin::Html, &state, desktop);
+    assert_eq!(
+        strip_lease_timer_values(&up_html_0),
+        strip_lease_timer_values(&up_html_1)
+    );
+    let _ = state.dismiss_dialog();
+
+    // 5. Single-click navigation works immediately while super-operator lease is active.
+    let nav_cmds = state.on_dom_action("data-area", "platform", false, 783_000);
+    assert!(!nav_cmds.is_empty());
+    assert_eq!(state.route.area, Area::Platform);
+}
