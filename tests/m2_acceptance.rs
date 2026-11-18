@@ -1534,6 +1534,8 @@ fn m2_86_needs_attention_status_labels_and_target_placement() {
             .find(|r| r.id == id)
             .unwrap_or_else(|| panic!("missing row {id}"))
     };
+    assert_eq!(find_row("att-ci-99").cells[0].text, "CI Job");
+    assert_eq!(find_row("att-ci-99").cells[2].text, "8/9 tests passed");
     assert_eq!(find_row("att-ci-99").cells[3].text, "Failed");
     assert_eq!(find_row("att-obs-PROB-LAT-99").cells[1].text, "mu-ingress");
     assert_eq!(find_row("att-obs-PROB-LAT-99").cells[3].text, "Degraded");
@@ -1777,4 +1779,131 @@ fn m2_91_timer_only_dom_patching_preserves_banner_and_navigation_under_super_ope
     let nav_cmds = state.on_dom_action("data-area", "platform", false, 783_000);
     assert!(!nav_cmds.is_empty());
     assert_eq!(state.route.area, Area::Platform);
+}
+
+#[test]
+fn m2_93_ci_job_scope_and_live_application_cards_exclude_ci_inner_step_alerts() {
+    use mu_console_protocol::{
+        ObservabilitySubView, ProblemCategory, SloProblem, SubsystemHealthEntry,
+        SubsystemHealthSummary, SubsystemStatus,
+    };
+    use mu_console_theme::scene::SceneComponent;
+    use mu_console_theme::skin::SemanticTone;
+    use mu_console_ui::scene::build_console_scene;
+
+    let mut st = active_state(
+        "ops",
+        vec![
+            "system:dashboard.read",
+            "ci:queue.read",
+            "ci:jobs.read",
+            "ci:repos.public.read",
+            "obs:problems.read",
+        ],
+    );
+    st.init_from_env("#/dashboard/overview", "", None);
+
+    let mut vm = ViewModel {
+        auth: st.auth(),
+        subsystem_health: SubsystemHealthSummary {
+            ci: SubsystemHealthEntry {
+                status: SubsystemStatus::Live,
+                summary: "Operational".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            observability: SubsystemHealthEntry {
+                status: SubsystemStatus::Live,
+                summary: "Operational".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            ..SubsystemHealthSummary::default()
+        },
+        ci_jobs: vec![CiJobSummary {
+            job_id: 202,
+            repo: RepoId::new("LMA1980", "jero-core"),
+            ref_name: "refs/heads/main".into(),
+            queue_state: "failed".into(),
+            tests_passed: 639,
+            tests_total: 639,
+            stages: vec![CiJobStage {
+                id: "regression-gate".into(),
+                name: "Regression Gate".into(),
+                assigned_node: Some("node-a".into()),
+                threads: 4,
+                state: StageState::Failed,
+                duration_secs: 2,
+                exit_code: 1,
+                skip_reason: None,
+            }],
+            ..CiJobSummary::default()
+        }],
+        ..ViewModel::default()
+    };
+    vm.observe.problems = vec![
+        SloProblem {
+            problem_id: "PROB-TEST-jero-core-miri".into(),
+            title: "Flaky / Failing Test jero-core::shm (cargo-miri)".into(),
+            category: ProblemCategory::FlakyTest,
+            severity: "warning".into(),
+            impacted_entity: "lma1980/jero-core".into(),
+            active: true,
+            ..SloProblem::default()
+        },
+        SloProblem {
+            problem_id: "PROB-BENCH-jero-core-dot".into(),
+            title: "Benchmark Regression in jero-core::dot".into(),
+            category: ProblemCategory::LatencyRegression,
+            severity: "error".into(),
+            impacted_entity: "lma1980/jero-core".into(),
+            active: true,
+            ..SloProblem::default()
+        },
+    ];
+    push_vm(&mut st, vm);
+
+    let scene = build_console_scene(&st, mu_console_theme::scene::SceneViewport::DESKTOP);
+    let app_sec = scene
+        .sections
+        .iter()
+        .find(|s| s.id == "sec-dash-applications")
+        .expect("Applications section");
+    let SceneComponent::StatusMatrix(mat) = &app_sec.components[0] else {
+        panic!("expected StatusMatrix");
+    };
+    assert_eq!(mat.cells[0].value, "Live");
+    assert_eq!(mat.cells[0].tone, SemanticTone::Pass);
+    assert_eq!(mat.cells[4].value, "Live");
+    assert_eq!(mat.cells[4].tone, SemanticTone::Pass);
+
+    let att_sec = scene
+        .sections
+        .iter()
+        .find(|s| s.id == "sec-dash-attention")
+        .expect("Needs Attention section");
+    let SceneComponent::TableGrid(grid) = &att_sec.components[0] else {
+        panic!("expected dash-attention-table");
+    };
+    assert_eq!(grid.rows.len(), 1);
+    assert_eq!(grid.rows[0].id, "att-ci-202");
+    assert_eq!(grid.rows[0].cells[0].text, "CI Job");
+    assert_eq!(
+        grid.rows[0].cells[2].text,
+        "Stage 'regression-gate' failed (exit 1)"
+    );
+    assert_eq!(grid.rows[0].cells[3].text, "Failed");
+
+    let (html_out, wf_out) = render_both_skins(&st);
+    assert!(html_out.contains("CI Job"));
+    assert!(wf_out.contains("CI Job"));
+    assert!(!html_out.contains("PROB-TEST-"));
+    assert!(!wf_out.contains("PROB-TEST-"));
+    assert!(!html_out.contains("Flaky / Failing Test"));
+    assert!(!wf_out.contains("Flaky / Failing Test"));
+
+    st.select_subview(SubView::Observability(ObservabilitySubView::ProblemsSlos));
+    let (obs_html, obs_wf) = render_both_skins(&st);
+    assert!(obs_html.contains("Zero open SLO alerts"));
+    assert!(!obs_wf.contains("PROB-TEST-"));
+    assert!(!obs_wf.contains("Flaky / Failing Test"));
+    assert!(!obs_wf.contains("Benchmark Regression"));
 }
