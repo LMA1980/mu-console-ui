@@ -5,7 +5,7 @@
 //! registration & `Timed` role elevation ceremonies, and synchronize browser
 //! storage and hash routes across both [`HtmlCoreSkin`] and [`WireframeSkin`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use js_sys::{Array, ArrayBuffer, Date, Function, Object, Promise, Reflect, Uint8Array, JSON};
@@ -19,8 +19,11 @@ use web_sys::{
 };
 
 use crate::client::{reload_banner_text, ClientUpdate, DataClient, WORKER_URL};
-use crate::components::{filter_placeholder, render_console, render_html_shell};
+use crate::components::{
+    filter_placeholder, render_console, render_html_shell, strip_lease_timer_values,
+};
 use crate::copy;
+use crate::roles::resolve_lease_timer_text;
 use crate::router::{format_hash, has_explicit_route};
 use crate::state::{
     extract_invite_token, font_slug, is_action_root_boundary, is_passive_container_control_id,
@@ -36,11 +39,38 @@ use crate::webauthn::{
 thread_local! {
     static WORKER: RefCell<Option<Worker>> = const { RefCell::new(None) };
     static LAST_RENDER: RefCell<String> = const { RefCell::new(String::new()) };
+    static LAST_HEADER_ROLES_KEY: RefCell<String> = const { RefCell::new(String::new()) };
     static LAST_SHELL_AUTH: RefCell<Option<(AuthStatus, bool, bool)>> = const { RefCell::new(None) };
+    static POINTER_DOWN_AT_MS: RefCell<Option<u64>> = const { RefCell::new(None) };
+    static DEFERRED_REPAINT: Cell<bool> = const { Cell::new(false) };
 }
 
 fn now_ms() -> u64 {
     Date::now() as u64
+}
+
+fn is_pointer_press_active() -> bool {
+    POINTER_DOWN_AT_MS.with(|slot| {
+        let Some(down_at) = *slot.borrow() else {
+            return false;
+        };
+        if now_ms().saturating_sub(down_at) < 500 {
+            true
+        } else {
+            *slot.borrow_mut() = None;
+            false
+        }
+    })
+}
+
+fn query_selector_all(doc: &web_sys::Document, selector: &str) -> Option<Array> {
+    let qsa_fn = Reflect::get(doc.as_ref(), &JsValue::from_str("querySelectorAll"))
+        .ok()
+        .and_then(|v| v.dyn_into::<Function>().ok())?;
+    let node_list = qsa_fn
+        .call1(doc.as_ref(), &JsValue::from_str(selector))
+        .ok()?;
+    Some(Array::from(&node_list))
 }
 
 /// Post a command as a transferred `ArrayBuffer`.
@@ -193,6 +223,44 @@ fn restore_focus(doc: &web_sys::Document, saved: Option<(String, Option<u32>)>) 
     }
 }
 
+fn repaint_lease_timers(st: &ConsoleState) {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let auth = st.auth();
+    if let Some(nodes) = query_selector_all(&doc, "[data-lease-timer]") {
+        for idx in 0..nodes.length() {
+            let Ok(el) = nodes.get(idx).dyn_into::<Element>() else {
+                continue;
+            };
+            let Some(key) = el.get_attribute("data-lease-timer") else {
+                continue;
+            };
+            if let Some(next_text) = resolve_lease_timer_text(&auth, &key) {
+                if el.text_content().as_deref() != Some(next_text.as_str()) {
+                    el.set_text_content(Some(&next_text));
+                }
+            }
+        }
+    }
+    let roles_plain = st.format_header_roles();
+    if let Some(roles_btn) = doc.get_element_by_id("muconsole-roles-btn") {
+        if roles_btn.get_attribute("aria-label").as_deref() != Some(roles_plain.as_str()) {
+            let _ = roles_btn.set_attribute("aria-label", &roles_plain);
+        }
+    }
+    if let Some(nodes) = query_selector_all(&doc, "[data-action='hdr-role'][aria-label]") {
+        for idx in 0..nodes.length() {
+            let Ok(el) = nodes.get(idx).dyn_into::<Element>() else {
+                continue;
+            };
+            if el.get_attribute("aria-label").as_deref() != Some(roles_plain.as_str()) {
+                let _ = el.set_attribute("aria-label", &roles_plain);
+            }
+        }
+    }
+}
+
 fn repaint(st: &ConsoleState) {
     let Some(win) = web_sys::window() else {
         return;
@@ -210,6 +278,7 @@ fn repaint(st: &ConsoleState) {
 
     let vp = window_viewport(&win);
     let rendered = render_console(st, vp, SafeArea::ZERO);
+    let rendered_key = strip_lease_timer_values(&rendered);
     let shell_key = (
         auth.status,
         auth.passkey_enrollment_required,
@@ -231,10 +300,10 @@ fn repaint(st: &ConsoleState) {
     if let (Some(dash), false) = (dash, shell_auth_changed) {
         let content_changed = LAST_RENDER.with(|last| {
             let mut prev = last.borrow_mut();
-            if *prev == rendered {
+            if *prev == rendered_key {
                 false
             } else {
-                prev.clone_from(&rendered);
+                prev.clone_from(&rendered_key);
                 true
             }
         });
@@ -269,7 +338,24 @@ fn repaint(st: &ConsoleState) {
                 font_btn.set_text_content(Some(&crate::components::font_toggle_label(st.font)));
             }
             if let Some(roles_btn) = doc.get_element_by_id("muconsole-roles-btn") {
-                roles_btn.set_text_content(Some(&st.format_header_roles()));
+                let roles_html = st.format_header_roles_html();
+                let roles_key = strip_lease_timer_values(&roles_html);
+                let roles_struct_changed = LAST_HEADER_ROLES_KEY.with(|prev| {
+                    let mut slot = prev.borrow_mut();
+                    if *slot == roles_key {
+                        false
+                    } else {
+                        *slot = roles_key;
+                        true
+                    }
+                });
+                if roles_struct_changed {
+                    roles_btn.set_inner_html(&roles_html);
+                }
+                let roles_plain = st.format_header_roles();
+                if roles_btn.get_attribute("aria-label").as_deref() != Some(roles_plain.as_str()) {
+                    let _ = roles_btn.set_attribute("aria-label", &roles_plain);
+                }
             }
             if let Some(auth_link) = doc.get_element_by_id("muconsole-auth-link") {
                 let (href, label) = match auth.status {
@@ -290,6 +376,7 @@ fn repaint(st: &ConsoleState) {
                 auth_link.set_text_content(Some(label));
             }
         }
+        repaint_lease_timers(st);
         if st.lazy_dyslexic_loaded {
             ensure_dyslexic_stylesheet(&doc);
         }
@@ -309,7 +396,9 @@ fn repaint(st: &ConsoleState) {
             }
         }
     } else if let Some(body) = doc.body() {
-        LAST_RENDER.with(|last| *last.borrow_mut() = rendered.clone());
+        LAST_RENDER.with(|last| *last.borrow_mut() = rendered_key);
+        let roles_key = strip_lease_timer_values(&st.format_header_roles_html());
+        LAST_HEADER_ROLES_KEY.with(|last| *last.borrow_mut() = roles_key);
         let html = render_html_shell(&rendered, st);
         body.set_inner_html(&html);
         if st.lazy_dyslexic_loaded {
@@ -976,12 +1065,8 @@ fn spawn_webauthn(state: Rc<RefCell<ConsoleState>>, worker: Worker, req: WebAuth
 }
 
 fn trap_dialog_tab(doc: &web_sys::Document, ev: &KeyboardEvent) -> bool {
-    let Ok(qsa_fn) = Reflect::get(doc.as_ref(), &JsValue::from_str("querySelectorAll"))
-        .and_then(|v| v.dyn_into::<Function>())
-    else {
-        return false;
-    };
-    let selector = JsValue::from_str(
+    let Some(list) = query_selector_all(
+        doc,
         "#muconsole-dashboard dialog[open] button:not([disabled]), \
          #muconsole-dashboard dialog[open] input:not([disabled]), \
          #muconsole-dashboard dialog[open] a[href], \
@@ -994,11 +1079,9 @@ fn trap_dialog_tab(doc: &web_sys::Document, ev: &KeyboardEvent) -> bool {
          #muconsole-dashboard [role='dialog'] select:not([disabled]), \
          #muconsole-dashboard [role='dialog'] textarea:not([disabled]), \
          #muconsole-dashboard [role='dialog'] [tabindex]:not([tabindex='-1'])",
-    );
-    let Ok(node_list) = qsa_fn.call1(doc.as_ref(), &selector) else {
+    ) else {
         return false;
     };
-    let list = Array::from(&node_list);
     let len = list.length();
     if len == 0 {
         return false;
@@ -1179,13 +1262,24 @@ pub fn start() {
                     send(&worker_for_msg, &UiCommand::SelectSubView(st.route.subview));
                 }
                 sync_browser_state(&mut st);
-                repaint(&st);
+                if is_pointer_press_active() {
+                    DEFERRED_REPAINT.with(|d| d.set(true));
+                } else {
+                    repaint(&st);
+                }
+            }
+            ClientUpdate::LeaseTimers => {
+                repaint_lease_timers(&st);
             }
             ClientUpdate::Ready(_)
             | ClientUpdate::Connection(_)
             | ClientUpdate::Badges(_)
             | ClientUpdate::Error(_) => {
-                repaint(&st);
+                if is_pointer_press_active() {
+                    DEFERRED_REPAINT.with(|d| d.set(true));
+                } else {
+                    repaint(&st);
+                }
             }
             ClientUpdate::Heartbeat => {}
         }
@@ -1236,16 +1330,17 @@ pub fn start() {
 
     // Document DOM interactions.
     if let Some(doc) = window.document() {
-        // Explicit user pointer activity resets Timed idle_timer (passive hover does not).
+        // Explicit user pointer activity resets Timed idle_timer without full-DOM replacement.
         {
             let state_for_ptr = Rc::clone(&state);
             let worker_for_ptr = worker.clone();
             let on_pointer = Closure::<dyn FnMut(Event)>::new(move |_ev: Event| {
+                POINTER_DOWN_AT_MS.with(|slot| *slot.borrow_mut() = Some(now_ms()));
                 let mut st = state_for_ptr.borrow_mut();
                 let cmds = st.on_explicit_user_activity(now_ms());
                 if !cmds.is_empty() {
                     send_all(&worker_for_ptr, &cmds);
-                    repaint(&st);
+                    repaint_lease_timers(&st);
                 }
             });
             let _ = doc.add_event_listener_with_callback(
@@ -1255,15 +1350,50 @@ pub fn start() {
             on_pointer.forget();
         }
 
+        // Flush any background worker repaint deferred during pointerdown -> pointerup.
+        {
+            let state_for_up = Rc::clone(&state);
+            let on_pointer_end = Closure::<dyn FnMut(Event)>::new(move |_ev: Event| {
+                POINTER_DOWN_AT_MS.with(|slot| *slot.borrow_mut() = None);
+                if DEFERRED_REPAINT.with(|d| d.get()) {
+                    let state_for_flush = Rc::clone(&state_for_up);
+                    let flush = Closure::once(move || {
+                        if DEFERRED_REPAINT.with(|d| d.replace(false)) {
+                            let st = state_for_flush.borrow();
+                            repaint(&st);
+                        }
+                    });
+                    if let Some(win) = web_sys::window() {
+                        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                            flush.as_ref().unchecked_ref(),
+                            0,
+                        );
+                    }
+                    flush.forget();
+                }
+            });
+            let _ = doc.add_event_listener_with_callback(
+                "pointerup",
+                on_pointer_end.as_ref().unchecked_ref(),
+            );
+            let _ = doc.add_event_listener_with_callback(
+                "pointercancel",
+                on_pointer_end.as_ref().unchecked_ref(),
+            );
+            on_pointer_end.forget();
+        }
+
         // Click delegation.
         {
             let state_for_click = Rc::clone(&state);
             let worker_for_click = worker.clone();
             let on_click = Closure::<dyn FnMut(MouseEvent)>::new(move |ev: MouseEvent| {
+                POINTER_DOWN_AT_MS.with(|slot| *slot.borrow_mut() = None);
                 let Some(target) = ev.target().and_then(|t| t.dyn_into::<Element>().ok()) else {
                     return;
                 };
                 if let Some((attr, val)) = find_action_attribute(&target) {
+                    DEFERRED_REPAINT.with(|d| d.set(false));
                     let maybe_webauthn = {
                         let mut st = state_for_click.borrow_mut();
                         let now = now_ms();
@@ -1279,6 +1409,9 @@ pub fn start() {
                     if let Some(req) = maybe_webauthn {
                         spawn_webauthn(Rc::clone(&state_for_click), worker_for_click.clone(), req);
                     }
+                } else if DEFERRED_REPAINT.with(|d| d.replace(false)) {
+                    let st = state_for_click.borrow();
+                    repaint(&st);
                 }
             });
             let _ =
@@ -1499,36 +1632,6 @@ pub fn start() {
             50,
         );
         on_rotary_tick.forget();
-    }
-
-    // 1-second local countdown timer for `+role[seconds_remaining][idle_timer]` and 00:00 expiry.
-    {
-        let state_for_lease = Rc::clone(&state);
-        let worker_for_lease = worker.clone();
-        let on_lease_tick = Closure::<dyn FnMut()>::new(move || {
-            let mut st = state_for_lease.borrow_mut();
-            let has_leases = !st.auth().leases.is_empty();
-            let cmds = st.tick(now_ms());
-            if !cmds.is_empty() || has_leases {
-                if !cmds.is_empty() {
-                    send_all(&worker_for_lease, &cmds);
-                }
-                if st.route_sync_dirty {
-                    send(&worker_for_lease, &UiCommand::Subscribe(st.route.clone()));
-                    send(
-                        &worker_for_lease,
-                        &UiCommand::SelectSubView(st.route.subview),
-                    );
-                }
-                sync_browser_state(&mut st);
-                repaint(&st);
-            }
-        });
-        let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
-            on_lease_tick.as_ref().unchecked_ref(),
-            1_000,
-        );
-        on_lease_tick.forget();
     }
 
     WORKER.with(|slot| *slot.borrow_mut() = Some(worker));
