@@ -1241,7 +1241,6 @@ pub fn start() {
             send(&worker, &UiCommand::RedeemInvite { token });
         }
         send(&worker, &UiCommand::Subscribe(st.route.clone()));
-        send(&worker, &UiCommand::SelectSubView(st.route.subview));
     }
 
     let state_for_msg = Rc::clone(&state);
@@ -1266,7 +1265,6 @@ pub fn start() {
                 }
                 if st.route_sync_dirty {
                     send(&worker_for_msg, &UiCommand::Subscribe(st.route.clone()));
-                    send(&worker_for_msg, &UiCommand::SelectSubView(st.route.subview));
                 }
                 sync_browser_state(&mut st);
                 if is_pointer_press_active() {
@@ -1321,11 +1319,7 @@ pub fn start() {
             let mut st = state_for_hash.borrow_mut();
             if format_hash(&st.route) != hash {
                 st.apply_hash(&hash);
-                let cmds = vec![
-                    UiCommand::Subscribe(st.route.clone()),
-                    UiCommand::SelectSubView(st.route.subview),
-                ];
-                send_all(&worker_for_hash, &cmds);
+                send(&worker_for_hash, &UiCommand::Subscribe(st.route.clone()));
                 sync_browser_state(&mut st);
                 repaint(&st);
             }
@@ -1474,7 +1468,8 @@ pub fn start() {
 
                 if target_is_input && key != "Escape" {
                     if key == "Enter" && target_id == "muconsole-filter" {
-                        let st = state_for_key.borrow();
+                        let mut st = state_for_key.borrow_mut();
+                        st.pending_filter_at_ms = None;
                         send(&worker_for_key, &UiCommand::Subscribe(st.route.clone()));
                     }
                     return;
@@ -1619,13 +1614,13 @@ pub fn start() {
         }
     }
 
-    // Periodic 50ms rotary debounce settle timer.
+    // Periodic 50ms rotary & filter debounce settle timer.
     {
         let state_for_rotary = Rc::clone(&state);
         let worker_for_rotary = worker.clone();
         let on_rotary_tick = Closure::<dyn FnMut()>::new(move || {
             let mut st = state_for_rotary.borrow_mut();
-            if st.pending_select_at_ms.is_some() {
+            if st.pending_select_at_ms.is_some() || st.pending_filter_at_ms.is_some() {
                 let cmds = st.tick(now_ms());
                 if !cmds.is_empty() {
                     send_all(&worker_for_rotary, &cmds);

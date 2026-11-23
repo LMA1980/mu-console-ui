@@ -14,10 +14,11 @@ use crate::state::{service_filter_matches, ConsoleState, AREAS};
 use mu_console_protocol::{
     AbDeploySubView, Area, AuthState, AuthStatus, CanaryBundleState, CdRunState, CdSubView,
     CiJobSummary, CiSubView, CrtFont, DashboardSubView, DialogModel as ProtoDialogModel,
-    GateOutcome, ModelRunnerSubView, ObservabilitySubView, PackageEcosystem, PlatformSubView,
-    ProblemCategory, RepoStatus, RepositorySubView, RiskConfirmAction, RoleActivationKind,
-    RoleLeaseView, SloProblem, Slot, SmartscapeLayer, StageState, StepUpRequirement, SubView,
-    SubsystemHealthEntry, SubsystemId, SubsystemStatus, TestState, UiError, Visibility,
+    GateOutcome, LogSeverity, ModelRunnerSubView, ObservabilitySubView, OtelLogEntry,
+    PackageEcosystem, PlatformSubView, ProblemCategory, RepoStatus, RepositorySubView,
+    RiskConfirmAction, RoleActivationKind, RoleLeaseView, SloProblem, Slot, SmartscapeLayer,
+    StageState, StepUpRequirement, SubView, SubsystemHealthEntry, SubsystemId, SubsystemStatus,
+    TestState, UiError, Visibility,
 };
 use mu_console_theme::scene::{
     self as theme_scene, ActionControl, ConsoleScene, GateChecklist, GateItem,
@@ -3388,7 +3389,7 @@ fn build_repo_cas_kv(state: &ConsoleState) -> KeyValueList {
 }
 
 fn matches_obs_service(selected: Option<&str>, candidate: &str) -> bool {
-    selected.is_none_or(|svc| candidate.eq_ignore_ascii_case(svc))
+    selected.is_none_or(|svc| service_filter_matches(svc, candidate))
 }
 
 fn build_obs_service_bar(state: &ConsoleState, services: &[String]) -> PlatformPanel {
@@ -3462,6 +3463,15 @@ fn build_observe_sections(
     subview: ObservabilitySubView,
     scene: &mut ConsoleScene,
 ) {
+    let services = state.observed_services();
+    let is_service_scoped = !matches!(subview, ObservabilitySubView::DataStore);
+    if is_service_scoped && !services.is_empty() {
+        scene.sections.push(
+            SceneSection::new("sec-obs-service-filter", "Service Filter").with_component(
+                SceneComponent::PlatformPanel(build_obs_service_bar(state, &services)),
+            ),
+        );
+    }
     let mut sec = SceneSection::new(
         "sec-observe",
         format!(
@@ -3469,13 +3479,6 @@ fn build_observe_sections(
             SubView::Observability(subview).label()
         ),
     );
-    let services = state.observed_services();
-    let is_service_scoped = !matches!(subview, ObservabilitySubView::DataStore);
-    if is_service_scoped && !services.is_empty() {
-        sec = sec.with_component(SceneComponent::PlatformPanel(build_obs_service_bar(
-            state, &services,
-        )));
-    }
     sec = match subview {
         ObservabilitySubView::Metrics => build_obs_metrics_components(state, sec),
         ObservabilitySubView::Logs => {
@@ -3548,40 +3551,51 @@ fn build_obs_metrics_components(state: &ConsoleState, mut sec: SceneSection) -> 
     sec
 }
 
+fn build_observe_log_entries(state: &ConsoleState, logs: &[OtelLogEntry]) -> Vec<LogEntry> {
+    logs.iter()
+        .filter(|l| {
+            state
+                .log_severity_filter
+                .is_none_or(|sev| l.severity == sev)
+        })
+        .filter(|l| matches_obs_service(state.obs_service_filter.as_deref(), &l.service))
+        .filter(|l| {
+            if state.filter_query.trim().is_empty() {
+                return true;
+            }
+            let sev = match l.severity {
+                LogSeverity::Info => "info",
+                LogSeverity::Warn => "warn",
+                LogSeverity::Error => "error",
+            };
+            let hay = format!("{} {} {} {}", l.service, sev, l.trace_id, l.message);
+            service_filter_matches(&state.filter_query, &hay)
+        })
+        .enumerate()
+        .map(|(i, l)| {
+            let level = match l.severity {
+                LogSeverity::Error => SemanticTone::Fail,
+                LogSeverity::Warn => SemanticTone::Warn,
+                LogSeverity::Info => SemanticTone::Info,
+            };
+            LogEntry {
+                line_no: u32::try_from(i + 1).ok(),
+                timestamp: Some(l.timestamp_ms.to_string()),
+                level,
+                signal: None,
+                text: format!("[{}] {}", l.service, l.message),
+                trace_id: Some(l.trace_id.clone()),
+                action: None,
+            }
+        })
+        .collect()
+}
+
 fn build_obs_logs_viewer(state: &ConsoleState) -> LogViewer {
-    let selected_svc = state.obs_service_filter.as_deref();
-    let entries: Vec<LogEntry> = state
+    let entries = state
         .client
         .view()
-        .map(|v| {
-            v.observe
-                .logs
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| {
-                    if !matches_obs_service(selected_svc, &l.service) {
-                        return false;
-                    }
-                    let hay = format!(
-                        "{} {} {} {}",
-                        l.severity.label(),
-                        l.service,
-                        l.trace_id,
-                        l.message
-                    );
-                    service_filter_matches(&state.filter_query, &hay)
-                })
-                .map(|(i, l)| LogEntry {
-                    line_no: u32::try_from(i + 1).ok(),
-                    timestamp: Some(l.timestamp_ms.to_string()),
-                    level: SemanticTone::Info,
-                    signal: None,
-                    text: format!("[{}] {}", l.service, l.message),
-                    trace_id: Some(l.trace_id.clone()),
-                    action: None,
-                })
-                .collect()
-        })
+        .map(|v| build_observe_log_entries(state, &v.observe.logs))
         .unwrap_or_default();
     LogViewer {
         id: "obs-logs-viewer".into(),
@@ -3606,10 +3620,10 @@ fn build_obs_purepath_table(state: &ConsoleState) -> TableGrid {
                 .iter()
                 .filter(|t| {
                     let svc_ok = selected_svc.is_none_or(|svc| {
-                        t.root_service.eq_ignore_ascii_case(svc)
+                        service_filter_matches(svc, &t.root_service)
                             || t.spans
                                 .iter()
-                                .any(|sp| sp.service.eq_ignore_ascii_case(svc))
+                                .any(|sp| service_filter_matches(svc, &sp.service))
                     });
                     if !svc_ok {
                         return false;
@@ -3698,11 +3712,11 @@ fn build_obs_problems_table(state: &ConsoleState) -> TableGrid {
                 .filter(|p| p.active && !is_suppressed_obs_problem(p))
                 .filter(|p| {
                     let svc_ok = selected_svc.is_none_or(|svc| {
-                        p.impacted_entity.eq_ignore_ascii_case(svc)
-                            || p.root_cause_service.eq_ignore_ascii_case(svc)
+                        service_filter_matches(svc, &p.impacted_entity)
+                            || service_filter_matches(svc, &p.root_cause_service)
                             || p.affected_services
                                 .iter()
-                                .any(|s| s.eq_ignore_ascii_case(svc))
+                                .any(|s| service_filter_matches(svc, s))
                     });
                     if !svc_ok {
                         return false;
@@ -5698,7 +5712,16 @@ mod tests {
         st.select_subview(SubView::Observability(ObservabilitySubView::Smartscape));
         st.activate_target("obs-smartscape-filter:hosts");
         let sc_hosts = build_console_scene(&st, SceneViewport::DESKTOP);
-        let SceneComponent::TableGrid(ss_hosts) = &sc_hosts.sections[0].components[2] else {
+        assert!(sc_hosts
+            .sections
+            .iter()
+            .any(|s| s.id == "sec-obs-service-filter"));
+        let hosts_sec = sc_hosts
+            .sections
+            .iter()
+            .find(|s| s.id == "sec-observe")
+            .expect("sec-observe");
+        let SceneComponent::TableGrid(ss_hosts) = &hosts_sec.components[1] else {
             panic!("expected smartscape table");
         };
         assert_eq!(ss_hosts.rows.len(), 1);
@@ -5708,7 +5731,12 @@ mod tests {
         st.activate_target("obs-service-next");
         st.select_subview(SubView::Observability(ObservabilitySubView::Ingress));
         let sc_ing = build_console_scene(&st, SceneViewport::DESKTOP);
-        let SceneComponent::TableGrid(ing_tbl) = &sc_ing.sections[0].components[2] else {
+        let ing_sec = sc_ing
+            .sections
+            .iter()
+            .find(|s| s.id == "sec-observe")
+            .expect("sec-observe");
+        let SceneComponent::TableGrid(ing_tbl) = &ing_sec.components[1] else {
             panic!("expected obs-ingress-table");
         };
         assert_eq!(ing_tbl.rows.len(), 1);
@@ -5750,5 +5778,114 @@ mod tests {
             panic!("expected dash-subsystem-cards");
         };
         assert!(mat.cells.is_empty());
+    }
+
+    #[test]
+    fn observability_logs_scene_filters_by_query_service_severity_and_maps_tone() {
+        let mut st = ConsoleState::new();
+        st.init_from_env("#/observability/logs", "", None);
+
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec!["system:dashboard.read".into(), "obs:logs.read".into()],
+                ..AuthState::default()
+            },
+            observe: mu_console_protocol::ObserveView {
+                logs: vec![
+                    OtelLogEntry {
+                        timestamp_ms: 1_001,
+                        severity: LogSeverity::Info,
+                        service: "muregist".into(),
+                        trace_id: "tr-reg-1".into(),
+                        span_id: None,
+                        message: "CAS upload ready".into(),
+                    },
+                    OtelLogEntry {
+                        timestamp_ms: 1_002,
+                        severity: LogSeverity::Error,
+                        service: "mu-registry".into(),
+                        trace_id: "tr-reg-2".into(),
+                        span_id: None,
+                        message: "HTTP 500 error".into(),
+                    },
+                    OtelLogEntry {
+                        timestamp_ms: 1_003,
+                        severity: LogSeverity::Warn,
+                        service: "mu-ci-controller".into(),
+                        trace_id: "tr-ci-1".into(),
+                        span_id: None,
+                        message: "queue backpressure".into(),
+                    },
+                    OtelLogEntry {
+                        timestamp_ms: 1_004,
+                        severity: LogSeverity::Info,
+                        service: "mu-console".into(),
+                        trace_id: "tr-web-1".into(),
+                        span_id: None,
+                        message: "HTTP 200 ok".into(),
+                    },
+                ],
+                ..mu_console_protocol::ObserveView::default()
+            },
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(vm)).expect("encode"));
+
+        let get_entries = |state: &ConsoleState| -> Vec<LogEntry> {
+            let scene = build_console_scene(state, SceneViewport::DESKTOP);
+            let sec = scene
+                .sections
+                .iter()
+                .find(|s| s.id == "sec-observe")
+                .expect("sec-observe");
+            let SceneComponent::LogViewer(viewer) = &sec.components[0] else {
+                panic!("expected LogViewer");
+            };
+            viewer.entries.clone()
+        };
+
+        // Unfiltered: all 4 rows with mapped severity tones.
+        let all = get_entries(&st);
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0].level, SemanticTone::Info);
+        assert_eq!(all[1].level, SemanticTone::Fail);
+        assert_eq!(all[2].level, SemanticTone::Warn);
+        assert_eq!(all[3].level, SemanticTone::Info);
+
+        // Canonical alias filtering matches both `muregist` and `mu-registry`.
+        st.set_filter_query("muregist", 1_000);
+        let reg = get_entries(&st);
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg[0].text, "[muregist] CAS upload ready");
+        assert_eq!(reg[1].text, "[mu-registry] HTTP 500 error");
+        assert_eq!(reg[0].line_no, Some(1));
+        assert_eq!(reg[1].line_no, Some(2));
+
+        // Multi-term alias + message/severity query narrows further.
+        st.set_filter_query("muregist error", 1_100);
+        let reg_err = get_entries(&st);
+        assert_eq!(reg_err.len(), 1);
+        assert_eq!(reg_err[0].text, "[mu-registry] HTTP 500 error");
+        assert_eq!(reg_err[0].level, SemanticTone::Fail);
+
+        // Trace ID matching works in filter_query.
+        st.set_filter_query("tr-ci-1", 1_200);
+        let by_trace = get_entries(&st);
+        assert_eq!(by_trace.len(), 1);
+        assert_eq!(by_trace[0].text, "[mu-ci-controller] queue backpressure");
+
+        // log_severity_filter and obs_service_filter also filter rendered entries.
+        st.set_filter_query("", 1_300);
+        st.log_severity_filter = Some(LogSeverity::Warn);
+        let warn_only = get_entries(&st);
+        assert_eq!(warn_only.len(), 1);
+        assert_eq!(warn_only[0].text, "[mu-ci-controller] queue backpressure");
+
+        st.log_severity_filter = None;
+        st.obs_service_filter = Some("muregist".into());
+        let svc_only = get_entries(&st);
+        assert_eq!(svc_only.len(), 2);
     }
 }
