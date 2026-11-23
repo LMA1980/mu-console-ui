@@ -2043,6 +2043,59 @@ fn m2_95_active_failing_test_surfaces_across_skins_and_clears_immediately_when_f
     assert!(!dash_wf_2.contains("#301"));
 }
 
+#[test]
+fn observability_hides_repo_selector_in_html_and_wireframe_skins() {
+    use mu_console_protocol::{ObservabilitySubView, RepoScore};
+
+    let mut st = active_state(
+        "ops",
+        vec![
+            "ci:queue.read",
+            "ci:repos.public.read",
+            "obs:smartscape.read",
+            "obs:traces.read",
+            "obs:problems.read",
+            "obs:logs.read",
+            "obs:metrics.read",
+            "obs:store.read",
+            "obs:ingress.read",
+        ],
+    );
+    let mut vm = st.client.view().cloned().expect("view");
+    vm.repos = vec![RepoScore::new(RepoId::new("LMA1980", "mu-registry"))];
+    push_vm(&mut st, vm);
+
+    st.select_subview(SubView::Ci(CiSubView::Scorecards));
+    let (ci_html, ci_wf) = render_both_skins(&st);
+    assert!(ci_html.contains("c2-repo-selector"));
+    assert!(ci_html.contains("mu-repo-selector"));
+    assert!(ci_html.contains("Prev Repo"));
+    assert!(ci_html.contains("Prev Submodule"));
+    assert!(ci_wf.contains("c2-repo-selector"));
+
+    for subview in ObservabilitySubView::ALL {
+        st.select_subview(SubView::Observability(subview));
+        let (obs_html, obs_wf) = render_both_skins(&st);
+        for token in [
+            "c2-repo-selector",
+            "mu-repo-selector",
+            "Prev Repo",
+            "Next Repo",
+            "Prev Submodule",
+            "Next Submodule",
+        ] {
+            assert!(
+                !obs_html.contains(token),
+                "HtmlCoreSkin rendered {token} in Observability {subview:?}"
+            );
+            assert!(
+                !obs_wf.contains(token),
+                "WireframeSkin rendered {token} in Observability {subview:?}"
+            );
+        }
+    }
+}
+
 fn full_area_access_policies() -> Vec<&'static str> {
     vec![
         "system:dashboard.read",
