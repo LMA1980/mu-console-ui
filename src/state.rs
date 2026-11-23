@@ -625,6 +625,42 @@ impl ConsoleState {
         can_access_subview(&self.auth(), subview)
     }
 
+    /// Return `true` when `#muconsole-filter` applies to the currently visible view.
+    #[must_use]
+    pub fn is_filter_applicable(&self) -> bool {
+        let auth = self.auth();
+        auth.is_resolved()
+            && !auth.anonymous_lockdown
+            && can_access_subview(&auth, self.route.subview)
+    }
+
+    /// Context-sensitive `#muconsole-filter` placeholder for the current auth state and sub-view.
+    #[must_use]
+    pub fn filter_placeholder_text(&self) -> &'static str {
+        copy::filter_placeholder_for_view(
+            &self.auth(),
+            self.route.subview,
+            self.is_filter_applicable(),
+        )
+    }
+
+    /// Return `true` when any caller-bound role ID is absent from `active_roles`.
+    #[must_use]
+    pub fn has_dormant_bound_roles(&self) -> bool {
+        let auth = self.auth();
+        let is_dormant = |role_id: &str| {
+            !auth
+                .active_roles
+                .iter()
+                .any(|active| active.role_id == role_id)
+        };
+        auth.bound_roles.iter().any(|id| is_dormant(id))
+            || auth
+                .bound_role_specs
+                .iter()
+                .any(|spec| is_dormant(&spec.id))
+    }
+
     /// Format active header role pill string bounded safely on UTF-8 char boundaries.
     #[must_use]
     pub fn format_header_roles(&self) -> String {
@@ -1032,7 +1068,10 @@ impl ConsoleState {
             .iter()
             .filter(|r| allow_private || r.visibility == Visibility::Public)
             .filter(|r| {
-                let hay = format!("{}/{}", r.id.owner, r.id.repo);
+                let hay = format!(
+                    "{}/{} {} {:?}",
+                    r.id.owner, r.id.repo, r.default_branch, r.status
+                );
                 service_filter_matches(&self.filter_query, &hay)
             })
             .cloned()
@@ -1090,6 +1129,8 @@ impl ConsoleState {
         }
         let allow_private =
             auth.status == AuthStatus::Active && auth.has_policy("ci:repos.private.read");
+        let can_view_logs = auth.status == AuthStatus::Active
+            && (auth.has_policy("ci:jobs.logs.read") || auth.has_policy("obs:logs.read"));
         let Some(view) = self.client.view() else {
             return Vec::new();
         };
@@ -1113,10 +1154,20 @@ impl ConsoleState {
             })
             .filter(|job| {
                 let hay = format!(
-                    "{}/{} {} {} {}",
-                    job.repo.owner, job.repo.repo, job.ref_name, job.job_id_str, job.queue_state
+                    "{}/{} #{} {} {} {}",
+                    job.repo.owner,
+                    job.repo.repo,
+                    job.job_id,
+                    job.ref_name,
+                    job.job_id_str,
+                    job.queue_state
                 );
                 service_filter_matches(&self.filter_query, &hay)
+                    || (can_view_logs
+                        && job
+                            .raw_log_lines
+                            .iter()
+                            .any(|line| service_filter_matches(&self.filter_query, line)))
             })
             .cloned()
             .collect()
@@ -1801,11 +1852,15 @@ impl ConsoleState {
                 self.aria_polite = format!("Navigating to {href}");
                 vec![UiCommand::Navigate { href }]
             }
-            "dlg-passkey-signout" | "profile-signout" | "session-error-signout" => {
+            "dlg-passkey-signout"
+            | "profile-signout"
+            | "session-error-signout"
+            | "auth-gate-signout" => {
                 let href = self.sign_out_href();
                 self.pending_navigation = Some(href.clone());
                 vec![UiCommand::Navigate { href }]
             }
+            "auth-gate-dashboard" => vec![self.select_area(Area::Dashboard)],
             "session-probe-retry" => {
                 self.client.clear_last_error();
                 self.aria_polite = copy::LOADING_SESSION_TITLE.into();
@@ -1920,6 +1975,16 @@ impl ConsoleState {
                 self.subview_page = 0;
                 Vec::new()
             }
+            "ci-queue-filter:all" => {
+                self.ci_queue_filter = 0;
+                self.subview_page = 0;
+                Vec::new()
+            }
+            "ci-queue-filter:running" => {
+                self.ci_queue_filter = 1;
+                self.subview_page = 0;
+                Vec::new()
+            }
             "ci-queue-filter:failed" => {
                 self.ci_queue_filter = 2;
                 self.subview_page = 0;
@@ -1961,8 +2026,28 @@ impl ConsoleState {
                 self.obs_smartscape_filter = 3;
                 Vec::new()
             }
-            "obs-smartscape-filter" => {
+            "obs-smartscape-filter:processes" => {
+                self.obs_smartscape_filter = 2;
+                Vec::new()
+            }
+            "obs-smartscape-filter:services" => {
+                self.obs_smartscape_filter = 1;
+                Vec::new()
+            }
+            "obs-smartscape-filter:all" | "obs-smartscape-filter" => {
                 self.obs_smartscape_filter = 0;
+                Vec::new()
+            }
+            "obs-service-prev" => {
+                self.rotate_obs_service(-1);
+                Vec::new()
+            }
+            "obs-service-next" => {
+                self.rotate_obs_service(1);
+                Vec::new()
+            }
+            "obs-service-clear" => {
+                self.obs_service_filter = None;
                 Vec::new()
             }
             "platform-maint-apply" => self.open_platform_risk_confirm(
@@ -2222,7 +2307,9 @@ impl ConsoleState {
         }
         match key {
             "/" if !shift => {
-                self.filter_focused = true;
+                if self.is_filter_applicable() {
+                    self.filter_focused = true;
+                }
                 None
             }
             "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" => {
@@ -2662,5 +2749,273 @@ mod tests {
             st.active_dialog(),
             Some(DialogModel::SessionRoles(_))
         ));
+    }
+
+    #[test]
+    fn filter_applicability_placeholders_dormant_roles_and_subview_controls() {
+        use mu_console_protocol::dto::RoleSpecDto;
+        use mu_console_protocol::{
+            DashboardSubView, ObservabilitySubView, ObserveView, PlatformSubView, RoleBadgeView,
+            SmartscapeLayer, SmartscapeNode,
+        };
+
+        // Unresolved session disables filter with resolving placeholder.
+        let mut st = ConsoleState::new();
+        assert!(!st.is_filter_applicable());
+        assert_eq!(st.filter_placeholder_text(), "Resolving session...");
+        assert_eq!(st.on_key("/", false, 10), None);
+        assert!(!st.filter_focused);
+
+        // Anonymous on accessible QueueLogs vs inaccessible Platform.
+        let anon_vm = ViewModel {
+            auth: AuthState::anonymous(vec![
+                "system:dashboard.read".into(),
+                "ci:queue.read".into(),
+                "ci:repos.public.read".into(),
+            ]),
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(anon_vm)).expect("encode"));
+        assert_eq!(st.route.subview, SubView::Ci(CiSubView::QueueLogs));
+        assert!(st.is_filter_applicable());
+        assert_eq!(
+            st.filter_placeholder_text(),
+            "Filter public repos, branches, or jobs..."
+        );
+
+        st.apply_hash("#/dashboard/overview");
+        assert!(st.is_filter_applicable());
+        assert_eq!(st.filter_placeholder_text(), "Filter applications...");
+
+        st.apply_hash("#/platform/users");
+        assert!(!st.is_filter_applicable());
+        assert_eq!(st.filter_placeholder_text(), "Sign in to filter...");
+
+        // PasskeyEnrollmentRequired: public QueueLogs applicable, protected Scorecards disabled.
+        let passkey_vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::PasskeyEnrollmentRequired,
+                github_login: Some("newop".into()),
+                passkey_count: 0,
+                passkey_enrollment_required: true,
+                ..AuthState::default()
+            },
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(passkey_vm)).expect("encode"));
+        st.apply_hash("#/ci/logs");
+        assert!(st.is_filter_applicable());
+        assert_eq!(
+            st.filter_placeholder_text(),
+            "Filter public repos, branches, or jobs..."
+        );
+        st.apply_hash("#/ci/scorecards");
+        assert!(!st.is_filter_applicable());
+        assert_eq!(st.filter_placeholder_text(), "Enroll passkey to unlock...");
+
+        // Active with dormant bound role, expanded repo filter, and new filter target controls.
+        let mut repo_pass = RepoScore::new(RepoId::new("LMA1980", "mu-console"));
+        repo_pass.default_branch = "feat/cool-branch".into();
+        repo_pass.status = RepoStatus::Passing;
+        let mut repo_fail = RepoScore::new(RepoId::new("LMA1980", "k3-core"));
+        repo_fail.default_branch = "main".into();
+        repo_fail.status = RepoStatus::Failing;
+
+        let active_vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                passkey_count: 1,
+                bound_roles: vec!["operator".into(), "sec-ops".into()],
+                bound_role_specs: vec![RoleSpecDto {
+                    id: "super-operator".into(),
+                    ..RoleSpecDto::default()
+                }],
+                active_roles: vec![RoleBadgeView {
+                    role_id: "operator".into(),
+                    ..RoleBadgeView::default()
+                }],
+                active_policies: vec![
+                    "system:dashboard.read".into(),
+                    "ci:queue.read".into(),
+                    "ci:nodes.read".into(),
+                    "obs:smartscape.read".into(),
+                ],
+                ..AuthState::default()
+            },
+            repos: vec![repo_pass, repo_fail],
+            observe: ObserveView {
+                smartscape_nodes: vec![
+                    SmartscapeNode {
+                        id: "svc-b".into(),
+                        label: "beta-svc".into(),
+                        layer: SmartscapeLayer::Service,
+                        req_per_sec_bp: 100,
+                        error_rate_bp: 0,
+                        p95_ms: 10,
+                        healthy: true,
+                    },
+                    SmartscapeNode {
+                        id: "svc-a".into(),
+                        label: "alpha-svc".into(),
+                        layer: SmartscapeLayer::Service,
+                        req_per_sec_bp: 100,
+                        error_rate_bp: 0,
+                        p95_ms: 10,
+                        healthy: true,
+                    },
+                ],
+                ..ObserveView::default()
+            },
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(active_vm)).expect("encode"));
+        assert!(st.has_dormant_bound_roles());
+
+        st.apply_hash("#/dashboard/overview");
+        assert_eq!(
+            st.filter_placeholder_text(),
+            "Filter applications, nodes, or alerts..."
+        );
+
+        st.apply_hash("#/ci/logs");
+        assert_eq!(
+            st.filter_placeholder_text(),
+            "Filter repos, branches, or jobs..."
+        );
+
+        st.apply_hash("#/platform/maintenance");
+        assert!(!st.is_filter_applicable());
+        assert_eq!(
+            st.filter_placeholder_text(),
+            "Access restricted for active roles"
+        );
+        assert_eq!(
+            st.route.subview,
+            SubView::Platform(PlatformSubView::Maintenance)
+        );
+
+        // auth-gate-dashboard & auth-gate-signout actions.
+        assert_eq!(
+            st.activate_target("auth-gate-dashboard"),
+            vec![UiCommand::SelectSubView(SubView::Dashboard(
+                DashboardSubView::Overview
+            ))]
+        );
+        assert_eq!(
+            st.activate_target("auth-gate-signout"),
+            vec![UiCommand::Navigate {
+                href: "/oauth2/sign_out?rd=%2F".into()
+            }]
+        );
+
+        // filtered_repos matches branch and status.
+        st.set_filter_query("feat/cool-branch", 50);
+        let by_branch = st.filtered_repos();
+        assert_eq!(by_branch.len(), 1);
+        assert_eq!(by_branch[0].id.repo, "mu-console");
+        st.set_filter_query("Failing", 60);
+        let by_status = st.filtered_repos();
+        assert_eq!(by_status.len(), 1);
+        assert_eq!(by_status[0].id.repo, "k3-core");
+        st.set_filter_query("", 70);
+
+        // CI queue & Observability filter target controls.
+        st.subview_page = 3;
+        assert!(st.activate_target("ci-queue-filter:running").is_empty());
+        assert_eq!(st.ci_queue_filter, 1);
+        assert_eq!(st.subview_page, 0);
+        assert!(st.activate_target("ci-queue-filter:all").is_empty());
+        assert_eq!(st.ci_queue_filter, 0);
+        assert!(st.activate_target("ci-queue-filter:failed").is_empty());
+        assert_eq!(st.ci_queue_filter, 2);
+
+        st.apply_hash("#/observe/smartscape");
+        assert_eq!(
+            st.filter_placeholder_text(),
+            "Filter services, hosts, processes, or layers..."
+        );
+        assert!(st
+            .activate_target("obs-smartscape-filter:services")
+            .is_empty());
+        assert_eq!(st.obs_smartscape_filter, 1);
+        assert!(st
+            .activate_target("obs-smartscape-filter:processes")
+            .is_empty());
+        assert_eq!(st.obs_smartscape_filter, 2);
+        assert!(st.activate_target("obs-smartscape-filter:hosts").is_empty());
+        assert_eq!(st.obs_smartscape_filter, 3);
+        assert!(st.activate_target("obs-smartscape-filter:all").is_empty());
+        assert_eq!(st.obs_smartscape_filter, 0);
+
+        assert!(st.activate_target("obs-service-next").is_empty());
+        assert_eq!(st.obs_service_filter.as_deref(), Some("alpha-svc"));
+        assert!(st.activate_target("obs-service-prev").is_empty());
+        assert_eq!(st.obs_service_filter, None);
+        assert!(st.activate_target("obs-service-prev").is_empty());
+        assert_eq!(st.obs_service_filter.as_deref(), Some("beta-svc"));
+        assert!(st.activate_target("obs-service-clear").is_empty());
+        assert_eq!(st.obs_service_filter, None);
+
+        let _ = ObservabilitySubView::ALL;
+    }
+
+    #[test]
+    fn visible_ci_jobs_gates_raw_log_search_on_log_read_policy() {
+        let mut job = CiJobSummary {
+            job_id_str: "job-77".into(),
+            job_id: 77,
+            repo: RepoId::new("LMA1980", "mu-console"),
+            ref_name: "main".into(),
+            commit_sha: "abc1234".into(),
+            queue_state: "running".into(),
+            elapsed_secs: 10,
+            wait_secs: 0,
+            quality_score: 99,
+            coverage_bp: 9000,
+            tests_passed: 10,
+            tests_total: 10,
+            benchmark_summary: String::new(),
+            stages: vec![],
+            raw_log_lines: vec!["compiling crate\n".into(), "LOG_NEEDLE failed\n".into()],
+        };
+        job.raw_log_lines.push("finished".into());
+
+        let mut st = ConsoleState::new();
+        let vm_without_logs = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                passkey_count: 1,
+                active_policies: vec!["ci:queue.read".into(), "ci:repos.public.read".into()],
+                ..AuthState::default()
+            },
+            ci_jobs: vec![job.clone()],
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(vm_without_logs)).expect("encode"));
+        st.set_filter_query("LOG_NEEDLE", 10);
+        assert!(st.visible_ci_jobs().is_empty());
+        st.set_filter_query("#77", 20);
+        assert_eq!(st.visible_ci_jobs().len(), 1);
+
+        let vm_with_logs = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                passkey_count: 1,
+                active_policies: vec![
+                    "ci:queue.read".into(),
+                    "ci:repos.public.read".into(),
+                    "ci:jobs.logs.read".into(),
+                ],
+                ..AuthState::default()
+            },
+            ci_jobs: vec![job],
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(vm_with_logs)).expect("encode"));
+        st.set_filter_query("LOG_NEEDLE", 30);
+        assert_eq!(st.visible_ci_jobs().len(), 1);
     }
 }

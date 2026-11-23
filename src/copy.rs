@@ -7,7 +7,9 @@
 //! never mention invitations or disclose internal account binding rules.
 
 use mu_console_protocol::{
-    Area, AuthReasonCode, CdEcosystem, ProblemCategory, SkipReason, SloProblem, SubsystemStatus,
+    AbDeploySubView, Area, AuthReasonCode, AuthState, AuthStatus, CdEcosystem, CdSubView,
+    CiSubView, DashboardSubView, ModelRunnerSubView, ObservabilitySubView, PlatformSubView,
+    ProblemCategory, RepositorySubView, SkipReason, SloProblem, SubView, SubsystemStatus,
 };
 
 /// Root document language attribute (`<html lang="en">`).
@@ -45,6 +47,25 @@ pub const AUTH_DENIED_LOCKDOWN_BODY: &str =
 pub const AUTH_REQUIRED_TITLE: &str = "Authentication required";
 pub const AUTH_REQUIRED_BODY: &str =
     "An active session with the required role is needed to view this area.";
+pub const AUTH_REQUIRED_ANON_BODY: &str = "Sign in with an authorized account to view this area.";
+
+/// Passkey-required access gate copy for signed-in users without an enrolled passkey.
+pub const PASSKEY_ACCESS_REQUIRED_TITLE: &str = "Passkey enrollment required";
+pub const PASSKEY_ACCESS_REQUIRED_BODY: &str =
+    "Your account is signed in, but a passkey must be enrolled before operator roles and this area unlock.";
+pub const PASSKEY_CI_STEPS_SUBTITLE: &str =
+    "Public repositories only. Enroll a passkey to unlock operator roles, logs, and node topology.";
+
+/// Restricted access copy for signed-in active sessions lacking required role policies.
+pub const ACCESS_RESTRICTED_TITLE: &str = "Access restricted";
+pub const ACCESS_RESTRICTED_ELEVATE_BODY: &str =
+    "Your active session roles do not grant access to this area. Enable or unlock an assigned role in Session Roles.";
+pub const ACCESS_RESTRICTED_NO_ROLE_BODY: &str =
+    "Your signed-in account does not hold the required permissions for this area.";
+pub const ACTIVE_CI_LOGS_RESTRICTED_NOTE: &str =
+    "Build output requires ci:jobs.logs.read. Enable or unlock a role in Session Roles.";
+pub const DASH_ROLE_HINT_NOTE: &str =
+    "Operational alerts and fleet status require active role policies. Open Session Roles to enable assigned roles.";
 
 /// Generic header notice for uninvited / unauthorized GitHub logins (zero invite disclosure).
 pub const AUTH_DENIED_STATUS: &str = "Authorization denied";
@@ -122,6 +143,105 @@ pub const fn filter_placeholder_for_area(area: Area) -> &'static str {
         Area::Observability => "Filter traces, services, problems, or logs...",
         Area::ModelRunner => "Filter models or VPN peers...",
         Area::Platform => "Filter users, invites, roles, or folios...",
+    }
+}
+
+fn dashboard_filter_placeholder(auth: &AuthState) -> &'static str {
+    let has_ci_or_obs = auth.can_access_area(Area::Ci) || auth.can_access_area(Area::Observability);
+    if auth.status == AuthStatus::Active && has_ci_or_obs {
+        if auth.has_policy("ci:nodes.read") {
+            "Filter applications, nodes, or alerts..."
+        } else {
+            "Filter applications or alerts..."
+        }
+    } else {
+        "Filter applications..."
+    }
+}
+
+/// Area-, subview-, and access-aware placeholder text for `#muconsole-filter`.
+#[must_use]
+pub fn filter_placeholder_for_view(
+    auth: &AuthState,
+    subview: SubView,
+    filter_enabled: bool,
+) -> &'static str {
+    if !filter_enabled {
+        return match auth.status {
+            AuthStatus::Unresolved => "Resolving session...",
+            AuthStatus::Anonymous => "Sign in to filter...",
+            AuthStatus::AuthorizationDenied => "Access denied",
+            AuthStatus::PasskeyEnrollmentRequired => "Enroll passkey to unlock...",
+            AuthStatus::Active => "Access restricted for active roles",
+        };
+    }
+
+    match subview {
+        SubView::Dashboard(DashboardSubView::Overview) => dashboard_filter_placeholder(auth),
+        SubView::Ci(CiSubView::QueueLogs) => {
+            if !matches!(auth.status, AuthStatus::Active) {
+                "Filter public repos, branches, or jobs..."
+            } else if auth.has_policy("ci:jobs.logs.read") || auth.has_policy("obs:logs.read") {
+                "Filter jobs, repos, branches, or logs..."
+            } else {
+                "Filter repos, branches, or jobs..."
+            }
+        }
+        SubView::Ci(CiSubView::Scorecards) => "Filter repos, branches, or status...",
+        SubView::Ci(CiSubView::Trainway) => "Filter branches, nodes, or stages...",
+        SubView::Ci(CiSubView::WorkerNodes) => "Filter worker nodes or architectures...",
+        SubView::Ci(CiSubView::SandboxProfiles) => "Filter sandbox profiles or backends...",
+        SubView::Cd(CdSubView::Runs) => "Filter release runs, repos, or ecosystems...",
+        SubView::Cd(CdSubView::Pipelines) => "Filter CD runs, steps, or states...",
+        SubView::AbDeploy(AbDeploySubView::IntegrationGate) => {
+            "Filter gate tests, status, or logs..."
+        }
+        SubView::AbDeploy(AbDeploySubView::DeploymentsSlots) => {
+            "Filter slots, target nodes, or digests..."
+        }
+        SubView::AbDeploy(AbDeploySubView::GateTestLogs) => "Filter gate test log lines...",
+        SubView::AbDeploy(AbDeploySubView::ActiveLeases) => "Filter services, slots, or leases...",
+        SubView::Repository(RepositorySubView::Packages) => {
+            "Filter packages, ecosystems, digests, or status..."
+        }
+        SubView::Repository(RepositorySubView::CanaryTaints) => {
+            "Filter canary bundles, services, or states..."
+        }
+        SubView::Repository(RepositorySubView::CasHealth) => "Filter CAS health metrics...",
+        SubView::Observability(ObservabilitySubView::Smartscape) => {
+            "Filter services, hosts, processes, or layers..."
+        }
+        SubView::Observability(ObservabilitySubView::PurePath) => {
+            "Filter trace IDs or root services..."
+        }
+        SubView::Observability(ObservabilitySubView::ProblemsSlos) => {
+            "Filter problems, entities, or severities..."
+        }
+        SubView::Observability(ObservabilitySubView::Logs) => {
+            "Filter log messages, services, or trace IDs..."
+        }
+        SubView::Observability(ObservabilitySubView::Metrics) => {
+            "Filter services, hardware classes, or traces..."
+        }
+        SubView::Observability(ObservabilitySubView::DataStore) => "Filter store health metrics...",
+        SubView::Observability(ObservabilitySubView::Ingress) => {
+            "Filter ingress routes, paths, or services..."
+        }
+        SubView::ModelRunner(ModelRunnerSubView::RuntimeQueue) => {
+            "Filter models or compute clusters..."
+        }
+        SubView::ModelRunner(ModelRunnerSubView::ConnectionVpn) => {
+            "Filter VPN peers or allowed IPs..."
+        }
+        SubView::Platform(PlatformSubView::Maintenance) => {
+            "Filter subsystems or maintenance state..."
+        }
+        SubView::Platform(PlatformSubView::UsersAndInvites) => {
+            "Filter user handles or bound roles..."
+        }
+        SubView::Platform(PlatformSubView::RolesAndFolios) => {
+            "Filter roles, lease modes, or folios..."
+        }
     }
 }
 
@@ -217,4 +337,142 @@ pub fn attention_obs_status_label(prob: &SloProblem) -> &'static str {
 #[must_use]
 pub fn announce_disabled_area(area: Area) -> String {
     format!("{} is disabled for active roles.", area.label())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_placeholder_for_view_covers_disabled_dashboard_and_all_27_subviews() {
+        let unresolved = AuthState::unresolved();
+        assert_eq!(
+            filter_placeholder_for_view(
+                &unresolved,
+                SubView::Dashboard(DashboardSubView::Overview),
+                false
+            ),
+            "Resolving session..."
+        );
+
+        let anon = AuthState::anonymous(vec![
+            "system:dashboard.read".into(),
+            "ci:queue.read".into(),
+            "ci:repos.public.read".into(),
+        ]);
+        assert_eq!(
+            filter_placeholder_for_view(
+                &anon,
+                SubView::Platform(PlatformSubView::Maintenance),
+                false
+            ),
+            "Sign in to filter..."
+        );
+        assert_eq!(
+            filter_placeholder_for_view(
+                &anon,
+                SubView::Dashboard(DashboardSubView::Overview),
+                true
+            ),
+            "Filter applications..."
+        );
+        assert_eq!(
+            filter_placeholder_for_view(&anon, SubView::Ci(CiSubView::QueueLogs), true),
+            "Filter public repos, branches, or jobs..."
+        );
+
+        let denied = AuthState {
+            status: AuthStatus::AuthorizationDenied,
+            ..AuthState::default()
+        };
+        assert_eq!(
+            filter_placeholder_for_view(
+                &denied,
+                SubView::Platform(PlatformSubView::Maintenance),
+                false
+            ),
+            "Access denied"
+        );
+
+        let passkey_req = AuthState {
+            status: AuthStatus::PasskeyEnrollmentRequired,
+            ..AuthState::default()
+        };
+        assert_eq!(
+            filter_placeholder_for_view(&passkey_req, SubView::Ci(CiSubView::Scorecards), false),
+            "Enroll passkey to unlock..."
+        );
+
+        let active_dash_only = AuthState {
+            status: AuthStatus::Active,
+            passkey_count: 1,
+            active_policies: vec!["system:dashboard.read".into()],
+            ..AuthState::default()
+        };
+        assert_eq!(
+            filter_placeholder_for_view(
+                &active_dash_only,
+                SubView::Platform(PlatformSubView::UsersAndInvites),
+                false
+            ),
+            "Access restricted for active roles"
+        );
+        assert_eq!(
+            filter_placeholder_for_view(
+                &active_dash_only,
+                SubView::Dashboard(DashboardSubView::Overview),
+                true
+            ),
+            "Filter applications..."
+        );
+
+        let active_obs = AuthState {
+            status: AuthStatus::Active,
+            passkey_count: 1,
+            active_policies: vec!["system:dashboard.read".into(), "obs:problems.read".into()],
+            ..AuthState::default()
+        };
+        assert_eq!(
+            filter_placeholder_for_view(
+                &active_obs,
+                SubView::Dashboard(DashboardSubView::Overview),
+                true
+            ),
+            "Filter applications or alerts..."
+        );
+
+        let active_full = AuthState {
+            status: AuthStatus::Active,
+            passkey_count: 1,
+            active_policies: vec![
+                "system:dashboard.read".into(),
+                "ci:queue.read".into(),
+                "ci:nodes.read".into(),
+                "ci:jobs.logs.read".into(),
+            ],
+            ..AuthState::default()
+        };
+        assert_eq!(
+            filter_placeholder_for_view(
+                &active_full,
+                SubView::Dashboard(DashboardSubView::Overview),
+                true
+            ),
+            "Filter applications, nodes, or alerts..."
+        );
+        assert_eq!(
+            filter_placeholder_for_view(&active_full, SubView::Ci(CiSubView::QueueLogs), true),
+            "Filter jobs, repos, branches, or logs..."
+        );
+
+        for area in Area::ALL {
+            for &sv in SubView::all_for(area) {
+                let text = filter_placeholder_for_view(&active_full, sv, true);
+                assert!(
+                    text.starts_with("Filter "),
+                    "unexpected text for {sv:?}: {text}"
+                );
+            }
+        }
+    }
 }
