@@ -1018,6 +1018,50 @@ fn u19_observability_sandbox_profiles_and_logs_follow_tail() {
 }
 
 #[test]
+fn u19b_observability_logs_live_filter_and_service_aliases() {
+    let mut st = state_for_scenario(
+        Scenario::StageFailure,
+        SubView::Observability(ObservabilitySubView::Logs),
+        CrtFont::Hurmit,
+    );
+    let mut vm = st.client.view().expect("view").clone();
+    vm.observe.logs = vec![
+        mu_console_protocol::OtelLogEntry {
+            timestamp_ms: 1_760_000_000_001,
+            severity: mu_console_protocol::LogSeverity::Info,
+            service: "muregist".into(),
+            trace_id: "tr-alias-1".into(),
+            span_id: None,
+            message: "cas blob committed".into(),
+        },
+        mu_console_protocol::OtelLogEntry {
+            timestamp_ms: 1_760_000_000_002,
+            severity: mu_console_protocol::LogSeverity::Error,
+            service: "mu-registry".into(),
+            trace_id: "tr-alias-2".into(),
+            span_id: None,
+            message: "HTTP 500 error".into(),
+        },
+        mu_console_protocol::OtelLogEntry {
+            timestamp_ms: 1_760_000_000_003,
+            severity: mu_console_protocol::LogSeverity::Warn,
+            service: "mu-ci-controller".into(),
+            trace_id: "tr-alias-3".into(),
+            span_id: None,
+            message: "worker lease retry".into(),
+        },
+    ];
+    let snap = Engine::encode_event(&DataEvent::Snapshot(vm)).expect("encode");
+    st.on_worker_frame(&snap);
+
+    st.set_filter_query("muregist", 1_000);
+    let html = render_console(&st, Viewport::new(1440.0, 900.0), SafeArea::ZERO);
+    assert!(html.contains("cas blob committed"));
+    assert!(html.contains("HTTP 500 error"));
+    assert!(!html.contains("worker lease retry"));
+}
+
+#[test]
 fn u20_dom_action_boundary_and_repo_selection_resets_stale_job() {
     assert!(!ACTION_ATTRS.is_empty());
     assert!(!is_action_root_boundary("muconsole-shell"));

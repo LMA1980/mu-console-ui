@@ -37,6 +37,8 @@ pub const PENDING_INVITE_STORAGE_KEY: &str = "muconsole.pending_invite";
 pub const PENDING_HASH_STORAGE_KEY: &str = "muconsole.pending_hash";
 /// Repo selector settle debounce delay in milliseconds.
 pub const ROTARY_SETTLE_MS: u64 = 350;
+/// Filter query settle debounce delay in milliseconds.
+pub const FILTER_SETTLE_MS: u64 = 250;
 
 /// Canonical 8 console areas rendered in top navigation.
 pub const AREAS: [Area; 8] = Area::ALL;
@@ -126,16 +128,72 @@ impl Default for PlatformFormState {
     }
 }
 
-/// Case-insensitive multi-term substring match used by `#muconsole-filter`.
+const fn subview_uses_server_filter(subview: SubView) -> bool {
+    matches!(
+        subview,
+        SubView::Observability(mu_console_protocol::ObservabilitySubView::Logs)
+            | SubView::Ci(CiSubView::QueueLogs)
+    )
+}
+
+fn canonical_service_group(compact: &str) -> Option<&'static str> {
+    match compact {
+        "muregist" | "muregistry" | "muregistdaemon" | "muregistrydaemon" => Some("mu-registry"),
+        "muobserve" | "muobservecollector" | "muobservehub" | "muobservable"
+        | "muobservablehub" | "muobservablecli" | "muobservablemcp" => Some("mu-observable"),
+        "actionrunnercontroller" | "mucicontroller" => Some("mu-ci-controller"),
+        "actionrunnerrs" | "actionrunnerworker" | "muciworker" | "actionrunner" => {
+            Some("mu-ci-worker")
+        }
+        "actionrunnerweb" | "muconsole" => Some("mu-console"),
+        "mucondecontroller" | "mucdcontroller" => Some("mu-cd-controller"),
+        "mucondeagent" | "mucdagent" => Some("mu-cd-agent"),
+        "muisolation" => Some("mu-isolation"),
+        _ => None,
+    }
+}
+
+fn compact_alnum(s: &str) -> String {
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Case-insensitive multi-term substring match with canonical service alias and
+/// hyphen/underscore normalization used by `#muconsole-filter`.
 #[must_use]
 pub fn service_filter_matches(filter: &str, candidate: &str) -> bool {
     let q = filter.trim();
     if q.is_empty() {
         return true;
     }
-    let hay = candidate.to_ascii_lowercase();
-    q.split_whitespace()
-        .all(|tok| hay.contains(&tok.to_ascii_lowercase()))
+    let hay_lower = candidate.to_ascii_lowercase();
+    let candidate_tokens: Vec<(String, Option<&'static str>)> = candidate
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let word_compact = compact_alnum(part);
+            let group = canonical_service_group(&word_compact);
+            (word_compact, group)
+        })
+        .filter(|(word_compact, _)| !word_compact.is_empty())
+        .collect();
+
+    q.split_whitespace().all(|tok| {
+        let tok_lower = tok.to_ascii_lowercase();
+        if hay_lower.contains(&tok_lower) {
+            return true;
+        }
+        let tok_compact = compact_alnum(tok);
+        if tok_compact.is_empty() {
+            return false;
+        }
+        let tok_group = canonical_service_group(&tok_compact);
+        candidate_tokens.iter().any(|(word_compact, word_group)| {
+            *word_compact == tok_compact || (tok_group.is_some() && tok_group == *word_group)
+        })
+    })
 }
 
 /// Match full ref name (`refs/heads/foo`) against bare branch names (`foo`).
@@ -1235,6 +1293,14 @@ impl ConsoleState {
         };
     }
 
+    fn subview_nav_command(&self, subview: SubView) -> UiCommand {
+        if self.route.filter.is_some() && subview_uses_server_filter(subview) {
+            UiCommand::Subscribe(self.route.clone())
+        } else {
+            UiCommand::SelectSubView(subview)
+        }
+    }
+
     /// Update `#muconsole-filter` query string cleanly.
     pub fn set_filter_query(&mut self, query: &str, now_ms: u64) {
         self.filter_query = query.to_owned();
@@ -1245,7 +1311,7 @@ impl ConsoleState {
         };
         self.carousel_page = 0;
         self.subview_page = 0;
-        self.pending_filter_at_ms = Some(now_ms);
+        self.pending_filter_at_ms = Some(now_ms.saturating_add(FILTER_SETTLE_MS));
     }
 
     /// Switch to an area only if active session holds minimal access (`disabled` rule).
@@ -1270,7 +1336,7 @@ impl ConsoleState {
         self.route_sync_dirty = true;
         self.subview_page = 0;
         self.aria_polite = copy::announce_route(area, sub.label());
-        UiCommand::SelectSubView(sub)
+        self.subview_nav_command(sub)
     }
 
     /// Switch directly to `subview` only when permitted for the active session.
@@ -1285,7 +1351,7 @@ impl ConsoleState {
         self.route_sync_dirty = true;
         self.subview_page = 0;
         self.aria_polite = copy::announce_route(subview.area(), subview.label());
-        vec![UiCommand::SelectSubView(subview)]
+        vec![self.subview_nav_command(subview)]
     }
 
     /// Cross-navigate to a PurePath trace when Observability read is permitted.
@@ -2205,10 +2271,17 @@ impl ConsoleState {
                 return self.dismiss_dialog().into_iter().next();
             }
             if self.filter_focused || !self.filter_query.is_empty() {
+                let had_filter =
+                    !self.filter_query.trim().is_empty() || self.route.filter.is_some();
                 self.filter_focused = false;
                 self.filter_query.clear();
                 self.route.filter = None;
-                return None;
+                self.pending_filter_at_ms = None;
+                return if had_filter && subview_uses_server_filter(self.route.subview) {
+                    Some(UiCommand::Subscribe(self.route.clone()))
+                } else {
+                    None
+                };
             }
             let next = escape_up(&self.route);
             if self.can_access_subview(next.subview) {
@@ -2263,6 +2336,15 @@ impl ConsoleState {
                         repo,
                         submodule: self.route.submodule.clone(),
                     });
+                }
+            }
+        }
+
+        if let Some(due) = self.pending_filter_at_ms {
+            if now_ms >= due {
+                self.pending_filter_at_ms = None;
+                if subview_uses_server_filter(self.route.subview) {
+                    cmds.push(UiCommand::Subscribe(self.route.clone()));
                 }
             }
         }
@@ -2662,5 +2744,174 @@ mod tests {
             st.active_dialog(),
             Some(DialogModel::SessionRoles(_))
         ));
+    }
+
+    #[test]
+    fn service_filter_matches_normalizes_service_aliases_and_separators() {
+        // Canonical service alias normalization across hyphenated and compact forms.
+        assert!(service_filter_matches("muregist", "mu-registry"));
+        assert!(service_filter_matches("mu-registry", "muregist"));
+        assert!(service_filter_matches("muregist-daemon", "mu-registry"));
+        assert!(service_filter_matches("muregist", "svc:muregist"));
+        assert!(service_filter_matches("mu_registry", "mu-registry"));
+        assert!(service_filter_matches(
+            "muregist error",
+            "[mu-registry] HTTP 500 error"
+        ));
+        assert!(!service_filter_matches(
+            "muregist",
+            "[mu-console] HTTP 500 error"
+        ));
+        assert!(!service_filter_matches(
+            "muregist error",
+            "[mu-registry] HTTP 200 ok"
+        ));
+
+        // Additional canonical platform service aliases.
+        assert!(service_filter_matches("mu-ci-worker", "actionrunner"));
+        assert!(service_filter_matches(
+            "mu-observable",
+            "muobserve-collector"
+        ));
+        assert!(!service_filter_matches(
+            "mu-ci-worker",
+            "actionrunner-controller"
+        ));
+
+        // Preserves existing multi-term case-insensitive substring matching.
+        assert!(service_filter_matches(
+            "runner controller",
+            "actionrunner-controller"
+        ));
+        assert!(service_filter_matches("", "anything"));
+        assert!(service_filter_matches("   ", "anything"));
+        assert!(!service_filter_matches("---", "muregist"));
+    }
+
+    #[test]
+    fn filter_debounce_escape_and_subview_selection_commands() {
+        use mu_console_protocol::dto::AuthSessionDto;
+        use mu_console_protocol::ObservabilitySubView;
+
+        let mut st = ConsoleState::new();
+        let vm = ViewModel {
+            auth: AuthState::from_session(&AuthSessionDto {
+                authenticated: true,
+                github_login: Some("ops".into()),
+                invite_bound: true,
+                passkey_count: 1,
+                active_policies: vec![
+                    "system:dashboard.read".into(),
+                    "obs:logs.read".into(),
+                    "obs:metrics.read".into(),
+                    "ci:queue.read".into(),
+                ],
+                ..AuthSessionDto::default()
+            }),
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(vm)).expect("encode"));
+
+        // Empty filter -> SelectSubView.
+        assert_eq!(
+            st.select_subview(SubView::Observability(ObservabilitySubView::Logs)),
+            vec![UiCommand::SelectSubView(SubView::Observability(
+                ObservabilitySubView::Logs
+            ))]
+        );
+
+        // Typing schedules debounced Subscribe at now + FILTER_SETTLE_MS.
+        st.set_filter_query("muregist", 1_000);
+        assert_eq!(st.pending_filter_at_ms, Some(1_000 + FILTER_SETTLE_MS));
+        assert_eq!(st.route.filter.as_deref(), Some("muregist"));
+        assert!(st.tick(1_000 + FILTER_SETTLE_MS - 1).is_empty());
+
+        let settled = st.tick(1_000 + FILTER_SETTLE_MS);
+        assert_eq!(st.pending_filter_at_ms, None);
+        assert_eq!(settled.len(), 1);
+        match &settled[0] {
+            UiCommand::Subscribe(route) => {
+                assert_eq!(
+                    route.subview,
+                    SubView::Observability(ObservabilitySubView::Logs)
+                );
+                assert_eq!(route.filter.as_deref(), Some("muregist"));
+            }
+            other => panic!("expected Subscribe, got {other:?}"),
+        }
+
+        // Rapid typing resets debounce deadline.
+        st.set_filter_query("mu", 2_000);
+        st.set_filter_query("muregist", 2_100);
+        assert!(st.tick(2_000 + FILTER_SETTLE_MS).is_empty());
+        assert_eq!(st.tick(2_100 + FILTER_SETTLE_MS).len(), 1);
+
+        // Navigating to Logs or QueueLogs while filter is non-empty uses Subscribe.
+        let cmds = st.select_subview(SubView::Observability(ObservabilitySubView::Logs));
+        assert!(matches!(
+            cmds.as_slice(),
+            [UiCommand::Subscribe(r)] if r.filter.as_deref() == Some("muregist")
+        ));
+        let ci_cmds = st.select_subview(SubView::Ci(CiSubView::QueueLogs));
+        assert!(matches!(
+            ci_cmds.as_slice(),
+            [UiCommand::Subscribe(r)] if r.filter.as_deref() == Some("muregist")
+        ));
+
+        // Navigating to a server-filtered area fallback (Logs) preserves filter via Subscribe,
+        // while a non-server-filtered area/subview emits SelectSubView.
+        assert!(matches!(
+            st.select_area(Area::Observability),
+            UiCommand::Subscribe(ref r)
+                if r.subview == SubView::Observability(ObservabilitySubView::Logs)
+                    && r.filter.as_deref() == Some("muregist")
+        ));
+        assert_eq!(
+            st.select_area(Area::Dashboard),
+            UiCommand::SelectSubView(SubView::Dashboard(
+                mu_console_protocol::DashboardSubView::Overview
+            ))
+        );
+        assert_eq!(
+            st.select_subview(SubView::Observability(ObservabilitySubView::Metrics)),
+            vec![UiCommand::SelectSubView(SubView::Observability(
+                ObservabilitySubView::Metrics
+            ))]
+        );
+        let _ = st.select_subview(SubView::Observability(ObservabilitySubView::Logs));
+
+        // Escape clears filter_query & pending_filter_at_ms and emits Subscribe with filter: None.
+        st.set_filter_query("muregist", 3_000);
+        let esc_cmd = st.on_key("Escape", false, 3_050);
+        assert!(st.filter_query.is_empty());
+        assert_eq!(st.route.filter, None);
+        assert_eq!(st.pending_filter_at_ms, None);
+        match esc_cmd {
+            Some(UiCommand::Subscribe(route)) => {
+                assert_eq!(route.filter, None);
+                assert_eq!(
+                    route.subview,
+                    SubView::Observability(ObservabilitySubView::Logs)
+                );
+            }
+            other => panic!("expected Some(Subscribe), got {other:?}"),
+        }
+
+        // Clearing filter via set_filter_query("") settles to Subscribe with filter: None.
+        st.set_filter_query("muregist", 4_000);
+        let _ = st.tick(4_000 + FILTER_SETTLE_MS);
+        st.set_filter_query("", 5_000);
+        let cleared = st.tick(5_000 + FILTER_SETTLE_MS);
+        assert!(matches!(
+            cleared.as_slice(),
+            [UiCommand::Subscribe(r)] if r.filter.is_none()
+        ));
+
+        // Escape on non-server-filtered subview clears filter and returns None.
+        let _ = st.select_subview(SubView::Ci(CiSubView::Trainway));
+        st.set_filter_query("foo", 6_000);
+        assert_eq!(st.on_key("Escape", false, 6_050), None);
+        assert!(st.filter_query.is_empty());
+        assert_eq!(st.pending_filter_at_ms, None);
     }
 }
