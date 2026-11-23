@@ -14,10 +14,11 @@ use crate::state::{ConsoleState, AREAS};
 use mu_console_protocol::{
     AbDeploySubView, Area, AuthState, AuthStatus, CanaryBundleState, CdRunState, CdSubView,
     CiJobSummary, CiSubView, CrtFont, DashboardSubView, DialogModel as ProtoDialogModel,
-    GateOutcome, ModelRunnerSubView, ObservabilitySubView, PackageEcosystem, PlatformSubView,
-    ProblemCategory, RepoStatus, RepositorySubView, RiskConfirmAction, RoleActivationKind,
-    RoleLeaseView, SloProblem, Slot, StageState, StepUpRequirement, SubView, SubsystemHealthEntry,
-    SubsystemId, SubsystemStatus, TestState, UiError, Visibility,
+    GateOutcome, LogSeverity, ModelRunnerSubView, ObservabilitySubView, OtelLogEntry,
+    PackageEcosystem, PlatformSubView, ProblemCategory, RepoStatus, RepositorySubView,
+    RiskConfirmAction, RoleActivationKind, RoleLeaseView, SloProblem, Slot, StageState,
+    StepUpRequirement, SubView, SubsystemHealthEntry, SubsystemId, SubsystemStatus, TestState,
+    UiError, Visibility,
 };
 use mu_console_theme::scene::{
     self as theme_scene, ActionControl, ConsoleScene, GateChecklist, GateItem,
@@ -2951,6 +2952,51 @@ fn build_repo_sections(state: &ConsoleState, subview: RepositorySubView, scene: 
     scene.sections.push(sec);
 }
 
+fn build_observe_log_entries(state: &ConsoleState, logs: &[OtelLogEntry]) -> Vec<LogEntry> {
+    logs.iter()
+        .filter(|l| {
+            state
+                .log_severity_filter
+                .is_none_or(|sev| l.severity == sev)
+        })
+        .filter(|l| {
+            state
+                .obs_service_filter
+                .as_deref()
+                .is_none_or(|svc| crate::state::service_filter_matches(svc, &l.service))
+        })
+        .filter(|l| {
+            if state.filter_query.trim().is_empty() {
+                return true;
+            }
+            let sev = match l.severity {
+                LogSeverity::Info => "info",
+                LogSeverity::Warn => "warn",
+                LogSeverity::Error => "error",
+            };
+            let hay = format!("{} {} {} {}", l.service, sev, l.trace_id, l.message);
+            crate::state::service_filter_matches(&state.filter_query, &hay)
+        })
+        .enumerate()
+        .map(|(i, l)| {
+            let level = match l.severity {
+                LogSeverity::Error => SemanticTone::Fail,
+                LogSeverity::Warn => SemanticTone::Warn,
+                LogSeverity::Info => SemanticTone::Info,
+            };
+            LogEntry {
+                line_no: u32::try_from(i + 1).ok(),
+                timestamp: Some(l.timestamp_ms.to_string()),
+                level,
+                signal: None,
+                text: format!("[{}] {}", l.service, l.message),
+                trace_id: Some(l.trace_id.clone()),
+                action: None,
+            }
+        })
+        .collect()
+}
+
 fn build_observe_sections(
     state: &ConsoleState,
     subview: ObservabilitySubView,
@@ -2996,22 +3042,7 @@ fn build_observe_sections(
         }
         ObservabilitySubView::Logs => {
             let entries: Vec<LogEntry> = view
-                .map(|v| {
-                    v.observe
-                        .logs
-                        .iter()
-                        .enumerate()
-                        .map(|(i, l)| LogEntry {
-                            line_no: u32::try_from(i + 1).ok(),
-                            timestamp: Some(l.timestamp_ms.to_string()),
-                            level: SemanticTone::Info,
-                            signal: None,
-                            text: format!("[{}] {}", l.service, l.message),
-                            trace_id: Some(l.trace_id.clone()),
-                            action: None,
-                        })
-                        .collect()
-                })
+                .map(|v| build_observe_log_entries(state, &v.observe.logs))
                 .unwrap_or_default();
             sec = sec.with_component(SceneComponent::LogViewer(LogViewer {
                 id: "obs-logs-viewer".into(),
@@ -4196,5 +4227,114 @@ mod tests {
             panic!("expected TableGrid");
         };
         assert!(grid2.rows.is_empty());
+    }
+
+    #[test]
+    fn observability_logs_scene_filters_by_query_service_severity_and_maps_tone() {
+        let mut st = ConsoleState::new();
+        st.init_from_env("#/observability/logs", "", None);
+
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec!["system:dashboard.read".into(), "obs:logs.read".into()],
+                ..AuthState::default()
+            },
+            observe: mu_console_protocol::ObserveView {
+                logs: vec![
+                    OtelLogEntry {
+                        timestamp_ms: 1_001,
+                        severity: LogSeverity::Info,
+                        service: "muregist".into(),
+                        trace_id: "tr-reg-1".into(),
+                        span_id: None,
+                        message: "CAS upload ready".into(),
+                    },
+                    OtelLogEntry {
+                        timestamp_ms: 1_002,
+                        severity: LogSeverity::Error,
+                        service: "mu-registry".into(),
+                        trace_id: "tr-reg-2".into(),
+                        span_id: None,
+                        message: "HTTP 500 error".into(),
+                    },
+                    OtelLogEntry {
+                        timestamp_ms: 1_003,
+                        severity: LogSeverity::Warn,
+                        service: "mu-ci-controller".into(),
+                        trace_id: "tr-ci-1".into(),
+                        span_id: None,
+                        message: "queue backpressure".into(),
+                    },
+                    OtelLogEntry {
+                        timestamp_ms: 1_004,
+                        severity: LogSeverity::Info,
+                        service: "mu-console".into(),
+                        trace_id: "tr-web-1".into(),
+                        span_id: None,
+                        message: "HTTP 200 ok".into(),
+                    },
+                ],
+                ..mu_console_protocol::ObserveView::default()
+            },
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(vm)).expect("encode"));
+
+        let get_entries = |state: &ConsoleState| -> Vec<LogEntry> {
+            let scene = build_console_scene(state, SceneViewport::DESKTOP);
+            let sec = scene
+                .sections
+                .iter()
+                .find(|s| s.id == "sec-observe")
+                .expect("sec-observe");
+            let SceneComponent::LogViewer(viewer) = &sec.components[0] else {
+                panic!("expected LogViewer");
+            };
+            viewer.entries.clone()
+        };
+
+        // Unfiltered: all 4 rows with mapped severity tones.
+        let all = get_entries(&st);
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0].level, SemanticTone::Info);
+        assert_eq!(all[1].level, SemanticTone::Fail);
+        assert_eq!(all[2].level, SemanticTone::Warn);
+        assert_eq!(all[3].level, SemanticTone::Info);
+
+        // Canonical alias filtering matches both `muregist` and `mu-registry`.
+        st.set_filter_query("muregist", 1_000);
+        let reg = get_entries(&st);
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg[0].text, "[muregist] CAS upload ready");
+        assert_eq!(reg[1].text, "[mu-registry] HTTP 500 error");
+        assert_eq!(reg[0].line_no, Some(1));
+        assert_eq!(reg[1].line_no, Some(2));
+
+        // Multi-term alias + message/severity query narrows further.
+        st.set_filter_query("muregist error", 1_100);
+        let reg_err = get_entries(&st);
+        assert_eq!(reg_err.len(), 1);
+        assert_eq!(reg_err[0].text, "[mu-registry] HTTP 500 error");
+        assert_eq!(reg_err[0].level, SemanticTone::Fail);
+
+        // Trace ID matching works in filter_query.
+        st.set_filter_query("tr-ci-1", 1_200);
+        let by_trace = get_entries(&st);
+        assert_eq!(by_trace.len(), 1);
+        assert_eq!(by_trace[0].text, "[mu-ci-controller] queue backpressure");
+
+        // log_severity_filter and obs_service_filter also filter rendered entries.
+        st.set_filter_query("", 1_300);
+        st.log_severity_filter = Some(LogSeverity::Warn);
+        let warn_only = get_entries(&st);
+        assert_eq!(warn_only.len(), 1);
+        assert_eq!(warn_only[0].text, "[mu-ci-controller] queue backpressure");
+
+        st.log_severity_filter = None;
+        st.obs_service_filter = Some("muregist".into());
+        let svc_only = get_entries(&st);
+        assert_eq!(svc_only.len(), 2);
     }
 }
