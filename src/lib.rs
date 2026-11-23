@@ -21,7 +21,8 @@ pub mod state;
 pub mod webauthn;
 
 pub use components::{
-    filter_placeholder, render_console, render_console_with_skin, render_html_shell,
+    filter_placeholder, filter_placeholder_for_state, render_console, render_console_with_skin,
+    render_html_shell,
 };
 pub use copy::HTML_LANG;
 pub use mu_console_layout::{Frames, SafeArea, Viewport};

@@ -20,7 +20,7 @@ use web_sys::{
 
 use crate::client::{reload_banner_text, ClientUpdate, DataClient, WORKER_URL};
 use crate::components::{
-    filter_placeholder, render_console, render_html_shell, strip_lease_timer_values,
+    filter_placeholder_for_state, render_console, render_html_shell, strip_lease_timer_values,
 };
 use crate::copy;
 use crate::roles::resolve_lease_timer_text;
@@ -390,7 +390,14 @@ fn repaint(st: &ConsoleState) {
             .get_element_by_id("muconsole-filter")
             .and_then(|e| e.dyn_into::<HtmlInputElement>().ok())
         {
-            let _ = input.set_attribute("placeholder", filter_placeholder(st.route.area));
+            let _ = input.set_attribute("placeholder", filter_placeholder_for_state(st));
+            let filter_disabled = !st.is_filter_applicable();
+            input.set_disabled(filter_disabled);
+            if filter_disabled {
+                let _ = input.set_attribute("aria-disabled", "true");
+            } else {
+                let _ = input.remove_attribute("aria-disabled");
+            }
             if input.value() != st.filter_query {
                 input.set_value(&st.filter_query);
             }
@@ -1468,7 +1475,7 @@ pub fn start() {
                     return;
                 }
 
-                if key == "/" && !target_is_input {
+                if key == "/" && !target_is_input && state_for_key.borrow().is_filter_applicable() {
                     ev.prevent_default();
                     if let Some(input) = web_sys::window()
                         .and_then(|w| w.document())

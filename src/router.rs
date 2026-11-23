@@ -172,6 +172,17 @@ const BASELINE_PUBLIC_POLICIES: [&str; 3] = [
     "ci:repos.public.read",
 ];
 
+/// Return `true` when `auth` is restricted to baseline public Dashboard and CI Queue views.
+#[must_use]
+pub const fn is_public_ci_only_session(auth: &AuthState) -> bool {
+    matches!(
+        auth.status,
+        AuthStatus::Anonymous
+            | AuthStatus::AuthorizationDenied
+            | AuthStatus::PasskeyEnrollmentRequired
+    )
+}
+
 /// Evaluate effective policy membership, preserving baseline public read capabilities for
 /// non-lockdown `0`-Passkey sessions (`PasskeyEnrollmentRequired`) until operator enrollment completes.
 #[must_use]
@@ -224,10 +235,7 @@ pub fn can_access_subview(auth: &AuthState, subview: SubView) -> bool {
     }
 
     let has_any = |policies: &[&str]| policies.iter().any(|p| effective_has_policy(auth, p));
-    if matches!(
-        auth.status,
-        AuthStatus::Anonymous | AuthStatus::AuthorizationDenied
-    ) {
+    if is_public_ci_only_session(auth) {
         return match subview {
             SubView::Dashboard(DashboardSubView::Overview) => {
                 has_any(&["system:dashboard.read", "system:status.read"])
@@ -493,6 +501,82 @@ mod tests {
         assert!(!can_access_subview(
             &ab_reader,
             SubView::AbDeploy(AbDeploySubView::GateTestLogs)
+        ));
+    }
+
+    #[test]
+    fn passkey_required_restricts_to_public_dashboard_and_queue_logs_only() {
+        let passkey_req = AuthState {
+            status: AuthStatus::PasskeyEnrollmentRequired,
+            github_login: Some("newop".into()),
+            passkey_count: 0,
+            passkey_enrollment_required: true,
+            anonymous_lockdown: false,
+            ..AuthState::default()
+        };
+        assert!(is_public_ci_only_session(&passkey_req));
+        assert!(can_access_subview(
+            &passkey_req,
+            SubView::Dashboard(DashboardSubView::Overview)
+        ));
+        assert!(can_access_subview(
+            &passkey_req,
+            SubView::Ci(CiSubView::QueueLogs)
+        ));
+        for blocked in [
+            SubView::Ci(CiSubView::Scorecards),
+            SubView::Ci(CiSubView::Trainway),
+            SubView::Ci(CiSubView::WorkerNodes),
+            SubView::Ci(CiSubView::SandboxProfiles),
+            SubView::Cd(CdSubView::Runs),
+            SubView::AbDeploy(AbDeploySubView::IntegrationGate),
+            SubView::Repository(RepositorySubView::Packages),
+            SubView::Observability(ObservabilitySubView::Smartscape),
+            SubView::ModelRunner(ModelRunnerSubView::RuntimeQueue),
+            SubView::Platform(PlatformSubView::Maintenance),
+        ] {
+            assert!(
+                !can_access_subview(&passkey_req, blocked),
+                "PasskeyEnrollmentRequired must block {blocked:?}"
+            );
+        }
+
+        let passkey_lockdown = AuthState {
+            anonymous_lockdown: true,
+            ..passkey_req
+        };
+        assert!(!can_access_subview(
+            &passkey_lockdown,
+            SubView::Dashboard(DashboardSubView::Overview)
+        ));
+        assert!(!can_access_subview(
+            &passkey_lockdown,
+            SubView::Ci(CiSubView::QueueLogs)
+        ));
+
+        let anon =
+            AuthState::anonymous(vec!["system:dashboard.read".into(), "ci:queue.read".into()]);
+        assert!(is_public_ci_only_session(&anon));
+        assert!(can_access_subview(&anon, SubView::Ci(CiSubView::QueueLogs)));
+        assert!(!can_access_subview(
+            &anon,
+            SubView::Ci(CiSubView::Scorecards)
+        ));
+
+        let active_ci = AuthState {
+            status: AuthStatus::Active,
+            passkey_count: 1,
+            active_policies: vec!["ci:queue.read".into(), "ci:repos.public.read".into()],
+            ..AuthState::default()
+        };
+        assert!(!is_public_ci_only_session(&active_ci));
+        assert!(can_access_subview(
+            &active_ci,
+            SubView::Ci(CiSubView::Scorecards)
+        ));
+        assert!(can_access_subview(
+            &active_ci,
+            SubView::Ci(CiSubView::Trainway)
         ));
     }
 }

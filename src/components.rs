@@ -47,6 +47,12 @@ pub const fn filter_placeholder(area: Area) -> &'static str {
     copy::filter_placeholder_for_area(area)
 }
 
+/// Area-, subview-, and access-aware placeholder string for `#muconsole-filter`.
+#[must_use]
+pub fn filter_placeholder_for_state(state: &ConsoleState) -> &'static str {
+    state.filter_placeholder_text()
+}
+
 /// Escape text safely for HTML and XML attributes/body nodes.
 fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -983,7 +989,12 @@ pub fn render_html_shell(content: &str, state: &ConsoleState) -> String {
     let crt_font_slug = crate::state::font_slug(state.font);
     let font_css = font_stack_css(state.font);
 
-    let placeholder = escape_html(filter_placeholder(state.route.area));
+    let placeholder = escape_html(filter_placeholder_for_state(state));
+    let filter_disabled_attr = if state.is_filter_applicable() {
+        ""
+    } else {
+        r#" disabled="disabled" aria-disabled="true""#
+    };
     let filter_val = escape_html(&state.filter_query);
     let polite = escape_html(&state.aria_polite);
     let assertive = escape_html(&state.aria_assertive);
@@ -1044,8 +1055,13 @@ pub fn render_html_shell(content: &str, state: &ConsoleState) -> String {
             let roles_plain = escape_html(&state.format_header_roles());
             let roles_html = state.format_header_roles_html();
             let href = escape_html(&state.sign_out_href());
+            let auth_state = if auth.status == AuthStatus::PasskeyEnrollmentRequired {
+                "passkey_required"
+            } else {
+                "active"
+            };
             format!(
-                r##"<button id="muconsole-user-btn" type="button" data-control-id="hdr-user" data-action="hdr-user">@{handle}</button><button id="muconsole-roles-btn" type="button" data-control-id="hdr-role" data-action="hdr-role" aria-label="{roles_plain}"{role_gated_attr}>{roles_html}</button><a id="muconsole-auth-link" href="{href}" data-auth-state="active">{}</a>"##,
+                r##"<button id="muconsole-user-btn" type="button" data-control-id="hdr-user" data-action="hdr-user">@{handle}</button><button id="muconsole-roles-btn" type="button" data-control-id="hdr-role" data-action="hdr-role" aria-label="{roles_plain}"{role_gated_attr}>{roles_html}</button><a id="muconsole-auth-link" href="{href}" data-auth-state="{auth_state}">{}</a>"##,
                 escape_html(copy::SIGN_OUT_LABEL),
             )
         }
@@ -1055,6 +1071,100 @@ pub fn render_html_shell(content: &str, state: &ConsoleState) -> String {
     let aria_label = escape_html(copy::FILTER_ARIA_LABEL);
 
     format!(
-        r##"<div id="muconsole-shell" data-skin="{skin_str}" data-crt-font="{crt_font_slug}" data-font="{font_css}" style="--font-crt:{font_css};--font-active:{font_css}"><style>{styles}</style><header id="muconsole-header"><a class="skip-link" href="#muconsole-dashboard">{skip_label}</a><input id="muconsole-filter" type="search" value="{filter_val}" placeholder="{placeholder}" aria-label="{aria_label}" style="font-size:16px" /><div id="muconsole-aria-polite" role="status" aria-live="polite">{polite}</div><div id="muconsole-aria-assertive" role="alert" aria-live="assertive">{assertive}</div>{header_tail}</header><main id="muconsole-dashboard">{content}</main></div>"##
+        r##"<div id="muconsole-shell" data-skin="{skin_str}" data-crt-font="{crt_font_slug}" data-font="{font_css}" style="--font-crt:{font_css};--font-active:{font_css}"><style>{styles}</style><header id="muconsole-header"><a class="skip-link" href="#muconsole-dashboard">{skip_label}</a><input id="muconsole-filter" type="search" value="{filter_val}" placeholder="{placeholder}" aria-label="{aria_label}" style="font-size:16px"{filter_disabled_attr} /><div id="muconsole-aria-polite" role="status" aria-live="polite">{polite}</div><div id="muconsole-aria-assertive" role="alert" aria-live="assertive">{assertive}</div>{header_tail}</header><main id="muconsole-dashboard">{content}</main></div>"##
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mu_console_protocol::{encode, AuthState, CiSubView, DataEvent, SubView, ViewModel};
+
+    #[test]
+    fn html_shell_sets_filter_disabled_state_and_passkey_auth_attribute() {
+        let mut st = ConsoleState::new();
+        let unresolved_html = render_html_shell("<svg></svg>", &st);
+        let unresolved_doc = roxmltree::Document::parse(&unresolved_html).expect("valid XML");
+        let filter_unresolved = unresolved_doc
+            .descendants()
+            .find(|n| n.attribute("id") == Some("muconsole-filter"))
+            .expect("#muconsole-filter present");
+        assert_eq!(filter_unresolved.attribute("disabled"), Some("disabled"));
+        assert_eq!(filter_unresolved.attribute("aria-disabled"), Some("true"));
+        assert_eq!(
+            filter_unresolved.attribute("placeholder"),
+            Some("Resolving session...")
+        );
+
+        let passkey_vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::PasskeyEnrollmentRequired,
+                github_login: Some("newop".into()),
+                passkey_count: 0,
+                passkey_enrollment_required: true,
+                ..AuthState::default()
+            },
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(passkey_vm)).expect("encode"));
+        st.apply_hash("#/ci/logs");
+        let passkey_html = render_html_shell("<svg></svg>", &st);
+        let passkey_doc = roxmltree::Document::parse(&passkey_html).expect("valid XML");
+        let auth_link = passkey_doc
+            .descendants()
+            .find(|n| n.attribute("id") == Some("muconsole-auth-link"))
+            .expect("#muconsole-auth-link present");
+        assert_eq!(
+            auth_link.attribute("data-auth-state"),
+            Some("passkey_required")
+        );
+        let filter_passkey = passkey_doc
+            .descendants()
+            .find(|n| n.attribute("id") == Some("muconsole-filter"))
+            .expect("#muconsole-filter present");
+        assert_eq!(filter_passkey.attribute("disabled"), None);
+        assert_eq!(
+            filter_passkey.attribute("placeholder"),
+            Some("Filter public repos, branches, or jobs...")
+        );
+
+        st.apply_hash("#/platform/users");
+        let blocked_html = render_html_shell("<svg></svg>", &st);
+        let blocked_doc = roxmltree::Document::parse(&blocked_html).expect("valid XML");
+        let filter_blocked = blocked_doc
+            .descendants()
+            .find(|n| n.attribute("id") == Some("muconsole-filter"))
+            .expect("#muconsole-filter present");
+        assert_eq!(filter_blocked.attribute("disabled"), Some("disabled"));
+        assert_eq!(filter_blocked.attribute("aria-disabled"), Some("true"));
+        assert_eq!(
+            filter_blocked.attribute("placeholder"),
+            Some("Enroll passkey to unlock...")
+        );
+
+        let active_vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                passkey_count: 1,
+                active_policies: vec!["system:dashboard.read".into(), "ci:queue.read".into()],
+                ..AuthState::default()
+            },
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(active_vm)).expect("encode"));
+        st.apply_hash("#/ci/scorecards");
+        let active_html = render_html_shell("<svg></svg>", &st);
+        let active_doc = roxmltree::Document::parse(&active_html).expect("valid XML");
+        let active_link = active_doc
+            .descendants()
+            .find(|n| n.attribute("id") == Some("muconsole-auth-link"))
+            .expect("#muconsole-auth-link present");
+        assert_eq!(active_link.attribute("data-auth-state"), Some("active"));
+        assert_eq!(
+            filter_placeholder_for_state(&st),
+            "Filter repos, branches, or status..."
+        );
+        let _ = SubView::Ci(CiSubView::Scorecards);
+    }
 }

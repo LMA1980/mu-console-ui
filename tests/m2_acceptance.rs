@@ -2095,3 +2095,1244 @@ fn observability_hides_repo_selector_in_html_and_wireframe_skins() {
         }
     }
 }
+
+fn full_area_access_policies() -> Vec<&'static str> {
+    vec![
+        "system:dashboard.read",
+        "ci:queue.read",
+        "ci:jobs.read",
+        "ci:jobs.logs.read",
+        "ci:jobs.resume",
+        "ci:jobs.restart",
+        "ci:repos.public.read",
+        "ci:repos.private.read",
+        "ci:nodes.read",
+        "ci:sandboxes.read",
+        "cd:runs.read",
+        "cd:steps.read",
+        "ab:slots.read",
+        "ab:deploy.read",
+        "ab:gate.logs.read",
+        "ab:leases.read",
+        "ab:rollback",
+        "reg:packages.read",
+        "reg:canaries.read",
+        "reg:taints.read",
+        "reg:cas.read",
+        "obs:smartscape.read",
+        "obs:traces.read",
+        "obs:problems.read",
+        "obs:logs.read",
+        "obs:metrics.read",
+        "obs:store.read",
+        "obs:ingress.read",
+        "mr:models.read",
+        "mr:queue.read",
+        "mr:openai_api.read",
+        "mr:wireguard_vpn.read",
+        "platform:maintenance.read",
+        "platform:maintenance.write",
+        "platform:users.read",
+        "platform:users.write",
+        "platform:invites.read",
+        "platform:invites.write",
+        "platform:roles.read",
+        "platform:roles.write",
+        "platform:folios.read",
+        "platform:folios.write",
+    ]
+}
+
+fn assert_repo_selector_absent(st: &ConsoleState, ctx: &str) {
+    use mu_console_theme::scene::SceneViewport;
+    use mu_console_ui::scene::build_console_scene;
+
+    let scene = build_console_scene(st, SceneViewport::DESKTOP);
+    assert!(
+        scene.repo_selector.is_none(),
+        "{ctx}: scene.repo_selector must be None"
+    );
+    let (html_out, wf_out) = render_both_skins(st);
+    for out in [&html_out, &wf_out] {
+        for forbidden in [
+            "c2-repo-selector",
+            "mu-repo-selector",
+            "Prev Repo",
+            "Prev Submodule",
+        ] {
+            assert!(
+                !out.contains(forbidden),
+                "{ctx}: output must omit '{forbidden}'"
+            );
+        }
+    }
+}
+
+fn assert_filter_disabled_16px(st: &ConsoleState, expected_placeholder: &str, ctx: &str) {
+    assert!(
+        !st.is_filter_applicable(),
+        "{ctx}: filter must not be applicable"
+    );
+    let (html_shell, wf_shell) = render_both_skins(st);
+    let doc = roxmltree::Document::parse(&wf_shell)
+        .unwrap_or_else(|e| panic!("{ctx} (wireframe): invalid XML shell: {e}"));
+    let filter = doc
+        .descendants()
+        .find(|n| n.attribute("id") == Some("muconsole-filter"))
+        .unwrap_or_else(|| panic!("{ctx} (wireframe): missing #muconsole-filter"));
+    assert_eq!(filter.attribute("disabled"), Some("disabled"), "{ctx}");
+    assert_eq!(filter.attribute("aria-disabled"), Some("true"), "{ctx}");
+    assert_eq!(
+        filter.attribute("placeholder"),
+        Some(expected_placeholder),
+        "{ctx} (wireframe) placeholder mismatch"
+    );
+    assert!(
+        filter
+            .attribute("style")
+            .is_some_and(|s| s.contains("font-size:16px")),
+        "{ctx} (wireframe): disabled #muconsole-filter must preserve font-size:16px"
+    );
+
+    let html_filter_line = html_shell
+        .split('<')
+        .find(|tag| tag.contains("id=\"muconsole-filter\""))
+        .unwrap_or_else(|| panic!("{ctx} (html): missing #muconsole-filter"));
+    assert!(html_filter_line.contains("disabled=\"disabled\""), "{ctx}");
+    assert!(html_filter_line.contains("aria-disabled=\"true\""), "{ctx}");
+    assert!(
+        html_filter_line.contains(&format!("placeholder=\"{expected_placeholder}\"")),
+        "{ctx} (html) placeholder mismatch in {html_filter_line}"
+    );
+    assert!(
+        html_filter_line.contains("font-size:16px"),
+        "{ctx} (html): disabled #muconsole-filter must preserve font-size:16px"
+    );
+}
+
+fn multi_area_fixture_vm(auth: AuthState) -> ViewModel {
+    use mu_console_protocol::dto::{
+        CdEcosystem, CdRunDto, CdRunFailurePinpointDto, CdStepDto, IngressRouteDto,
+        ModelRunnerConnectionDto, ModelRunnerStatusDto, ResidentModelStatusDto,
+        SubsystemHealthEntry, SubsystemHealthSummary, SubsystemStatus, WireGuardPeerSummaryDto,
+    };
+    use mu_console_protocol::{
+        Branch, CanaryBundle, CanaryBundleState, CasHealth, CdLease, CdRunState, DeploymentGate,
+        FabricNode, GateOutcome, GateTest, HardwareMetricSeries, LogSeverity, OtelLogEntry,
+        PackageEcosystem, PrState, ProblemCategory, PurePathTrace, RegistryPackage, RegistryView,
+        RepoScore, RepoStatus, RepoTopology, SandboxProfileSummary, SidingPhase, SloProblem, Slot,
+        SmartscapeLayer, SmartscapeNode, Station, SubmoduleRef, TestState, Train,
+    };
+
+    let mut parent = RepoScore::new(RepoId::new("LMA1980", "alpha-superproject"));
+    parent.default_branch = "release-alpha".into();
+    parent.status = RepoStatus::Failing;
+    parent.score = 82;
+    parent.submodules = vec![SubmoduleRef {
+        path: "code/core".into(),
+        repo: RepoId::new("LMA1980", "core"),
+        pinned_sha: "abc1234".into(),
+    }];
+    let mut beta_repo = RepoScore::new(RepoId::new("LMA1980", "beta-service"));
+    beta_repo.default_branch = "main".into();
+    beta_repo.status = RepoStatus::Passing;
+    beta_repo.score = 99;
+    let mut priv_repo = RepoScore::new(RepoId::new("LMA1980", "private-vault"));
+    priv_repo.visibility = Visibility::Private;
+    priv_repo.status = RepoStatus::Passing;
+
+    let mut vm = ViewModel {
+        auth,
+        repos: vec![parent, beta_repo, priv_repo],
+        topology: Some(RepoTopology {
+            repo: RepoId::new("LMA1980", "alpha-superproject"),
+            submodule: None,
+            default_branch: "main".into(),
+            stations: vec![
+                Station {
+                    id: "fmt".into(),
+                    label: "FMT".into(),
+                },
+                Station {
+                    id: "rvv-bench".into(),
+                    label: "RVV".into(),
+                },
+            ],
+            branches: vec![Branch {
+                ref_name: "feat/alpha-rvv".into(),
+                base_ref: "main".into(),
+                fork_stage: 0,
+                pr_state: PrState::Open,
+                last_job: Some(101),
+                phase: SidingPhase::Active,
+            }],
+            trains: vec![
+                Train {
+                    job_id: 101,
+                    ref_name: "feat/alpha-rvv".into(),
+                    stage: 1,
+                    stage_states: vec![StageState::Passed, StageState::Running],
+                    node_id: Some("worker-alpha".into()),
+                    node_lost: false,
+                },
+                Train {
+                    job_id: 102,
+                    ref_name: "feat/beta-docs".into(),
+                    stage: 0,
+                    stage_states: vec![StageState::Passed, StageState::Passed],
+                    node_id: Some("worker-beta".into()),
+                    node_lost: false,
+                },
+            ],
+            submodules: vec![],
+            fabric_rev: 7,
+            submodule_bump_pending: false,
+        }),
+        ci_jobs: vec![
+            CiJobSummary {
+                job_id_str: "job-101".into(),
+                job_id: 101,
+                repo: RepoId::new("LMA1980", "alpha-superproject"),
+                ref_name: "feat/alpha-rvv".into(),
+                commit_sha: "111aaaa".into(),
+                queue_state: "running".into(),
+                stages: vec![CiJobStage {
+                    id: "rvv".into(),
+                    name: "RVV Suite".into(),
+                    assigned_node: Some("worker-alpha".into()),
+                    threads: 8,
+                    state: StageState::Running,
+                    duration_secs: 14,
+                    exit_code: 0,
+                    skip_reason: None,
+                }],
+                raw_log_lines: vec![
+                    "LOG_NEEDLE running rvv tile".into(),
+                    "unrelated stdout line".into(),
+                ],
+                ..CiJobSummary::default()
+            },
+            CiJobSummary {
+                job_id_str: "job-102".into(),
+                job_id: 102,
+                repo: RepoId::new("LMA1980", "beta-service"),
+                ref_name: "main".into(),
+                commit_sha: "222bbbb".into(),
+                queue_state: "failed".into(),
+                stages: vec![CiJobStage {
+                    id: "clippy".into(),
+                    name: "Clippy".into(),
+                    assigned_node: Some("worker-beta".into()),
+                    threads: 4,
+                    state: StageState::Failed,
+                    duration_secs: 9,
+                    exit_code: 1,
+                    skip_reason: None,
+                }],
+                raw_log_lines: vec!["clippy error line".into()],
+                ..CiJobSummary::default()
+            },
+            CiJobSummary {
+                job_id_str: "job-103".into(),
+                job_id: 103,
+                repo: RepoId::new("LMA1980", "beta-service"),
+                ref_name: "release".into(),
+                commit_sha: "333cccc".into(),
+                queue_state: "passed".into(),
+                ..CiJobSummary::default()
+            },
+        ],
+        nodes: vec![
+            FabricNode {
+                id: "worker-alpha".into(),
+                online: false,
+                arch: "riscv64".into(),
+                active_slots: 0,
+                max_slots: 1,
+                cpu_load_bp: 0,
+                ..FabricNode::default()
+            },
+            FabricNode {
+                id: "worker-beta".into(),
+                online: true,
+                arch: "x86_64".into(),
+                active_slots: 1,
+                max_slots: 1,
+                cpu_load_bp: 4200,
+                ..FabricNode::default()
+            },
+        ],
+        sandboxes: vec![
+            SandboxProfileSummary {
+                profile_name: "sb-kvm-strict".into(),
+                backend: "HypervisorSandbox".into(),
+                max_pids: 256,
+                max_slots: 1,
+                thread_budget: 6,
+                hardware_target: "riscv64".into(),
+            },
+            SandboxProfileSummary {
+                profile_name: "sb-kernel-fast".into(),
+                backend: "KernelSandbox".into(),
+                max_pids: 256,
+                max_slots: 1,
+                thread_budget: 8,
+                hardware_target: "x86_64".into(),
+            },
+        ],
+        cd_runs: vec![
+            CdRunDto {
+                run_id: "cd-alpha-1".into(),
+                ecosystem: CdEcosystem::Cargo,
+                repo: RepoId::new("LMA1980", "alpha-superproject"),
+                ref_name: "main".into(),
+                state: CdRunState::Failed,
+                failure: Some(CdRunFailurePinpointDto {
+                    step_id: "publish-crate".into(),
+                    package_name: Some("alpha-core".into()),
+                    package_version: Some("0.3.0".into()),
+                    reason: "ETag mismatch".into(),
+                    log_excerpt: None,
+                }),
+                steps: vec![CdStepDto {
+                    step_id: "publish-crate".into(),
+                    label: "Publish Crate".into(),
+                    state: CdRunState::Failed,
+                    ..CdStepDto::default()
+                }],
+                ..CdRunDto::default()
+            },
+            CdRunDto {
+                run_id: "cd-beta-2".into(),
+                ecosystem: CdEcosystem::Maven,
+                repo: RepoId::new("LMA1980", "beta-service"),
+                ref_name: "main".into(),
+                state: CdRunState::Succeeded,
+                steps: vec![CdStepDto {
+                    step_id: "deploy-pom".into(),
+                    label: "Deploy Maven Artifact".into(),
+                    state: CdRunState::Succeeded,
+                    ..CdStepDto::default()
+                }],
+                ..CdRunDto::default()
+            },
+        ],
+        gate: Some(DeploymentGate {
+            deployment_id: "dep-alpha-01".into(),
+            repo: RepoId::new("LMA1980", "alpha-superproject"),
+            service: "alpha-api".into(),
+            artifact_digest: "sha256:alpha9911".into(),
+            target_node: "node-a".into(),
+            staged_slot: Slot::B,
+            restore_slot: Slot::A,
+            lease_expires_epoch_ms: 999_000,
+            outcome: GateOutcome::Pending,
+            rollback_reason: None,
+            tainted: false,
+            tests: vec![
+                GateTest {
+                    name: "it_alpha_gemm".into(),
+                    critical: true,
+                    state: TestState::Failed,
+                    duration_ms: 1_200,
+                    crate_name: Some("core".into()),
+                    log_excerpt: Some("GATE_NEEDLE gemm nan\nother gate line".into()),
+                },
+                GateTest {
+                    name: "it_beta_smoke".into(),
+                    critical: false,
+                    state: TestState::Passed,
+                    duration_ms: 300,
+                    crate_name: Some("ui".into()),
+                    log_excerpt: Some("smoke ok".into()),
+                },
+            ],
+        }),
+        leases: vec![
+            CdLease {
+                lease_id: "lease-alpha".into(),
+                deployment_id: "dep-alpha-01".into(),
+                target_node: "node-a".into(),
+                service: "alpha-api".into(),
+                artifact_digest: "sha256:alpha9911".into(),
+                active_slot: Slot::A,
+                candidate_slot: Slot::B,
+                ttl_remaining_ms: 120_000,
+                promoted: false,
+            },
+            CdLease {
+                lease_id: "lease-beta".into(),
+                deployment_id: "dep-beta-02".into(),
+                target_node: "node-b".into(),
+                service: "beta-worker".into(),
+                artifact_digest: "sha256:beta8822".into(),
+                active_slot: Slot::B,
+                candidate_slot: Slot::A,
+                ttl_remaining_ms: 60_000,
+                promoted: true,
+            },
+        ],
+        registry: RegistryView {
+            packages: vec![
+                RegistryPackage {
+                    ecosystem: PackageEcosystem::Cargo,
+                    name: "k3-alpha-crate".into(),
+                    latest_version: "0.4.0".into(),
+                    versions_count: 1,
+                    sha256_prefix: "deadbeef1111".into(),
+                    deps_count: 3,
+                    yanked: false,
+                    tainted: false,
+                    taint_reason: None,
+                    versions: vec!["0.4.0".into()],
+                },
+                RegistryPackage {
+                    ecosystem: PackageEcosystem::NuGet,
+                    name: "Mu.Beta.Package".into(),
+                    latest_version: "2.1.0".into(),
+                    versions_count: 1,
+                    sha256_prefix: "cafe2222bbbb".into(),
+                    deps_count: 2,
+                    yanked: false,
+                    tainted: true,
+                    taint_reason: Some("canary fail".into()),
+                    versions: vec!["2.1.0".into()],
+                },
+            ],
+            canaries: vec![
+                CanaryBundle {
+                    bundle_id: "bundle-alpha-ok".into(),
+                    repo: RepoId::new("LMA1980", "alpha-superproject"),
+                    service: "alpha-api".into(),
+                    artifact_digest: "sha256:alpha9911".into(),
+                    state: CanaryBundleState::Promoted,
+                    taint_reason: None,
+                    deployment_id: "dep-alpha-01".into(),
+                    trace_id: "tr-alpha-1".into(),
+                },
+                CanaryBundle {
+                    bundle_id: "bundle-beta-taint".into(),
+                    repo: RepoId::new("LMA1980", "beta-service"),
+                    service: "beta-worker".into(),
+                    artifact_digest: "sha256:beta8822".into(),
+                    state: CanaryBundleState::Tainted,
+                    taint_reason: Some("error rate spike".into()),
+                    deployment_id: "dep-beta-02".into(),
+                    trace_id: "tr-beta-2".into(),
+                },
+            ],
+            cas: CasHealth {
+                blob_count: 420,
+                corrupt_blobs: 1,
+                ..CasHealth::default()
+            },
+        },
+        subsystem_health: SubsystemHealthSummary {
+            ci: SubsystemHealthEntry {
+                status: SubsystemStatus::Live,
+                summary: "Operational".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            observability: SubsystemHealthEntry {
+                status: SubsystemStatus::Degraded,
+                summary: "Latency alert".into(),
+                ..SubsystemHealthEntry::default()
+            },
+            ..SubsystemHealthSummary::default()
+        },
+        ..ViewModel::default()
+    };
+
+    vm.observe.smartscape_nodes = vec![
+        SmartscapeNode {
+            id: "svc-alpha".into(),
+            label: "alpha-api".into(),
+            layer: SmartscapeLayer::Service,
+            req_per_sec_bp: 1200,
+            error_rate_bp: 10,
+            p95_ms: 18,
+            healthy: true,
+        },
+        SmartscapeNode {
+            id: "proc-beta".into(),
+            label: "beta-worker".into(),
+            layer: SmartscapeLayer::Process,
+            req_per_sec_bp: 300,
+            error_rate_bp: 50,
+            p95_ms: 42,
+            healthy: false,
+        },
+        SmartscapeNode {
+            id: "host-gamma".into(),
+            label: "gamma-host".into(),
+            layer: SmartscapeLayer::Host,
+            req_per_sec_bp: 0,
+            error_rate_bp: 0,
+            p95_ms: 5,
+            healthy: true,
+        },
+    ];
+    vm.observe.traces = vec![
+        PurePathTrace {
+            trace_id: "tr-alpha-01".into(),
+            root_service: "alpha-api".into(),
+            root_operation: "GET /v1/alpha".into(),
+            domain: "edge".into(),
+            duration_ms: 19,
+            error: false,
+            slow_p99: false,
+            started_epoch_ms: 1_000,
+            spans: vec![],
+        },
+        PurePathTrace {
+            trace_id: "tr-beta-02".into(),
+            root_service: "beta-worker".into(),
+            root_operation: "POST /v1/beta".into(),
+            domain: "compute".into(),
+            duration_ms: 88,
+            error: true,
+            slow_p99: true,
+            started_epoch_ms: 2_000,
+            spans: vec![],
+        },
+    ];
+    vm.observe.problems = vec![
+        SloProblem {
+            problem_id: "PROB-ALPHA-1".into(),
+            title: "Alpha API p99 latency breach".into(),
+            category: ProblemCategory::LatencyRegression,
+            severity: "critical".into(),
+            impacted_entity: "alpha-api".into(),
+            active: true,
+            ..SloProblem::default()
+        },
+        SloProblem {
+            problem_id: "PROB-BETA-2".into(),
+            title: "Beta worker crash loop".into(),
+            category: ProblemCategory::ErrorRateSpike,
+            severity: "error".into(),
+            impacted_entity: "beta-worker".into(),
+            active: true,
+            ..SloProblem::default()
+        },
+    ];
+    vm.observe.logs = vec![
+        OtelLogEntry {
+            timestamp_ms: 1_000,
+            severity: LogSeverity::Info,
+            service: "alpha-api".into(),
+            span_id: None,
+            trace_id: "tr-alpha-01".into(),
+            message: "alpha request completed".into(),
+        },
+        OtelLogEntry {
+            timestamp_ms: 2_000,
+            severity: LogSeverity::Error,
+            service: "beta-worker".into(),
+            span_id: None,
+            trace_id: "tr-beta-02".into(),
+            message: "beta panic detected".into(),
+        },
+    ];
+    vm.observe.metrics = vec![
+        HardwareMetricSeries {
+            service: "alpha-api".into(),
+            hardware_class: "x86_64".into(),
+            rps: 140,
+            error_rate_bp: 5,
+            p50_ms: 6,
+            p95_ms: 18,
+            p99_ms: 30,
+            exemplar_trace_id: "tr-alpha-01".into(),
+            samples: vec![6, 12, 18],
+        },
+        HardwareMetricSeries {
+            service: "beta-worker".into(),
+            hardware_class: "riscv64".into(),
+            rps: 30,
+            error_rate_bp: 200,
+            p50_ms: 20,
+            p95_ms: 80,
+            p99_ms: 140,
+            exemplar_trace_id: "tr-beta-02".into(),
+            samples: vec![20, 50, 80],
+        },
+    ];
+    vm.observe.store.hot_duckdb_rows = 12_345;
+    vm.observe.ingress_routes = vec![
+        IngressRouteDto {
+            route_id: "ing-alpha".into(),
+            path_prefix: "/v1/alpha".into(),
+            upstream_url: "http://192.0.2.10:8080".into(),
+            service_name: "alpha-api".into(),
+            strip_prefix: false,
+            auth_required: true,
+            request_count: 100,
+            request_rate_rps: 12.0,
+            error_rate_pct: 0.1,
+            p95_latency_ms: 8.5,
+        },
+        IngressRouteDto {
+            route_id: "ing-beta".into(),
+            path_prefix: "/v1/beta".into(),
+            upstream_url: "http://192.0.2.20:8080".into(),
+            service_name: "beta-worker".into(),
+            strip_prefix: false,
+            auth_required: true,
+            request_count: 50,
+            request_rate_rps: 4.0,
+            error_rate_pct: 2.5,
+            p95_latency_ms: 35.0,
+        },
+    ];
+    vm.model_runner.status = Some(ModelRunnerStatusDto {
+        models: vec![
+            ResidentModelStatusDto {
+                model_id: "qwen-7b".into(),
+                cluster: "cluster-a100".into(),
+                is_alive: true,
+                mlock_bytes: 4 * 1024 * 1024 * 1024,
+                ..ResidentModelStatusDto::default()
+            },
+            ResidentModelStatusDto {
+                model_id: "llama-3b".into(),
+                cluster: "cluster-x100".into(),
+                is_alive: true,
+                mlock_bytes: 2 * 1024 * 1024 * 1024,
+                ..ResidentModelStatusDto::default()
+            },
+        ],
+        ..ModelRunnerStatusDto::default()
+    });
+    vm.model_runner.connection = Some(ModelRunnerConnectionDto {
+        peers: vec![
+            WireGuardPeerSummaryDto {
+                public_key_prefix: "pk-alpha".into(),
+                allowed_ips: "10.42.0.2/32".into(),
+                latest_handshake_epoch_ms: Some(1_000),
+                ..WireGuardPeerSummaryDto::default()
+            },
+            WireGuardPeerSummaryDto {
+                public_key_prefix: "pk-beta".into(),
+                allowed_ips: "10.42.0.3/32".into(),
+                latest_handshake_epoch_ms: None,
+                ..WireGuardPeerSummaryDto::default()
+            },
+        ],
+        ..ModelRunnerConnectionDto::default()
+    });
+    vm.platform = PlatformSnapshotDto {
+        users: vec![
+            PlatformUserDto {
+                github_login: "sole-admin".into(),
+                display_name: Some("Sole Admin".into()),
+                passkey_count: 1,
+                bound_roles: vec!["platform-admin".into()],
+                is_platform_admin: true,
+                last_seen_ms: None,
+            },
+            PlatformUserDto {
+                github_login: "dev-member".into(),
+                display_name: Some("Dev Member".into()),
+                passkey_count: 1,
+                bound_roles: vec!["operator".into()],
+                is_platform_admin: false,
+                last_seen_ms: None,
+            },
+        ],
+        roles: vec![
+            RoleSpecDto {
+                id: "operator".into(),
+                display_name: Some("Baseline Operator".into()),
+                activation: RoleActivationDto::pinned_baseline(),
+                ..RoleSpecDto::default()
+            },
+            RoleSpecDto {
+                id: "super-operator".into(),
+                display_name: Some("Super Operator".into()),
+                activation: RoleActivationDto::super_operator(),
+                ..RoleSpecDto::default()
+            },
+        ],
+        role_folio_index: mu_console_protocol::dto::RoleFolioIndexDto {
+            role_folios: [(
+                "super-operator".to_owned(),
+                vec!["folio-super-admin".to_owned()],
+            )]
+            .into_iter()
+            .collect(),
+            ..mu_console_protocol::dto::RoleFolioIndexDto::default()
+        },
+        ..PlatformSnapshotDto::default()
+    };
+    vm
+}
+
+#[test]
+fn observability_and_non_repo_subviews_omit_repo_selector() {
+    use mu_console_protocol::{ObservabilitySubView, RepositorySubView};
+    use mu_console_theme::scene::SceneViewport;
+    use mu_console_ui::scene::build_console_scene;
+
+    // 1. Authorized operator holding full policies: non-repo sub-views & all 7 Observability sub-views omit repo_selector.
+    let mut full = active_state("ops", full_area_access_policies());
+    let vm = multi_area_fixture_vm(full.auth());
+    push_vm(&mut full, vm.clone());
+
+    for obs_sv in ObservabilitySubView::ALL {
+        full.select_subview(SubView::Observability(obs_sv));
+        assert_repo_selector_absent(&full, &format!("Observability::{obs_sv:?}"));
+    }
+    for sv in [
+        SubView::Ci(CiSubView::WorkerNodes),
+        SubView::Ci(CiSubView::SandboxProfiles),
+        SubView::Repository(RepositorySubView::CasHealth),
+        SubView::AbDeploy(AbDeploySubView::ActiveLeases),
+    ] {
+        full.select_subview(sv);
+        assert_repo_selector_absent(&full, &format!("Non-repo {sv:?}"));
+    }
+
+    // 2. Authorized user on CI::Scorecards WITH ci:repos.public.read sees repo_selector across both skins.
+    full.select_subview(SubView::Ci(CiSubView::Scorecards));
+    let scorecards_scene = build_console_scene(&full, SceneViewport::DESKTOP);
+    assert!(scorecards_scene.repo_selector.is_some());
+    let (sc_html, sc_wf) = render_both_skins(&full);
+    assert!(sc_html.contains("c2-repo-selector"));
+    assert!(sc_html.contains("mu-repo-selector"));
+    assert!(sc_html.contains("Prev Repo"));
+    assert!(sc_html.contains("Prev Submodule"));
+    assert!(sc_wf.contains("c2-repo-selector"));
+
+    // 3. Active operator lacking ci:repos.public.read / ci:repos.private.read omits repo_selector even on repo sub-views.
+    let mut no_repos = active_state(
+        "no-repos",
+        vec![
+            "ci:queue.read",
+            "ci:jobs.read",
+            "cd:runs.read",
+            "ab:slots.read",
+            "reg:packages.read",
+        ],
+    );
+    let mut no_repos_vm = vm;
+    no_repos_vm.auth = no_repos.auth();
+    push_vm(&mut no_repos, no_repos_vm);
+    for sv in [
+        SubView::Ci(CiSubView::Scorecards),
+        SubView::Ci(CiSubView::Trainway),
+        SubView::Ci(CiSubView::QueueLogs),
+        SubView::Cd(mu_console_protocol::CdSubView::Runs),
+        SubView::AbDeploy(AbDeploySubView::IntegrationGate),
+        SubView::Repository(RepositorySubView::Packages),
+    ] {
+        no_repos.select_subview(sv);
+        assert_repo_selector_absent(&no_repos, &format!("No ci:repos.* {sv:?}"));
+    }
+}
+
+#[test]
+fn anonymous_vs_passkey_required_vs_active_without_accesses() {
+    use mu_console_theme::scene::SceneViewport;
+    use mu_console_ui::components::filter_placeholder_for_state;
+    use mu_console_ui::scene::build_console_scene;
+
+    // 1. Anonymous: protected deep link -> "Authentication required" + Sign In; placeholders omit "alerts" / "nodes".
+    let anon_auth = AuthState::anonymous(vec![
+        "system:dashboard.read".into(),
+        "ci:queue.read".into(),
+        "ci:repos.public.read".into(),
+    ]);
+    let base_vm = multi_area_fixture_vm(anon_auth.clone());
+
+    let mut anon_dash = ConsoleState::new();
+    anon_dash.init_from_env("#/dashboard/overview", "", None);
+    push_vm(&mut anon_dash, base_vm.clone());
+    assert!(!filter_placeholder_for_state(&anon_dash).contains("alerts"));
+    let (anon_dash_html, anon_dash_wf) = render_both_skins(&anon_dash);
+    assert!(!anon_dash_html.contains("alerts..."));
+    assert!(!anon_dash_wf.contains("alerts..."));
+
+    let mut anon_ci = ConsoleState::new();
+    anon_ci.init_from_env("#/ci/logs", "", None);
+    push_vm(&mut anon_ci, base_vm.clone());
+    assert!(!filter_placeholder_for_state(&anon_ci).contains("nodes"));
+
+    let mut anon_deep = ConsoleState::new();
+    anon_deep.init_from_env("#/platform/users", "", None);
+    push_vm(&mut anon_deep, base_vm.clone());
+    let (anon_deep_html, anon_deep_wf) = render_both_skins(&anon_deep);
+    for out in [&anon_deep_html, &anon_deep_wf] {
+        assert!(out.contains("Authentication required"));
+        assert!(out.contains("Sign In"));
+        assert!(!out.contains("Passkey enrollment required"));
+        assert!(!out.contains("Access restricted"));
+    }
+
+    // 2. PasskeyEnrollmentRequired: public Dashboard + public CI > Queue & Logs only;
+    //    protected deep link -> "Passkey enrollment required" + Register Passkey (never "Authentication required").
+    let pk_auth = AuthState::from_session(&AuthSessionDto {
+        authenticated: true,
+        invite_bound: true,
+        passkey_count: 0,
+        passkey_enrollment_required: true,
+        github_login: Some("passkey-rookie".into()),
+        reason_code: Some(AuthReasonCode::PasskeyEnrollmentRequired),
+        ..AuthSessionDto::default()
+    });
+    let mut pk_vm = base_vm;
+    pk_vm.auth = pk_auth.clone();
+    pk_vm.ci_jobs[0].raw_log_lines = vec!["PK_RAW_LOG_MUST_STAY_HIDDEN".into()];
+    pk_vm.ci_jobs[0].stages[0].assigned_node = Some("pk-secret-worker".into());
+    pk_vm.ci_jobs[0].stages[0].threads = 32;
+
+    assert!(can_access_subview(
+        &pk_auth,
+        SubView::Dashboard(DashboardSubView::Overview)
+    ));
+    assert!(can_access_subview(
+        &pk_auth,
+        SubView::Ci(CiSubView::QueueLogs)
+    ));
+    for forbidden_ci in [
+        CiSubView::Scorecards,
+        CiSubView::Trainway,
+        CiSubView::WorkerNodes,
+        CiSubView::SandboxProfiles,
+    ] {
+        assert!(!can_access_subview(&pk_auth, SubView::Ci(forbidden_ci)));
+    }
+
+    let mut pk_ci = ConsoleState::new();
+    pk_ci.init_from_env("#/ci/logs", "", None);
+    push_vm(&mut pk_ci, pk_vm.clone());
+    let _ = pk_ci.dismiss_dialog();
+    assert!(!filter_placeholder_for_state(&pk_ci).contains("nodes"));
+    let (pk_ci_html, pk_ci_wf) = render_both_skins(&pk_ci);
+    for out in [&pk_ci_html, &pk_ci_wf] {
+        assert!(out.contains(r#"data-auth-state="passkey_required""#));
+        assert!(out.contains("Enroll a passkey"));
+        assert!(!out.contains("nav-subview:ci:"));
+        assert!(!out.contains("c2-repo-selector"));
+        assert!(!out.contains("PK_RAW_LOG_MUST_STAY_HIDDEN"));
+        assert!(!out.contains("pk-secret-worker"));
+        assert!(!out.contains("32t"));
+        assert!(!out.contains("ci-job-raw-logs"));
+        assert!(!out.contains("private-vault"));
+    }
+
+    let mut pk_deep = ConsoleState::new();
+    pk_deep.init_from_env("#/ci/scorecards", "", None);
+    push_vm(&mut pk_deep, pk_vm);
+    let _ = pk_deep.dismiss_dialog();
+    let (pk_deep_html, pk_deep_wf) = render_both_skins(&pk_deep);
+    for out in [&pk_deep_html, &pk_deep_wf] {
+        assert!(out.contains("Passkey enrollment required"));
+        assert!(out.contains("Register Passkey"));
+        assert!(out.contains("auth-gate-register-passkey"));
+        assert!(out.contains(r#"data-auth-state="passkey_required""#));
+        assert!(!out.contains("Authentication required"));
+    }
+
+    // 3. Active without accesses: protected deep link -> "Access restricted" + Session Roles (NEVER "Authentication required").
+    let op_spec = RoleSpecDto {
+        id: "operator".into(),
+        display_name: Some("Operator".into()),
+        activation: RoleActivationDto::pinned_baseline(),
+        ..RoleSpecDto::default()
+    };
+    let ci_spec = RoleSpecDto {
+        id: "ci-operator".into(),
+        display_name: Some("CI Operator".into()),
+        activation: RoleActivationDto::elective(),
+        ..RoleSpecDto::default()
+    };
+    let active_dash_only_auth = AuthState::from_session(&AuthSessionDto {
+        authenticated: true,
+        invite_bound: true,
+        passkey_count: 1,
+        github_login: Some("limited-op".into()),
+        baseline_role: Some("operator".into()),
+        bound_roles: vec!["operator".into(), "ci-operator".into()],
+        bound_role_specs: vec![op_spec.clone(), ci_spec.clone()],
+        active_roles: vec![op_spec.clone()],
+        active_policies: vec!["system:dashboard.read".into()],
+        ..AuthSessionDto::default()
+    });
+    let mut act_dash = ConsoleState::new();
+    act_dash.init_from_env("#/dashboard/overview", "", None);
+    push_vm(&mut act_dash, multi_area_fixture_vm(active_dash_only_auth));
+    let dash_scene = build_console_scene(&act_dash, SceneViewport::DESKTOP);
+    assert!(!dash_scene
+        .sections
+        .iter()
+        .any(|s| s.id == "sec-dash-attention"));
+    assert!(dash_scene
+        .sections
+        .iter()
+        .any(|s| s.id == "sec-dash-role-hint"));
+    let (act_dash_html, act_dash_wf) = render_both_skins(&act_dash);
+    for out in [&act_dash_html, &act_dash_wf] {
+        assert!(!out.contains("Needs Attention"));
+        assert!(out.contains("Session Role Elevation"));
+        assert!(out.contains("Session Roles"));
+    }
+
+    // Protected deep link while Active without area policy renders "Access restricted" + Session Roles.
+    act_dash.init_from_env("#/ab-deploy/gate", "", None);
+    let (act_deep_html, act_deep_wf) = render_both_skins(&act_dash);
+    for out in [&act_deep_html, &act_deep_wf] {
+        assert!(out.contains("Access restricted"));
+        assert!(out.contains("Session Roles"));
+        assert!(out.contains("Return to Dashboard"));
+        assert!(!out.contains("Authentication required"));
+    }
+
+    // Active CI > Queue & Logs without ci:jobs.logs.read or ci:nodes.read hides raw logs and node/thread details.
+    let mut act_ci = active_state(
+        "ci-no-logs",
+        vec!["ci:queue.read", "ci:jobs.read", "ci:repos.public.read"],
+    );
+    let mut ci_vm = multi_area_fixture_vm(act_ci.auth());
+    ci_vm.ci_jobs[0].raw_log_lines = vec!["ACTIVE_RAW_LOG_SHOULD_HIDE".into()];
+    ci_vm.ci_jobs[0].stages[0].assigned_node = Some("secret-ci-node".into());
+    ci_vm.ci_jobs[0].stages[0].threads = 64;
+    act_ci.init_from_env("#/ci/logs", "", None);
+    push_vm(&mut act_ci, ci_vm);
+    let (act_ci_html, act_ci_wf) = render_both_skins(&act_ci);
+    for out in [&act_ci_html, &act_ci_wf] {
+        assert!(out.contains("ci-job-logs-restricted"));
+        assert!(!out.contains("ci-job-raw-logs"));
+        assert!(!out.contains("ACTIVE_RAW_LOG_SHOULD_HIDE"));
+        assert!(!out.contains("secret-ci-node"));
+        assert!(!out.contains("64t"));
+    }
+
+    // Platform > Users & Invites gates invite creator and users table independently.
+    let mut users_only = active_state("users-reader", vec!["platform:users.read"]);
+    users_only.init_from_env("#/platform/users", "", None);
+    let u_vm = multi_area_fixture_vm(users_only.auth());
+    push_vm(&mut users_only, u_vm);
+    let (u_html, u_wf) = render_both_skins(&users_only);
+    for out in [&u_html, &u_wf] {
+        assert!(out.contains("plat-users-table"));
+        assert!(!out.contains("plat-invite-creator"));
+    }
+
+    let mut invites_only = active_state("invites-reader", vec!["platform:invites.read"]);
+    invites_only.init_from_env("#/platform/users", "", None);
+    let i_vm = multi_area_fixture_vm(invites_only.auth());
+    push_vm(&mut invites_only, i_vm);
+    let (i_html, i_wf) = render_both_skins(&invites_only);
+    for out in [&i_html, &i_wf] {
+        assert!(out.contains("plat-invite-creator"));
+        assert!(!out.contains("plat-users-table"));
+    }
+}
+
+fn check_disabled_filter_across_states() {
+    let cold = ConsoleState::new();
+    assert_filter_disabled_16px(&cold, "Resolving session...", "cold_boot");
+
+    let mut lockdown = ConsoleState::new();
+    push_vm(
+        &mut lockdown,
+        ViewModel {
+            auth: AuthState::anonymous(vec![]),
+            ..ViewModel::default()
+        },
+    );
+    assert_filter_disabled_16px(&lockdown, "Sign in to filter...", "anon_lockdown");
+
+    let mut denied = ConsoleState::new();
+    denied.init_from_env("#/platform/users", "", None);
+    push_vm(
+        &mut denied,
+        ViewModel {
+            auth: AuthState::from_session(&AuthSessionDto {
+                authenticated: false,
+                invite_bound: false,
+                github_login: Some("outsider".into()),
+                reason_code: Some(AuthReasonCode::AuthorizationDenied),
+                ..AuthSessionDto::default()
+            }),
+            ..ViewModel::default()
+        },
+    );
+    assert_filter_disabled_16px(&denied, "Access denied", "auth_denied_deep_link");
+
+    let mut pk_deep = ConsoleState::new();
+    pk_deep.init_from_env("#/ci/trainway", "", None);
+    push_vm(
+        &mut pk_deep,
+        ViewModel {
+            auth: AuthState::from_session(&AuthSessionDto {
+                authenticated: true,
+                invite_bound: true,
+                passkey_count: 0,
+                passkey_enrollment_required: true,
+                github_login: Some("new-op".into()),
+                reason_code: Some(AuthReasonCode::PasskeyEnrollmentRequired),
+                ..AuthSessionDto::default()
+            }),
+            ..ViewModel::default()
+        },
+    );
+    assert_filter_disabled_16px(&pk_deep, "Enroll passkey to unlock...", "passkey_deep");
+
+    let mut active_unauth = active_state("limited", vec!["system:dashboard.read"]);
+    active_unauth.init_from_env("#/platform/users", "", None);
+    let mut unauth_vm = multi_area_fixture_vm(active_unauth.auth());
+    unauth_vm.auth = active_unauth.auth();
+    push_vm(&mut active_unauth, unauth_vm);
+    assert_filter_disabled_16px(
+        &active_unauth,
+        "Access restricted for active roles",
+        "active_unauthorized",
+    );
+    // `/` shortcut stays inert when filter is disabled.
+    assert!(active_unauth.on_key("/", false, 100).is_none());
+    assert!(!active_unauth.filter_focused);
+}
+
+#[test]
+fn area_and_access_aware_filtering_across_all_8_areas() {
+    use mu_console_protocol::{
+        CdSubView, ModelRunnerSubView, ObservabilitySubView, PlatformSubView, RepositorySubView,
+    };
+
+    check_disabled_filter_across_states();
+
+    let mut st = active_state("ops", full_area_access_policies());
+    let full_vm = multi_area_fixture_vm(st.auth());
+    push_vm(&mut st, full_vm);
+
+    // 1. Dashboard: active with ci:nodes.read + obs + ci -> enabled placeholder, filters Fleet/Attention/Apps.
+    st.select_subview(SubView::Dashboard(DashboardSubView::Overview));
+    assert!(st.is_filter_applicable());
+    assert_eq!(st.on_key("/", false, 200), None);
+    assert!(st.filter_focused);
+    st.set_filter_query("alpha", 210);
+    let (dash_html, dash_wf) = render_both_skins(&st);
+    for out in [&dash_html, &dash_wf] {
+        assert!(out.contains("worker-alpha"));
+        assert!(!out.contains("worker-beta"));
+        assert!(out.contains("alpha-api"));
+    }
+    assert!(dash_html.contains("Filter applications, nodes, or alerts..."));
+
+    // 2. CI: QueueLogs status filters + log/job text filtering + Scorecards/Trainway/WorkerNodes/SandboxProfiles.
+    st.set_filter_query("", 300);
+    st.select_subview(SubView::Ci(CiSubView::QueueLogs));
+    assert!(st.activate_target("ci-queue-filter:running").is_empty());
+    let (ci_run_html, _) = render_both_skins(&st);
+    assert!(ci_run_html.contains("#101"));
+    assert!(!ci_run_html.contains("#102"));
+    assert!(st.activate_target("ci-queue-filter:failed").is_empty());
+    let (ci_fail_html, ci_fail_wf) = render_both_skins(&st);
+    assert!(ci_fail_html.contains("#102") && ci_fail_wf.contains("#102"));
+    assert!(!ci_fail_html.contains("#101"));
+    assert!(st.activate_target("ci-queue-filter:all").is_empty());
+
+    st.set_filter_query("LOG_NEEDLE", 310);
+    let (ci_log_html, _) = render_both_skins(&st);
+    assert!(ci_log_html.contains("LOG_NEEDLE running rvv tile"));
+    assert!(!ci_log_html.contains("unrelated stdout line"));
+
+    st.select_subview(SubView::Ci(CiSubView::Scorecards));
+    st.set_filter_query("release-alpha", 320);
+    let (sc_html, _) = render_both_skins(&st);
+    assert!(sc_html.contains("alpha-superproject"));
+    assert!(!sc_html.contains("beta-service"));
+
+    st.select_subview(SubView::Ci(CiSubView::Trainway));
+    st.set_filter_query("alpha-rvv", 330);
+    let (tw_html, _) = render_both_skins(&st);
+    assert!(tw_html.contains("feat/alpha-rvv"));
+    assert!(!tw_html.contains("feat/beta-docs"));
+
+    st.select_subview(SubView::Ci(CiSubView::WorkerNodes));
+    st.set_filter_query("riscv64", 340);
+    let (wn_html, _) = render_both_skins(&st);
+    assert!(wn_html.contains("worker-alpha"));
+    assert!(!wn_html.contains("worker-beta"));
+
+    st.select_subview(SubView::Ci(CiSubView::SandboxProfiles));
+    st.set_filter_query("HypervisorSandbox", 350);
+    let (sb_html, _) = render_both_skins(&st);
+    assert!(sb_html.contains("sb-kvm-strict"));
+    assert!(!sb_html.contains("sb-kernel-fast"));
+
+    // 3. CD: Runs & Pipelines.
+    st.select_subview(SubView::Cd(CdSubView::Runs));
+    st.set_filter_query("Cargo", 400);
+    let (cd_runs_html, _) = render_both_skins(&st);
+    assert!(cd_runs_html.contains("cd-alpha-1"));
+    assert!(!cd_runs_html.contains("cd-beta-2"));
+
+    st.select_subview(SubView::Cd(CdSubView::Pipelines));
+    st.set_filter_query("Deploy Maven", 410);
+    let (cd_pipe_html, _) = render_both_skins(&st);
+    assert!(cd_pipe_html.contains("cd-beta-2"));
+    assert!(!cd_pipe_html.contains("cd-alpha-1"));
+
+    // 4. A|B Deploy: Gate, Slots, GateTestLogs, ActiveLeases.
+    st.select_subview(SubView::AbDeploy(AbDeploySubView::IntegrationGate));
+    st.set_filter_query("it_alpha_gemm", 500);
+    let (ab_gate_html, _) = render_both_skins(&st);
+    assert!(ab_gate_html.contains("it_alpha_gemm"));
+    assert!(!ab_gate_html.contains("it_beta_smoke"));
+
+    st.select_subview(SubView::AbDeploy(AbDeploySubView::DeploymentsSlots));
+    st.set_filter_query("Candidate", 510);
+    let (ab_slot_html, _) = render_both_skins(&st);
+    assert!(ab_slot_html.contains("ab-slot-b"));
+    assert!(!ab_slot_html.contains("ab-slot-a"));
+
+    st.select_subview(SubView::AbDeploy(AbDeploySubView::GateTestLogs));
+    st.set_filter_query("GATE_NEEDLE", 520);
+    let (ab_logs_html, _) = render_both_skins(&st);
+    assert!(ab_logs_html.contains("GATE_NEEDLE gemm nan"));
+    assert!(!ab_logs_html.contains("other gate line"));
+
+    st.select_subview(SubView::AbDeploy(AbDeploySubView::ActiveLeases));
+    st.set_filter_query("beta-worker", 530);
+    let (ab_lease_html, _) = render_both_skins(&st);
+    assert!(ab_lease_html.contains("lease-beta"));
+    assert!(!ab_lease_html.contains("lease-alpha"));
+
+    // 5. Registry: Packages (digests + ecosystem), CanaryTaints, CasHealth.
+    st.select_subview(SubView::Repository(RepositorySubView::Packages));
+    st.set_filter_query("deadbeef1111", 600);
+    let (reg_dig_html, _) = render_both_skins(&st);
+    assert!(reg_dig_html.contains("k3-alpha-crate"));
+    assert!(!reg_dig_html.contains("Mu.Beta.Package"));
+    st.set_filter_query("", 605);
+    st.on_dom_action("data-ecosystem", "nuget", false, 606);
+    let (reg_eco_html, _) = render_both_skins(&st);
+    assert!(reg_eco_html.contains("Mu.Beta.Package"));
+    assert!(!reg_eco_html.contains("k3-alpha-crate"));
+
+    st.select_subview(SubView::Repository(RepositorySubView::CanaryTaints));
+    st.set_filter_query("TAINTED", 610);
+    let (cny_html, _) = render_both_skins(&st);
+    assert!(cny_html.contains("bundle-beta-taint"));
+    assert!(!cny_html.contains("bundle-alpha-ok"));
+
+    st.select_subview(SubView::Repository(RepositorySubView::CasHealth));
+    st.set_filter_query("Corrupt", 620);
+    let (cas_html, _) = render_both_skins(&st);
+    assert!(cas_html.contains("Corrupt Blobs"));
+
+    // 6. Observability: all 7 sub-views (Smartscape layer filter + service selector + Ingress).
+    st.set_filter_query("", 700);
+    st.select_subview(SubView::Observability(ObservabilitySubView::Smartscape));
+    assert!(st
+        .activate_target("obs-smartscape-filter:services")
+        .is_empty());
+    let (ss_svc_html, _) = render_both_skins(&st);
+    assert!(ss_svc_html.contains("alpha-api"));
+    assert!(!ss_svc_html.contains("beta-worker"));
+    assert!(!ss_svc_html.contains("gamma-host"));
+
+    assert!(st
+        .activate_target("obs-smartscape-filter:processes")
+        .is_empty());
+    let (ss_proc_html, _) = render_both_skins(&st);
+    assert!(ss_proc_html.contains("beta-worker"));
+    assert!(!ss_proc_html.contains("alpha-api"));
+
+    assert!(st.activate_target("obs-smartscape-filter:hosts").is_empty());
+    let (ss_host_html, _) = render_both_skins(&st);
+    assert!(ss_host_html.contains("gamma-host"));
+    assert!(!ss_host_html.contains("alpha-api"));
+
+    assert!(st.activate_target("obs-smartscape-filter:all").is_empty());
+    // Cycle service selector to first sorted service ("alpha-api").
+    assert!(st.activate_target("obs-service-next").is_empty());
+    assert_eq!(st.obs_service_filter.as_deref(), Some("alpha-api"));
+    for obs_sv in [
+        ObservabilitySubView::Smartscape,
+        ObservabilitySubView::PurePath,
+        ObservabilitySubView::ProblemsSlos,
+        ObservabilitySubView::Logs,
+        ObservabilitySubView::Metrics,
+        ObservabilitySubView::Ingress,
+    ] {
+        st.select_subview(SubView::Observability(obs_sv));
+        let (obs_html, obs_wf) = render_both_skins(&st);
+        assert!(
+            obs_html.contains("alpha-api"),
+            "{obs_sv:?} missing alpha-api"
+        );
+        assert!(
+            !obs_html.contains("beta-worker"),
+            "{obs_sv:?} leaked beta-worker under service filter"
+        );
+        assert!(obs_wf.contains("obs-service-filter"));
+    }
+    assert!(st.activate_target("obs-service-clear").is_empty());
+    assert_eq!(st.obs_service_filter, None);
+    st.select_subview(SubView::Observability(ObservabilitySubView::Ingress));
+    st.set_filter_query("/v1/beta", 710);
+    let (ing_html, ing_wf) = render_both_skins(&st);
+    assert!(ing_html.contains("ing-beta") && ing_wf.contains("ing-beta"));
+    assert!(!ing_html.contains("ing-alpha"));
+
+    st.select_subview(SubView::Observability(ObservabilitySubView::DataStore));
+    st.set_filter_query("DuckDB", 720);
+    let (ds_html, _) = render_both_skins(&st);
+    assert!(ds_html.contains("12345"));
+
+    // 7. Model Runner: RuntimeQueue & ConnectionVpn.
+    st.select_subview(SubView::ModelRunner(ModelRunnerSubView::RuntimeQueue));
+    st.set_filter_query("cluster-a100", 800);
+    let (mr_rt_html, _) = render_both_skins(&st);
+    assert!(mr_rt_html.contains("qwen-7b"));
+    assert!(!mr_rt_html.contains("llama-3b"));
+
+    st.select_subview(SubView::ModelRunner(ModelRunnerSubView::ConnectionVpn));
+    st.set_filter_query("10.42.0.3", 810);
+    let (mr_vpn_html, _) = render_both_skins(&st);
+    assert!(mr_vpn_html.contains("pk-beta"));
+    assert!(!mr_vpn_html.contains("pk-alpha"));
+
+    // 8. Platform: Maintenance, UsersAndInvites (Last Admin preserved when filtered to 1 admin!), RolesAndFolios.
+    st.select_subview(SubView::Platform(PlatformSubView::Maintenance));
+    st.set_filter_query("Subsystem", 900);
+    let (pm_html, _) = render_both_skins(&st);
+    assert!(pm_html.contains("Selected Subsystem"));
+
+    st.select_subview(SubView::Platform(PlatformSubView::UsersAndInvites));
+    st.set_filter_query("sole-admin", 910);
+    let (pu_html, pu_wf) = render_both_skins(&st);
+    assert!(pu_html.contains("@sole-admin") && pu_wf.contains("sole-admin"));
+    assert!(!pu_html.contains("@dev-member"));
+    assert!(pu_html.contains("Last Admin"));
+    assert!(st
+        .activate_target("platform-user-revoke:sole-admin")
+        .is_empty());
+    assert!(st.active_dialog().is_none());
+
+    // Pre-filter admin_count stays accurate with 2 admins even when filtered down to 1 admin.
+    let mut two_admin_vm = multi_area_fixture_vm(st.auth());
+    two_admin_vm.platform.users.push(PlatformUserDto {
+        github_login: "backup-admin".into(),
+        display_name: Some("Backup Admin".into()),
+        passkey_count: 1,
+        bound_roles: vec!["platform-admin".into()],
+        is_platform_admin: true,
+        last_seen_ms: None,
+    });
+    push_vm(&mut st, two_admin_vm);
+    let (pu2_html, _) = render_both_skins(&st);
+    assert!(pu2_html.contains("@sole-admin"));
+    assert!(!pu2_html.contains("@backup-admin"));
+    assert!(!pu2_html.contains("Last Admin"));
+
+    st.select_subview(SubView::Platform(PlatformSubView::RolesAndFolios));
+    st.set_filter_query("folio-super-admin", 920);
+    let (pr_html, _) = render_both_skins(&st);
+    assert!(pr_html.contains("Super Operator"));
+    assert!(!pr_html.contains("Baseline Operator"));
+}
