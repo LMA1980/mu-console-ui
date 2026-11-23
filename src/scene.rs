@@ -880,7 +880,7 @@ fn build_subview_tabs(state: &ConsoleState, auth: &AuthState) -> Vec<SubViewTab>
 fn build_repo_selector(state: &ConsoleState) -> Option<RepoSelector> {
     if matches!(
         state.route.area,
-        Area::Dashboard | Area::ModelRunner | Area::Platform
+        Area::Dashboard | Area::Observability | Area::ModelRunner | Area::Platform
     ) {
         return None;
     }
@@ -3695,7 +3695,8 @@ fn stage_state_tone(st: StageState) -> SemanticTone {
 mod tests {
     use super::*;
     use mu_console_protocol::{
-        encode, CiJobSummary, DataEvent, FabricNode, ProblemCategory, RepoId, SloProblem, ViewModel,
+        encode, CiJobSummary, DataEvent, FabricNode, ProblemCategory, RepoId, RepoScore,
+        SloProblem, ViewModel,
     };
 
     #[test]
@@ -4336,5 +4337,65 @@ mod tests {
         st.obs_service_filter = Some("muregist".into());
         let svc_only = get_entries(&st);
         assert_eq!(svc_only.len(), 2);
+    }
+
+    #[test]
+    fn observability_omits_repo_selector_across_all_subviews() {
+        let mut st = ConsoleState::new();
+        st.init_from_env("#/observability/smartscape", "", None);
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec![
+                    "system:dashboard.read".into(),
+                    "ci:queue.read".into(),
+                    "ci:repos.public.read".into(),
+                    "cd:runs.read".into(),
+                    "ab:slots.read".into(),
+                    "reg:packages.read".into(),
+                    "obs:smartscape.read".into(),
+                    "obs:traces.read".into(),
+                    "obs:problems.read".into(),
+                    "obs:logs.read".into(),
+                    "obs:metrics.read".into(),
+                    "obs:store.read".into(),
+                    "obs:ingress.read".into(),
+                    "mr:models.read".into(),
+                    "platform:maintenance.read".into(),
+                ],
+                ..AuthState::default()
+            },
+            repos: vec![RepoScore::new(RepoId::new("LMA1980", "mu-registry"))],
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(vm)).expect("encode vm"));
+
+        for subview in ObservabilitySubView::ALL {
+            let _ = st.select_subview(SubView::Observability(subview));
+            let scene = build_console_scene(&st, SceneViewport::DESKTOP);
+            assert!(
+                scene.repo_selector.is_none(),
+                "Observability subview {subview:?} must omit repo_selector"
+            );
+        }
+
+        for hidden_area in [Area::Dashboard, Area::ModelRunner, Area::Platform] {
+            let _ = st.select_area(hidden_area);
+            let scene = build_console_scene(&st, SceneViewport::DESKTOP);
+            assert!(
+                scene.repo_selector.is_none(),
+                "{hidden_area:?} must omit repo_selector"
+            );
+        }
+
+        for visible_area in [Area::Ci, Area::Cd, Area::AbDeploy, Area::Repository] {
+            let _ = st.select_area(visible_area);
+            let scene = build_console_scene(&st, SceneViewport::DESKTOP);
+            assert!(
+                scene.repo_selector.is_some(),
+                "{visible_area:?} must include repo_selector"
+            );
+        }
     }
 }
