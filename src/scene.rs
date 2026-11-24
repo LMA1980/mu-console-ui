@@ -14,16 +14,16 @@ use crate::state::{service_filter_matches, ConsoleState, AREAS};
 use mu_console_protocol::{
     AbDeploySubView, Area, AuthState, AuthStatus, CanaryBundleState, CdRunState, CdSubView,
     CiJobSummary, CiSubView, CrtFont, DashboardSubView, DialogModel as ProtoDialogModel,
-    GateOutcome, LogSeverity, ModelRunnerSubView, ObservabilitySubView, OtelLogEntry,
-    PackageEcosystem, PlatformSubView, ProblemCategory, RepoStatus, RepositorySubView,
-    RiskConfirmAction, RoleActivationKind, RoleLeaseView, SloProblem, Slot, SmartscapeLayer,
-    StageState, StepUpRequirement, SubView, SubsystemHealthEntry, SubsystemId, SubsystemStatus,
-    TestState, UiError, Visibility,
+    GateOutcome, LogSeverity, ModelRunnerSubView, ObsLogWindowMeta, ObservabilitySubView,
+    OtelLogEntry, PackageEcosystem, PlatformSubView, ProblemCategory, RepoStatus,
+    RepositorySubView, RiskConfirmAction, RoleActivationKind, RoleLeaseView, SloProblem, Slot,
+    SmartscapeLayer, StageState, StepUpRequirement, SubView, SubsystemHealthEntry, SubsystemId,
+    SubsystemStatus, TestState, UiError, Visibility,
 };
 use mu_console_theme::scene::{
     self as theme_scene, ActionControl, ConsoleScene, GateChecklist, GateItem,
     InviteCreatedOnceDialog, KeyValueEntry, KeyValueList, LogEntry, LogViewer, MatrixCell, NavTab,
-    PasskeyEnrollmentDialog, PlatformPanel, RepoSelector, RiskConfirmDialog, RoleBadge,
+    Pagination, PasskeyEnrollmentDialog, PlatformPanel, RepoSelector, RiskConfirmDialog, RoleBadge,
     SceneBanner, SceneComponent, SceneSection, SceneViewport, SessionRoleOption,
     SessionRolesDialog, SparklineCard, StatusLamp, StatusMatrix, SubViewTab, TableCell,
     TableColumn, TableGrid, TableRow, TrainwayCheckpoint, TrainwayGraph, TrainwayTrack,
@@ -1777,16 +1777,22 @@ fn subsystem_permitted_detail(
                 .filter(|p| p.active && !is_suppressed_obs_problem(p))
                 .count();
             if active_problems > 0 {
+                let logs_summary = match view.observe.log_window.total_matched {
+                    Some(total) => format!("{}/{total} logs", view.observe.logs.len()),
+                    None => format!("{} logs", view.observe.logs.len()),
+                };
                 format!(
-                    "{} logs · {} traces · {} metrics · {active_problems} active SLO problem(s)",
-                    view.observe.logs.len(),
+                    "{logs_summary} · {} traces · {} metrics · {active_problems} active SLO problem(s)",
                     view.observe.traces.len(),
                     view.observe.metrics.len(),
                 )
             } else {
+                let logs_summary = match view.observe.log_window.total_matched {
+                    Some(total) => format!("{}/{total} logs", view.observe.logs.len()),
+                    None => format!("{} logs", view.observe.logs.len()),
+                };
                 format!(
-                    "{} logs · {} traces · {} metrics",
-                    view.observe.logs.len(),
+                    "{logs_summary} · {} traces · {} metrics",
                     view.observe.traces.len(),
                     view.observe.metrics.len(),
                 )
@@ -2312,6 +2318,7 @@ fn build_ci_log_component(
                 signal: None,
                 text: line.clone(),
                 trace_id: None,
+                anchor_key: None,
                 action: None,
             })
             .collect();
@@ -2885,6 +2892,7 @@ fn build_ab_gate_logs_section(state: &ConsoleState) -> SceneSection {
                     signal: None,
                     text: l.to_owned(),
                     trace_id: None,
+                    anchor_key: None,
                     action: None,
                 })
                 .collect()
@@ -3551,7 +3559,33 @@ fn build_obs_metrics_components(state: &ConsoleState, mut sec: SceneSection) -> 
     sec
 }
 
-fn build_observe_log_entries(state: &ConsoleState, logs: &[OtelLogEntry]) -> Vec<LogEntry> {
+fn obs_log_anchor_key(l: &OtelLogEntry) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    };
+    feed(&l.timestamp_ms.to_le_bytes());
+    feed(l.service.as_bytes());
+    feed(l.trace_id.as_bytes());
+    if let Some(ref sp) = l.span_id {
+        feed(sp.as_bytes());
+    }
+    feed(l.message.as_bytes());
+    format!("{:016x}-{hash:016x}", l.timestamp_ms)
+}
+
+fn build_observe_log_entries(
+    state: &ConsoleState,
+    logs: &[OtelLogEntry],
+    window: &ObsLogWindowMeta,
+) -> Vec<LogEntry> {
+    let apply_client_query = !state.filter_query.trim().is_empty()
+        && (!window.search_active || state.pending_filter_at_ms.is_some());
     logs.iter()
         .filter(|l| {
             state
@@ -3560,7 +3594,7 @@ fn build_observe_log_entries(state: &ConsoleState, logs: &[OtelLogEntry]) -> Vec
         })
         .filter(|l| matches_obs_service(state.obs_service_filter.as_deref(), &l.service))
         .filter(|l| {
-            if state.filter_query.trim().is_empty() {
+            if !apply_client_query {
                 return true;
             }
             let sev = match l.severity {
@@ -3568,7 +3602,11 @@ fn build_observe_log_entries(state: &ConsoleState, logs: &[OtelLogEntry]) -> Vec
                 LogSeverity::Warn => "warn",
                 LogSeverity::Error => "error",
             };
-            let hay = format!("{} {} {} {}", l.service, sev, l.trace_id, l.message);
+            let span = l.span_id.as_deref().unwrap_or("");
+            let hay = format!(
+                "{} {} {} {} {}",
+                l.service, sev, l.trace_id, span, l.message
+            );
             service_filter_matches(&state.filter_query, &hay)
         })
         .enumerate()
@@ -3579,12 +3617,13 @@ fn build_observe_log_entries(state: &ConsoleState, logs: &[OtelLogEntry]) -> Vec
                 LogSeverity::Info => SemanticTone::Info,
             };
             LogEntry {
-                line_no: u32::try_from(i + 1).ok(),
+                line_no: u32::try_from(window.window_start_index as usize + i + 1).ok(),
                 timestamp: Some(l.timestamp_ms.to_string()),
                 level,
                 signal: None,
                 text: format!("[{}] {}", l.service, l.message),
                 trace_id: Some(l.trace_id.clone()),
+                anchor_key: Some(obs_log_anchor_key(l)),
                 action: None,
             }
         })
@@ -3592,20 +3631,102 @@ fn build_observe_log_entries(state: &ConsoleState, logs: &[OtelLogEntry]) -> Vec
 }
 
 fn build_obs_logs_viewer(state: &ConsoleState) -> LogViewer {
-    let entries = state
+    let (entries, window) = state
         .client
         .view()
-        .map(|v| build_observe_log_entries(state, &v.observe.logs))
+        .map(|v| {
+            let w = v.observe.log_window.clone();
+            (build_observe_log_entries(state, &v.observe.logs, &w), w)
+        })
         .unwrap_or_default();
+
+    let count = entries.len();
+    let start_num = window.window_start_index as usize + 1;
+    let end_num = window.window_start_index as usize + count;
+    let title = if count == 0 {
+        if window.search_active {
+            "Distributed OpenTelemetry Logs (0 matching)".to_owned()
+        } else {
+            "Distributed OpenTelemetry Logs".to_owned()
+        }
+    } else if let Some(total) = window.total_matched {
+        format!("Distributed OpenTelemetry Logs ({start_num}–{end_num} of {total})")
+    } else if window.cached_total as usize > count || window.window_start_index > 0 {
+        format!(
+            "Distributed OpenTelemetry Logs ({start_num}–{end_num} · {} cached)",
+            window.cached_total
+        )
+    } else {
+        format!("Distributed OpenTelemetry Logs ({count} entries)")
+    };
+
+    let mut controls = Vec::new();
+    if window.window_start_index > 0 || window.pending_live_count > 0 {
+        let label = if window.pending_live_count > 0 {
+            format!("↑ Latest (+{})", window.pending_live_count)
+        } else {
+            "↑ Latest".to_owned()
+        };
+        controls.push(ActionControl::new(
+            "obs-logs-latest",
+            label,
+            "obs-logs-latest",
+        ));
+    }
+
+    let pagination = if window.has_newer
+        || window.has_older
+        || window.loading_newer
+        || window.loading_older
+        || window.window_start_index > 0
+    {
+        let current_page = (window.window_start_index / 200) + 1;
+        let total_items = window
+            .total_matched
+            .and_then(|t| u32::try_from(t).ok())
+            .or((window.cached_total > 0).then_some(window.cached_total));
+        let estimated_pages = total_items.map_or(current_page, |t| t.div_ceil(200).max(1));
+        let total_pages = estimated_pages
+            .max(current_page + u32::from(window.has_older))
+            .max(1);
+        Some(Pagination {
+            current_page,
+            total_pages,
+            total_items,
+            prev: ActionControl::new(
+                "obs-logs-newer",
+                if window.loading_newer {
+                    "Loading…"
+                } else {
+                    "↑ Newer"
+                },
+                "obs-logs-newer",
+            )
+            .disabled(!window.has_newer || window.loading_newer),
+            next: ActionControl::new(
+                "obs-logs-older",
+                if window.loading_older {
+                    "Loading…"
+                } else {
+                    "↓ Load Older"
+                },
+                "obs-logs-older",
+            )
+            .disabled(!window.has_older || window.loading_older),
+        })
+    } else {
+        None
+    };
+
     LogViewer {
         id: "obs-logs-viewer".into(),
-        title: "Distributed OpenTelemetry Logs".into(),
+        title,
         font_alias: Some("MuCRT".into()),
         wrap: true,
         stream_id: Some("otel-logs".into()),
         entries,
-        controls: vec![],
-        pagination: None,
+        controls,
+        pagination,
     }
 }
 
@@ -5948,5 +6069,72 @@ mod tests {
                 "{visible_area:?} must include repo_selector"
             );
         }
+    }
+
+    #[test]
+    fn obs_logs_viewer_preserves_server_matches_window_line_numbers_anchors_and_pagination() {
+        let mut st = ConsoleState::new();
+        st.init_from_env("#/observability/logs?filter=worker-riscv64", "", None);
+        st.pending_filter_at_ms = None;
+
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec!["system:dashboard.read".into(), "obs:logs.read".into()],
+                ..AuthState::default()
+            },
+            observe: mu_console_protocol::ObserveView {
+                logs: vec![OtelLogEntry {
+                    timestamp_ms: 1_794_000_000_500,
+                    severity: LogSeverity::Warn,
+                    service: "actionrunner-rs".into(),
+                    trace_id: "tr-srv-1".into(),
+                    span_id: Some("sp-worker-riscv64".into()),
+                    message: "Heartbeat tick".into(),
+                }],
+                log_window: mu_console_protocol::ObsLogWindowMeta {
+                    window_start_index: 500,
+                    cached_total: 1_200,
+                    total_matched: Some(3_450),
+                    has_older: true,
+                    has_newer: true,
+                    loading_older: false,
+                    loading_newer: false,
+                    search_active: true,
+                    pending_live_count: 4,
+                },
+                ..mu_console_protocol::ObserveView::default()
+            },
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(vm)).expect("encode vm"));
+
+        let scene = build_console_scene(&st, SceneViewport::DESKTOP);
+        let sec = scene
+            .sections
+            .iter()
+            .find(|s| s.id == "sec-observe")
+            .expect("sec-observe");
+        let SceneComponent::LogViewer(viewer) = &sec.components[0] else {
+            panic!("expected LogViewer");
+        };
+
+        // Server-returned hit must NOT be dropped even though `worker-riscv64` wasn't in message/service.
+        assert_eq!(viewer.entries.len(), 1);
+        assert_eq!(viewer.entries[0].line_no, Some(501));
+        assert!(viewer.entries[0].anchor_key.is_some());
+        assert!(viewer.title.contains("501"));
+        assert!(viewer.title.contains("3450"));
+        assert!(viewer
+            .controls
+            .iter()
+            .any(|c| c.control_id == "obs-logs-latest" && c.label == "↑ Latest (+4)"));
+        let pg = viewer.pagination.as_ref().expect("window pagination");
+        assert_eq!(pg.prev.control_id, "obs-logs-newer");
+        assert!(!pg.prev.disabled);
+        assert_eq!(pg.next.control_id, "obs-logs-older");
+        assert!(!pg.next.disabled);
+        assert_eq!(pg.total_items, Some(3_450));
     }
 }

@@ -367,10 +367,13 @@ mod tests {
         );
         let mut c = DataClient::new();
         c.on_frame(&frame(&DataEvent::Error(UiError::VersionMismatch {
-            expected: 9,
+            expected: PROTOCOL_VERSION + 1,
             found: PROTOCOL_VERSION,
         })));
-        assert_eq!(c.reload_required(), Some((9, PROTOCOL_VERSION)));
+        assert_eq!(
+            c.reload_required(),
+            Some((PROTOCOL_VERSION + 1, PROTOCOL_VERSION))
+        );
         assert!(reload_banner_text(2, 3).contains("Reload required"));
         assert!(matches!(c.on_frame(&[]), ClientUpdate::Error(_)));
     }

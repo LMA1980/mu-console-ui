@@ -39,6 +39,7 @@ input,select,textarea,.mu-input{font-family:var(--font-crt);font-size:16px;color
 :focus-visible{outline:2px solid var(--accent-neon-cyan);outline-offset:2px}
 .mu-scene-main{display:flex;flex-direction:column;gap:14px;flex:1 1 auto}
 .mu-scene-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:16px;align-items:start}
+.mu-section[data-full-width="true"],.mu-section[data-section-id^="sec-dash-"]{grid-column:1 / -1}
 .mu-section,.mu-card{background:var(--bg-panel);border:1px solid var(--border-wireframe);border-radius:6px;padding:14px;display:flex;flex-direction:column;gap:12px;box-sizing:border-box}
 .mu-card{background:var(--bg-screen)}
 .mu-card-bar,.mu-section-header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px}
@@ -51,6 +52,7 @@ input,select,textarea,.mu-input{font-family:var(--font-crt);font-size:16px;color
 .mu-table{width:100%;border-collapse:collapse;font-size:13px}
 .mu-table th,.mu-table td{padding:8px 10px;border-bottom:1px solid var(--border-wireframe);text-align:left;vertical-align:middle}
 .mu-log-lines{margin:0;padding:8px 10px;list-style:none;background:var(--bg-screen);border:1px solid var(--border-wireframe);border-radius:4px;font-size:12.5px;overflow-x:auto}
+.mu-log-viewer[data-component-id="obs-logs-viewer"] .mu-log-lines{max-height:clamp(360px,68dvh,820px);overflow-y:auto;overscroll-behavior:contain}
 .mu-log-line{display:flex;flex-wrap:wrap;gap:8px;padding:3px 0}
 .mu-log-viewer[data-wrap="true"] .mu-log-text{white-space:pre-wrap;word-break:break-word}
 .mu-log-viewer[data-wrap="false"] .mu-log-text{white-space:pre}
