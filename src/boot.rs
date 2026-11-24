@@ -43,6 +43,7 @@ thread_local! {
     static LAST_SHELL_AUTH: RefCell<Option<(AuthStatus, bool, bool)>> = const { RefCell::new(None) };
     static POINTER_DOWN_AT_MS: RefCell<Option<u64>> = const { RefCell::new(None) };
     static DEFERRED_REPAINT: Cell<bool> = const { Cell::new(false) };
+    static LAST_OBS_SCROLL_TRIGGER_MS: Cell<u64> = const { Cell::new(0) };
 }
 
 fn now_ms() -> u64 {
@@ -100,7 +101,17 @@ fn sync_browser_state(st: &mut ConsoleState) {
     let desired_hash = format_hash(&st.route);
     let current_hash = win.location().hash().unwrap_or_default();
     if st.route_sync_dirty || current_hash != desired_hash {
-        let _ = win.location().set_hash(&desired_hash);
+        let replaced = win
+            .history()
+            .ok()
+            .and_then(|h| {
+                h.replace_state_with_url(&JsValue::NULL, "", Some(&desired_hash))
+                    .ok()
+            })
+            .is_some();
+        if !replaced {
+            let _ = win.location().set_hash(&desired_hash);
+        }
         st.route_sync_dirty = false;
     }
 
@@ -261,6 +272,59 @@ fn repaint_lease_timers(st: &ConsoleState) {
     }
 }
 
+fn obs_log_lines_element(doc: &web_sys::Document) -> Option<Element> {
+    doc.query_selector(".mu-log-viewer[data-component-id=\"obs-logs-viewer\"] .mu-log-lines")
+        .ok()
+        .flatten()
+}
+
+fn capture_obs_log_anchor(doc: &web_sys::Document) -> Option<(i32, Option<(String, f64)>)> {
+    let el = obs_log_lines_element(doc)?;
+    let prev_scroll = el.scroll_top();
+    let container_top = el.get_bounding_client_rect().top();
+    let mut child = el.first_element_child();
+    let mut anchor = None;
+    while let Some(li) = child {
+        if let Some(key) = li.get_attribute("data-log-key") {
+            let offset = li.get_bounding_client_rect().top() - container_top;
+            if offset >= -2.0 {
+                anchor = Some((key, offset));
+                break;
+            }
+        }
+        child = li.next_element_sibling();
+    }
+    Some((prev_scroll, anchor))
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn restore_obs_log_anchor(
+    doc: &web_sys::Document,
+    reset: bool,
+    snapshot: Option<(i32, Option<(String, f64)>)>,
+) {
+    let Some(el) = obs_log_lines_element(doc) else {
+        return;
+    };
+    if reset {
+        el.set_scroll_top(0);
+        return;
+    }
+    let Some((prev_scroll, anchor)) = snapshot else {
+        return;
+    };
+    if let Some((ref key, prev_offset)) = anchor {
+        if let Ok(Some(matched)) = el.query_selector(&format!("li[data-log-key=\"{key}\"]")) {
+            let container_top = el.get_bounding_client_rect().top();
+            let new_offset = matched.get_bounding_client_rect().top() - container_top;
+            let delta = (new_offset - prev_offset).round() as i32;
+            el.set_scroll_top((el.scroll_top() + delta).max(0));
+            return;
+        }
+    }
+    el.set_scroll_top(prev_scroll.max(0));
+}
+
 fn repaint(st: &ConsoleState) {
     let Some(win) = web_sys::window() else {
         return;
@@ -308,7 +372,10 @@ fn repaint(st: &ConsoleState) {
             }
         });
         if content_changed {
+            let obs_anchor = capture_obs_log_anchor(&doc);
+            let reset_scroll = st.reset_obs_log_scroll.replace(false);
             dash.set_inner_html(&rendered);
+            restore_obs_log_anchor(&doc, reset_scroll, obs_anchor);
             restore_focus(&doc, focus_snapshot);
         }
 
@@ -398,7 +465,10 @@ fn repaint(st: &ConsoleState) {
             } else {
                 let _ = input.remove_attribute("aria-disabled");
             }
-            if input.value() != st.filter_query {
+            let is_filter_focused = doc
+                .active_element()
+                .is_some_and(|el| el.id() == "muconsole-filter");
+            if !is_filter_focused && input.value() != st.filter_query {
                 input.set_value(&st.filter_query);
             }
         }
@@ -1595,6 +1665,62 @@ pub fn start() {
             let _ =
                 doc.add_event_listener_with_callback("wheel", on_wheel.as_ref().unchecked_ref());
             on_wheel.forget();
+        }
+
+        // Capture-phase scroll listener on OBS > Logs viewport for bidirectional infinite scrolling.
+        {
+            let state_for_scroll = Rc::clone(&state);
+            let worker_for_scroll = worker.clone();
+            let on_scroll = Closure::<dyn FnMut(Event)>::new(move |ev: Event| {
+                let Some(target) = ev.target().and_then(|t| t.dyn_into::<Element>().ok()) else {
+                    return;
+                };
+                let is_obs_log_lines = target
+                    .get_attribute("class")
+                    .is_some_and(|c| c.split_whitespace().any(|t| t == "mu-log-lines"))
+                    && target
+                        .closest(".mu-log-viewer[data-component-id='obs-logs-viewer']")
+                        .ok()
+                        .flatten()
+                        .is_some();
+                if !is_obs_log_lines {
+                    return;
+                }
+                let now = now_ms();
+                let ready =
+                    LAST_OBS_SCROLL_TRIGGER_MS.with(|slot| now.saturating_sub(slot.get()) >= 150);
+                if !ready {
+                    return;
+                }
+                let st = state_for_scroll.borrow();
+                let Some(window_meta) = st.client.view().map(|v| &v.observe.log_window) else {
+                    return;
+                };
+                let scroll_top = target.scroll_top();
+                let client_height = target.client_height();
+                let scroll_height = target.scroll_height();
+                if scroll_height > client_height
+                    && scroll_top + client_height >= scroll_height.saturating_sub(160)
+                    && window_meta.has_older
+                    && !window_meta.loading_older
+                {
+                    LAST_OBS_SCROLL_TRIGGER_MS.with(|slot| slot.set(now));
+                    send(&worker_for_scroll, &UiCommand::LoadOlderObsLogs);
+                } else if scroll_top <= 160
+                    && window_meta.has_newer
+                    && !window_meta.loading_newer
+                    && window_meta.window_start_index > 0
+                {
+                    LAST_OBS_SCROLL_TRIGGER_MS.with(|slot| slot.set(now));
+                    send(&worker_for_scroll, &UiCommand::LoadNewerObsLogs);
+                }
+            });
+            let _ = doc.add_event_listener_with_callback_and_bool(
+                "scroll",
+                on_scroll.as_ref().unchecked_ref(),
+                true,
+            );
+            on_scroll.forget();
         }
 
         // Tab visibility throttling.

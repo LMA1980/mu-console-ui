@@ -456,6 +456,7 @@ pub struct ConsoleState {
     pub obs_service_filter: Option<String>,
     pub rendered_ci_log_page: Cell<u32>,
     pub rendered_obs_log_page: Cell<u32>,
+    pub reset_obs_log_scroll: Cell<bool>,
     pub aria_polite: String,
     pub aria_assertive: String,
     pub pending_invite: Option<String>,
@@ -531,6 +532,7 @@ impl ConsoleState {
             obs_service_filter: None,
             rendered_ci_log_page: Cell::new(0),
             rendered_obs_log_page: Cell::new(0),
+            reset_obs_log_scroll: Cell::new(false),
             aria_polite: String::new(),
             aria_assertive: String::new(),
             pending_invite: None,
@@ -600,9 +602,7 @@ impl ConsoleState {
         self.has_explicit_hash = has_explicit_route(hash);
         let parsed = parse_hash(hash);
         self.route = parsed;
-        if let Some(q) = self.route.filter.as_deref() {
-            self.filter_query = q.to_owned();
-        }
+        self.filter_query = self.route.filter.clone().unwrap_or_default();
         if let Some(t) = self.route.trace_id.as_deref() {
             self.selected_trace_id = Some(t.to_owned());
         }
@@ -1362,6 +1362,12 @@ impl ConsoleState {
         };
         self.carousel_page = 0;
         self.subview_page = 0;
+        if matches!(
+            self.route.subview,
+            SubView::Observability(mu_console_protocol::ObservabilitySubView::Logs)
+        ) {
+            self.reset_obs_log_scroll.set(true);
+        }
         self.pending_filter_at_ms = Some(now_ms.saturating_add(FILTER_SETTLE_MS));
     }
 
@@ -2073,6 +2079,12 @@ impl ConsoleState {
                 self.follow_log = false;
                 self.log_page = self.log_page.saturating_add(1);
                 Vec::new()
+            }
+            "obs-logs-older" => vec![UiCommand::LoadOlderObsLogs],
+            "obs-logs-newer" => vec![UiCommand::LoadNewerObsLogs],
+            "obs-logs-latest" => {
+                self.reset_obs_log_scroll.set(true);
+                vec![UiCommand::JumpToLatestObsLogs]
             }
             "ci-job-detail-screen:prev" => {
                 self.follow_log = false;
@@ -3268,5 +3280,27 @@ mod tests {
         assert_eq!(st.on_key("Escape", false, 6_050), None);
         assert!(st.filter_query.is_empty());
         assert_eq!(st.pending_filter_at_ms, None);
+
+        // apply_hash without filter= must clear stale filter_query.
+        st.set_filter_query("stale_term", 7_000);
+        st.apply_hash("#/observability/logs");
+        assert!(st.filter_query.is_empty());
+        assert_eq!(st.route.filter, None);
+
+        // OBS log window navigation controls emit paging UiCommands and reset scroll on Latest.
+        assert_eq!(
+            st.activate_target("obs-logs-older"),
+            vec![UiCommand::LoadOlderObsLogs]
+        );
+        assert_eq!(
+            st.activate_target("obs-logs-newer"),
+            vec![UiCommand::LoadNewerObsLogs]
+        );
+        st.reset_obs_log_scroll.set(false);
+        assert_eq!(
+            st.activate_target("obs-logs-latest"),
+            vec![UiCommand::JumpToLatestObsLogs]
+        );
+        assert!(st.reset_obs_log_scroll.get());
     }
 }
