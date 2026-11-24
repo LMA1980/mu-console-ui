@@ -7,7 +7,7 @@
 //! [`ConsoleState::effective_skin`].
 
 use crate::copy;
-use crate::scene::{build_console_scene, build_dialog_model};
+use crate::scene::{build_console_scene_for_skin, build_dialog_model};
 use crate::state::ConsoleState;
 use mu_console_layout::{SafeArea, Viewport};
 use mu_console_protocol::{
@@ -70,7 +70,7 @@ pub fn render_console(state: &ConsoleState, vp: Viewport, _safe: SafeArea) -> St
 #[must_use]
 pub fn render_console_with_skin(skin: ConsoleSkin, state: &ConsoleState, vp: Viewport) -> String {
     let scene_vp = SceneViewport::new(vp.width, vp.height);
-    let scene = build_console_scene(state, scene_vp);
+    let scene = build_console_scene_for_skin(skin, state, scene_vp);
     let dialog = build_dialog_model(state);
     match skin {
         ConsoleSkin::Wireframe => {

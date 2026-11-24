@@ -7,9 +7,10 @@ use std::cell::Cell;
 use mu_console_layout::{scorecard_page_capacity, SafeArea, Viewport};
 use mu_console_protocol::{
     AbDeploySubView, Area, AuthState, AuthStatus, CiJobSummary, CiSubView, ConsoleSkin, CrtFont,
-    DialogModel, LogSeverity, MaintenanceMode, PackageEcosystem, PasskeyEnrollmentGateModel,
-    RepoId, RepoScore, RepoStatus, RiskConfirmAction, RiskConfirmDialogModel, Route,
-    SessionRoleDescriptor, SessionRolesDialogModel, SubView, SubmoduleId, SubsystemId, UiCommand,
+    DialogModel, LogSeverity, MaintenanceMode, ObsLogWindowMeta, ObservabilitySubView,
+    OtelLogEntry, PackageEcosystem, PasskeyEnrollmentGateModel, RepoId, RepoScore, RepoStatus,
+    RiskConfirmAction, RiskConfirmDialogModel, Route, SessionRoleDescriptor,
+    SessionRolesDialogModel, SubView, SubmoduleId, SubsystemId, UiCommand, UiError,
     UserProfileDialogModel, UserProfileTab, ViewModel, Visibility,
 };
 use mu_console_theme::metrics::{CrtFontMetrics, HURMIT, OPEN_DYSLEXIC};
@@ -127,6 +128,9 @@ impl Default for PlatformFormState {
         }
     }
 }
+
+/// Number of log entries displayed per sub-page in [`ConsoleSkin::Wireframe`].
+pub const WF_OBS_LOGS_PAGE_SIZE: usize = 32;
 
 const fn subview_uses_server_filter(subview: SubView) -> bool {
     matches!(
@@ -432,6 +436,7 @@ pub struct ConsoleState {
     pub filter_focused: bool,
     pub pending_select_at_ms: Option<u64>,
     pub pending_filter_at_ms: Option<u64>,
+    pub awaiting_obs_search_reply: bool,
     pub phone_rotary_open: bool,
     pub carousel_page: u32,
     pub yard_page: u32,
@@ -457,6 +462,8 @@ pub struct ConsoleState {
     pub rendered_ci_log_page: Cell<u32>,
     pub rendered_obs_log_page: Cell<u32>,
     pub reset_obs_log_scroll: Cell<bool>,
+    pub replace_hash_only: Cell<bool>,
+    pub force_filter_input_sync: Cell<bool>,
     pub aria_polite: String,
     pub aria_assertive: String,
     pub pending_invite: Option<String>,
@@ -480,6 +487,10 @@ pub struct ConsoleState {
     prev_lease_ids: Vec<String>,
     last_lease_tick_ms: u64,
     last_activity_at_ms: u64,
+    worker_error_announced: bool,
+    obs_jump_to_latest_pending: bool,
+    prev_obs_window_start: Option<u32>,
+    prev_obs_search_active: bool,
 }
 
 impl Default for ConsoleState {
@@ -508,6 +519,7 @@ impl ConsoleState {
             filter_focused: false,
             pending_select_at_ms: None,
             pending_filter_at_ms: None,
+            awaiting_obs_search_reply: false,
             phone_rotary_open: false,
             carousel_page: 0,
             yard_page: 0,
@@ -533,6 +545,8 @@ impl ConsoleState {
             rendered_ci_log_page: Cell::new(0),
             rendered_obs_log_page: Cell::new(0),
             reset_obs_log_scroll: Cell::new(false),
+            replace_hash_only: Cell::new(false),
+            force_filter_input_sync: Cell::new(false),
             aria_polite: String::new(),
             aria_assertive: String::new(),
             pending_invite: None,
@@ -556,6 +570,10 @@ impl ConsoleState {
             prev_lease_ids: Vec::new(),
             last_lease_tick_ms: 0,
             last_activity_at_ms: 0,
+            worker_error_announced: false,
+            obs_jump_to_latest_pending: false,
+            prev_obs_window_start: None,
+            prev_obs_search_active: false,
         }
     }
 
@@ -603,6 +621,18 @@ impl ConsoleState {
         let parsed = parse_hash(hash);
         self.route = parsed;
         self.filter_query = self.route.filter.clone().unwrap_or_default();
+        self.pending_filter_at_ms = None;
+        self.awaiting_obs_search_reply = false;
+        self.force_filter_input_sync.set(true);
+        self.replace_hash_only.set(true);
+        self.subview_page = 0;
+        self.prev_obs_window_start = None;
+        if matches!(
+            self.route.subview,
+            SubView::Observability(ObservabilitySubView::Logs)
+        ) {
+            self.reset_obs_log_scroll.set(true);
+        }
         if let Some(t) = self.route.trace_id.as_deref() {
             self.selected_trace_id = Some(t.to_owned());
         }
@@ -983,12 +1013,24 @@ impl ConsoleState {
     /// Apply decoded postcard frame from the data worker and handle auth/expiry route transitions.
     pub fn on_worker_frame(&mut self, frame: &[u8]) -> ClientUpdate {
         let update = self.client.on_frame(frame);
-        match update {
+        match &update {
             ClientUpdate::View | ClientUpdate::ReloadRequired { .. } => {
+                self.awaiting_obs_search_reply = false;
+                if matches!(&update, ClientUpdate::View) && self.worker_error_announced {
+                    self.aria_assertive.clear();
+                    self.worker_error_announced = false;
+                }
                 self.sync_from_view_model();
             }
             ClientUpdate::LeaseTimers => {
                 self.sync_lease_timers_from_view_model();
+            }
+            ClientUpdate::Error(err) => {
+                self.awaiting_obs_search_reply = false;
+                if self.auth().status == AuthStatus::Active {
+                    self.aria_assertive = format_worker_error(err);
+                    self.worker_error_announced = true;
+                }
             }
             _ => {}
         }
@@ -1104,10 +1146,49 @@ impl ConsoleState {
             self.route_sync_dirty = true;
         }
 
+        let obs_start = view.observe.log_window.window_start_index;
+        let obs_len = view.observe.logs.len();
+        let obs_search = view.observe.log_window.search_active;
+        let obs_head_changed = obs_len > 0 && self.prev_obs_window_start.is_some();
+
         self.prev_auth_status = next_status;
         self.prev_github_login.clone_from(&view.auth.github_login);
         self.prev_lease_ids = next_lease_ids;
         self.sync_rotary_from_route();
+
+        let is_obs_logs = matches!(
+            self.route.subview,
+            SubView::Observability(ObservabilitySubView::Logs)
+        );
+        if self.obs_jump_to_latest_pending {
+            self.subview_page = 0;
+            self.obs_jump_to_latest_pending = false;
+        } else if obs_head_changed
+            && is_obs_logs
+            && self.effective_skin() == ConsoleSkin::Wireframe
+            && self.prev_obs_search_active == obs_search
+        {
+            if let Some(prev_start) = self.prev_obs_window_start {
+                let page_sz = u32::try_from(WF_OBS_LOGS_PAGE_SIZE).unwrap_or(32);
+                if obs_start > prev_start && (obs_start - prev_start) >= page_sz {
+                    let delta = obs_start - prev_start;
+                    let cur_end = self
+                        .subview_page
+                        .saturating_mul(page_sz)
+                        .saturating_add(page_sz);
+                    self.subview_page = cur_end.saturating_sub(delta) / page_sz;
+                } else if obs_start < prev_start && (prev_start - obs_start) >= page_sz {
+                    let delta = prev_start - obs_start;
+                    let shifted_start = self
+                        .subview_page
+                        .saturating_mul(page_sz)
+                        .saturating_add(delta);
+                    self.subview_page = shifted_start.saturating_sub(page_sz) / page_sz;
+                }
+            }
+        }
+        self.prev_obs_window_start = (obs_len > 0).then_some(obs_start);
+        self.prev_obs_search_active = obs_search;
     }
 
     /// Return filtered repositories obeying public-only boundary unless private read policy held.
@@ -1278,6 +1359,7 @@ impl ConsoleState {
         self.route.submodule = None;
         self.route.branch = None;
         self.route.job = None;
+        self.replace_hash_only.set(false);
         self.pending_select_at_ms = Some(now_ms.saturating_add(ROTARY_SETTLE_MS));
     }
 
@@ -1299,6 +1381,7 @@ impl ConsoleState {
                 path: s.path.clone(),
             })
         };
+        self.replace_hash_only.set(false);
         self.pending_select_at_ms = Some(now_ms.saturating_add(ROTARY_SETTLE_MS));
     }
 
@@ -1321,6 +1404,7 @@ impl ConsoleState {
 
     /// Cycle service filter inside `Observability`.
     pub fn rotate_obs_service(&mut self, delta: isize) {
+        self.subview_page = 0;
         let services = self.observed_services();
         if services.is_empty() {
             self.obs_service_filter = None;
@@ -1362,13 +1446,80 @@ impl ConsoleState {
         };
         self.carousel_page = 0;
         self.subview_page = 0;
+        self.prev_obs_window_start = None;
+        self.replace_hash_only.set(true);
         if matches!(
             self.route.subview,
-            SubView::Observability(mu_console_protocol::ObservabilitySubView::Logs)
+            SubView::Observability(ObservabilitySubView::Logs)
         ) {
             self.reset_obs_log_scroll.set(true);
         }
         self.pending_filter_at_ms = Some(now_ms.saturating_add(FILTER_SETTLE_MS));
+    }
+
+    /// Flush any pending `#muconsole-filter` server query immediately (`Enter` or debounce settle).
+    pub fn submit_filter_now(&mut self) -> Option<UiCommand> {
+        self.pending_filter_at_ms = None;
+        if !subview_uses_server_filter(self.route.subview) {
+            self.awaiting_obs_search_reply = false;
+            return None;
+        }
+        self.awaiting_obs_search_reply = matches!(
+            self.route.subview,
+            SubView::Observability(ObservabilitySubView::Logs)
+        ) && !self.filter_query.trim().is_empty();
+        Some(UiCommand::Subscribe(self.route.clone()))
+    }
+
+    pub(crate) fn obs_log_apply_client_query(&self, window: &ObsLogWindowMeta) -> bool {
+        !self.filter_query.trim().is_empty()
+            && (!window.search_active
+                || self.pending_filter_at_ms.is_some()
+                || self.awaiting_obs_search_reply)
+    }
+
+    pub(crate) fn obs_log_matches_filters(
+        &self,
+        entry: &OtelLogEntry,
+        apply_client_query: bool,
+    ) -> bool {
+        if self
+            .log_severity_filter
+            .is_some_and(|sev| entry.severity != sev)
+        {
+            return false;
+        }
+        if let Some(svc) = self.obs_service_filter.as_deref() {
+            if !service_filter_matches(svc, &entry.service) {
+                return false;
+            }
+        }
+        if !apply_client_query {
+            return true;
+        }
+        let sev = match entry.severity {
+            LogSeverity::Info => "info",
+            LogSeverity::Warn => "warn",
+            LogSeverity::Error => "error",
+        };
+        let span = entry.span_id.as_deref().unwrap_or("");
+        let hay = format!(
+            "{} {} {} {} {}",
+            entry.service, sev, entry.trace_id, span, entry.message
+        );
+        service_filter_matches(&self.filter_query, &hay)
+    }
+
+    pub(crate) fn obs_log_filtered_count(&self) -> usize {
+        let Some(v) = self.client.view() else {
+            return 0;
+        };
+        let apply_client_query = self.obs_log_apply_client_query(&v.observe.log_window);
+        v.observe
+            .logs
+            .iter()
+            .filter(|l| self.obs_log_matches_filters(l, apply_client_query))
+            .count()
     }
 
     /// Switch to an area only if active session holds minimal access (`disabled` rule).
@@ -1391,7 +1542,12 @@ impl ConsoleState {
         self.route.subview = sub;
         self.has_explicit_hash = true;
         self.route_sync_dirty = true;
+        self.replace_hash_only.set(false);
         self.subview_page = 0;
+        self.prev_obs_window_start = None;
+        if !matches!(sub, SubView::Observability(ObservabilitySubView::Logs)) {
+            self.awaiting_obs_search_reply = false;
+        }
         self.aria_polite = copy::announce_route(area, sub.label());
         self.subview_nav_command(sub)
     }
@@ -1406,7 +1562,12 @@ impl ConsoleState {
         self.route.subview = subview;
         self.has_explicit_hash = true;
         self.route_sync_dirty = true;
+        self.replace_hash_only.set(false);
         self.subview_page = 0;
+        self.prev_obs_window_start = None;
+        if !matches!(subview, SubView::Observability(ObservabilitySubView::Logs)) {
+            self.awaiting_obs_search_reply = false;
+        }
         self.aria_polite = copy::announce_route(subview.area(), subview.label());
         vec![self.subview_nav_command(subview)]
     }
@@ -1712,6 +1873,7 @@ impl ConsoleState {
                     "error" => Some(LogSeverity::Error),
                     _ => None,
                 };
+                self.subview_page = 0;
                 Vec::new()
             }
             "data-action" | "data-control-id" => self.handle_control_id(attr_val, now_ms),
@@ -2080,9 +2242,37 @@ impl ConsoleState {
                 self.log_page = self.log_page.saturating_add(1);
                 Vec::new()
             }
-            "obs-logs-older" => vec![UiCommand::LoadOlderObsLogs],
-            "obs-logs-newer" => vec![UiCommand::LoadNewerObsLogs],
+            "obs-logs-older" => {
+                if self.effective_skin() == ConsoleSkin::Wireframe {
+                    let local_wf_pages = self
+                        .obs_log_filtered_count()
+                        .div_ceil(WF_OBS_LOGS_PAGE_SIZE)
+                        .max(1);
+                    let cur_page = (self.subview_page as usize).min(local_wf_pages - 1);
+                    if cur_page + 1 < local_wf_pages {
+                        self.subview_page = u32::try_from(cur_page + 1).unwrap_or(u32::MAX);
+                        return Vec::new();
+                    }
+                }
+                vec![UiCommand::LoadOlderObsLogs]
+            }
+            "obs-logs-newer" => {
+                if self.effective_skin() == ConsoleSkin::Wireframe {
+                    let local_wf_pages = self
+                        .obs_log_filtered_count()
+                        .div_ceil(WF_OBS_LOGS_PAGE_SIZE)
+                        .max(1);
+                    let cur_page = (self.subview_page as usize).min(local_wf_pages - 1);
+                    if cur_page > 0 {
+                        self.subview_page = u32::try_from(cur_page - 1).unwrap_or(0);
+                        return Vec::new();
+                    }
+                }
+                vec![UiCommand::LoadNewerObsLogs]
+            }
             "obs-logs-latest" => {
+                self.subview_page = 0;
+                self.obs_jump_to_latest_pending = true;
                 self.reset_obs_log_scroll.set(true);
                 vec![UiCommand::JumpToLatestObsLogs]
             }
@@ -2126,6 +2316,7 @@ impl ConsoleState {
             }
             "obs-service-clear" => {
                 self.obs_service_filter = None;
+                self.subview_page = 0;
                 Vec::new()
             }
             "platform-maint-apply" => self.open_platform_risk_confirm(
@@ -2374,6 +2565,19 @@ impl ConsoleState {
                 self.filter_query.clear();
                 self.route.filter = None;
                 self.pending_filter_at_ms = None;
+                self.awaiting_obs_search_reply = false;
+                if had_filter {
+                    self.replace_hash_only.set(true);
+                    self.force_filter_input_sync.set(true);
+                    self.subview_page = 0;
+                    self.prev_obs_window_start = None;
+                    if matches!(
+                        self.route.subview,
+                        SubView::Observability(ObservabilitySubView::Logs)
+                    ) {
+                        self.reset_obs_log_scroll.set(true);
+                    }
+                }
                 return if had_filter && subview_uses_server_filter(self.route.subview) {
                     Some(UiCommand::Subscribe(self.route.clone()))
                 } else {
@@ -2384,6 +2588,15 @@ impl ConsoleState {
             if self.can_access_subview(next.subview) {
                 self.route = next;
                 self.route_sync_dirty = true;
+                self.replace_hash_only.set(false);
+                self.subview_page = 0;
+                self.prev_obs_window_start = None;
+                if !matches!(
+                    self.route.subview,
+                    SubView::Observability(ObservabilitySubView::Logs)
+                ) {
+                    self.awaiting_obs_search_reply = false;
+                }
             }
             return None;
         }
@@ -2441,9 +2654,8 @@ impl ConsoleState {
 
         if let Some(due) = self.pending_filter_at_ms {
             if now_ms >= due {
-                self.pending_filter_at_ms = None;
-                if subview_uses_server_filter(self.route.subview) {
-                    cmds.push(UiCommand::Subscribe(self.route.clone()));
+                if let Some(cmd) = self.submit_filter_now() {
+                    cmds.push(cmd);
                 }
             }
         }
@@ -2468,6 +2680,41 @@ impl ConsoleState {
             }
         }
         cmds
+    }
+}
+
+fn format_worker_error(err: &UiError) -> String {
+    let raw = match err {
+        UiError::Http { status: 0, message } => {
+            if message.trim().is_empty() {
+                "Request failed: network error.".to_owned()
+            } else {
+                format!("Request failed (network error): {}", message.trim())
+            }
+        }
+        UiError::Http { status, message } => {
+            if message.trim().is_empty() {
+                format!("Request failed (HTTP {status}).")
+            } else {
+                format!("Request failed (HTTP {status}): {}", message.trim())
+            }
+        }
+        UiError::Decode(msg) => format!("Invalid server response: {}", msg.trim()),
+        UiError::AuthDenied(code) => {
+            format!("Access denied ({}).", copy::auth_reason_label(*code))
+        }
+        UiError::Stream(msg) => format!("Live stream interrupted: {}", msg.trim()),
+        UiError::UnknownScenario(s) => format!("Unknown scenario '{s}'; using live stream."),
+        UiError::VersionMismatch { expected, found } => {
+            format!("Reload required (protocol {found}, expected {expected}).")
+        }
+    };
+    if raw.chars().count() <= 160 {
+        raw
+    } else {
+        let mut out: String = raw.chars().take(159).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -3286,6 +3533,10 @@ mod tests {
         st.apply_hash("#/observability/logs");
         assert!(st.filter_query.is_empty());
         assert_eq!(st.route.filter, None);
+        assert_eq!(st.pending_filter_at_ms, None);
+        assert!(!st.awaiting_obs_search_reply);
+        assert!(st.force_filter_input_sync.get());
+        assert!(st.reset_obs_log_scroll.get());
 
         // OBS log window navigation controls emit paging UiCommands and reset scroll on Latest.
         assert_eq!(
@@ -3302,5 +3553,77 @@ mod tests {
             vec![UiCommand::JumpToLatestObsLogs]
         );
         assert!(st.reset_obs_log_scroll.get());
+    }
+
+    #[test]
+    fn submit_filter_now_escape_history_mode_and_active_error_announcements() {
+        use mu_console_protocol::{encode, DataEvent, ObservabilitySubView, UiError};
+
+        let mut st = ConsoleState::new();
+        let active_vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec!["system:dashboard.read".into(), "obs:logs.read".into()],
+                ..AuthState::default()
+            },
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(active_vm)).expect("encode vm"));
+
+        // Discrete route transition uses pushState (replace_hash_only = false).
+        let _ = st.select_subview(SubView::Observability(ObservabilitySubView::Logs));
+        assert!(!st.replace_hash_only.get());
+
+        // In-place typing sets replace_hash_only = true; submit_filter_now clears pending and awaits reply.
+        st.set_filter_query("muregist", 1_000);
+        assert!(st.replace_hash_only.get());
+        assert!(st.pending_filter_at_ms.is_some());
+        let cmd = st.submit_filter_now();
+        assert_eq!(st.pending_filter_at_ms, None);
+        assert!(st.awaiting_obs_search_reply);
+        assert!(matches!(
+            cmd,
+            Some(UiCommand::Subscribe(ref r)) if r.filter.as_deref() == Some("muregist")
+        ));
+
+        // Authenticated worker Error clears awaiting_obs_search_reply and announces via aria_assertive.
+        let err_frame = encode(&DataEvent::Error(UiError::Http {
+            status: 400,
+            message: "unsupported filter token".into(),
+        }))
+        .expect("encode err");
+        assert!(matches!(
+            st.on_worker_frame(&err_frame),
+            ClientUpdate::Error(_)
+        ));
+        assert!(!st.awaiting_obs_search_reply);
+        assert!(st.aria_assertive.contains("HTTP 400"));
+        assert!(st.aria_assertive.contains("unsupported filter token"));
+
+        // Subsequent View update clears the prior worker error announcement.
+        let ok_patch = encode(&DataEvent::Patch(Vec::new())).expect("encode patch");
+        assert_eq!(st.on_worker_frame(&ok_patch), ClientUpdate::View);
+        assert!(st.aria_assertive.is_empty());
+
+        // Escape clearing filter on Logs sets force_filter_input_sync and reset_obs_log_scroll.
+        st.set_filter_query("muregist", 2_000);
+        st.force_filter_input_sync.set(false);
+        st.reset_obs_log_scroll.set(false);
+        assert!(matches!(
+            st.on_key("Escape", false, 2_050),
+            Some(UiCommand::Subscribe(_))
+        ));
+        assert!(st.force_filter_input_sync.get());
+        assert!(st.reset_obs_log_scroll.get());
+
+        // Mouse-focused empty #muconsole-filter + Escape clears filter_focused without navigating up.
+        st.filter_focused = true;
+        assert_eq!(st.on_key("Escape", false, 2_100), None);
+        assert!(!st.filter_focused);
+        assert_eq!(
+            st.route.subview,
+            SubView::Observability(ObservabilitySubView::Logs)
+        );
     }
 }

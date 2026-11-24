@@ -10,15 +10,15 @@
 use crate::copy;
 pub use crate::copy::attention_obs_status_label;
 use crate::router::{self, can_access_subview};
-use crate::state::{service_filter_matches, ConsoleState, AREAS};
+use crate::state::{service_filter_matches, ConsoleState, AREAS, WF_OBS_LOGS_PAGE_SIZE};
 use mu_console_protocol::{
     AbDeploySubView, Area, AuthState, AuthStatus, CanaryBundleState, CdRunState, CdSubView,
-    CiJobSummary, CiSubView, CrtFont, DashboardSubView, DialogModel as ProtoDialogModel,
-    GateOutcome, LogSeverity, ModelRunnerSubView, ObsLogWindowMeta, ObservabilitySubView,
-    OtelLogEntry, PackageEcosystem, PlatformSubView, ProblemCategory, RepoStatus,
-    RepositorySubView, RiskConfirmAction, RoleActivationKind, RoleLeaseView, SloProblem, Slot,
-    SmartscapeLayer, StageState, StepUpRequirement, SubView, SubsystemHealthEntry, SubsystemId,
-    SubsystemStatus, TestState, UiError, Visibility,
+    CiJobSummary, CiSubView, ConsoleSkin, CrtFont, DashboardSubView,
+    DialogModel as ProtoDialogModel, GateOutcome, LogSeverity, ModelRunnerSubView,
+    ObsLogWindowMeta, ObservabilitySubView, OtelLogEntry, PackageEcosystem, PlatformSubView,
+    ProblemCategory, RepoStatus, RepositorySubView, RiskConfirmAction, RoleActivationKind,
+    RoleLeaseView, SloProblem, Slot, SmartscapeLayer, StageState, StepUpRequirement, SubView,
+    SubsystemHealthEntry, SubsystemId, SubsystemStatus, TestState, UiError, Visibility,
 };
 use mu_console_theme::scene::{
     self as theme_scene, ActionControl, ConsoleScene, GateChecklist, GateItem,
@@ -32,9 +32,19 @@ use mu_console_theme::scene::{
 use mu_console_theme::skin::{SemanticTone, SignalGlyph};
 use std::collections::{BTreeMap, HashSet};
 
-/// Build the complete [`ConsoleScene`] projection for `state` at `_viewport`.
+/// Build the complete [`ConsoleScene`] projection for `state` using `state.effective_skin()`.
 #[must_use]
-pub fn build_console_scene(state: &ConsoleState, _viewport: SceneViewport) -> ConsoleScene {
+pub fn build_console_scene(state: &ConsoleState, viewport: SceneViewport) -> ConsoleScene {
+    build_console_scene_for_skin(state.effective_skin(), state, viewport)
+}
+
+/// Build the complete [`ConsoleScene`] projection for `state` under an explicit [`ConsoleSkin`].
+#[must_use]
+pub fn build_console_scene_for_skin(
+    skin: ConsoleSkin,
+    state: &ConsoleState,
+    _viewport: SceneViewport,
+) -> ConsoleScene {
     let auth = state.auth();
     let mut scene = ConsoleScene::new(state.route.area.slug(), state.route.area.label());
     scene.active_subview = Some(state.route.subview.slug().to_owned());
@@ -284,7 +294,7 @@ pub fn build_console_scene(state: &ConsoleState, _viewport: SceneViewport) -> Co
         SubView::Cd(cd) => build_cd_sections(state, &auth, cd, &mut scene),
         SubView::AbDeploy(ab) => build_ab_sections(state, &auth, ab, &mut scene),
         SubView::Repository(repo) => build_repo_sections(state, &auth, repo, &mut scene),
-        SubView::Observability(obs) => build_observe_sections(state, obs, &mut scene),
+        SubView::Observability(obs) => build_observe_sections(state, obs, skin, &mut scene),
         SubView::ModelRunner(mr) => build_model_runner_sections(state, mr, &mut scene),
         SubView::Platform(plat) => build_platform_sections(state, &auth, plat, &mut scene),
     }
@@ -3469,6 +3479,7 @@ fn build_obs_smartscape_filter_bar(state: &ConsoleState) -> StatusMatrix {
 fn build_observe_sections(
     state: &ConsoleState,
     subview: ObservabilitySubView,
+    skin: ConsoleSkin,
     scene: &mut ConsoleScene,
 ) {
     let services = state.observed_services();
@@ -3489,9 +3500,9 @@ fn build_observe_sections(
     );
     sec = match subview {
         ObservabilitySubView::Metrics => build_obs_metrics_components(state, sec),
-        ObservabilitySubView::Logs => {
-            sec.with_component(SceneComponent::LogViewer(build_obs_logs_viewer(state)))
-        }
+        ObservabilitySubView::Logs => sec.with_component(SceneComponent::LogViewer(
+            build_obs_logs_viewer(state, skin),
+        )),
         ObservabilitySubView::PurePath => {
             sec.with_component(SceneComponent::TableGrid(build_obs_purepath_table(state)))
         }
@@ -3584,84 +3595,118 @@ fn build_observe_log_entries(
     logs: &[OtelLogEntry],
     window: &ObsLogWindowMeta,
 ) -> Vec<LogEntry> {
-    let apply_client_query = !state.filter_query.trim().is_empty()
-        && (!window.search_active || state.pending_filter_at_ms.is_some());
+    let apply_client_query = state.obs_log_apply_client_query(window);
+    let mut occ_counts: BTreeMap<String, u32> = BTreeMap::new();
     logs.iter()
-        .filter(|l| {
-            state
-                .log_severity_filter
-                .is_none_or(|sev| l.severity == sev)
-        })
-        .filter(|l| matches_obs_service(state.obs_service_filter.as_deref(), &l.service))
-        .filter(|l| {
-            if !apply_client_query {
-                return true;
-            }
-            let sev = match l.severity {
-                LogSeverity::Info => "info",
-                LogSeverity::Warn => "warn",
-                LogSeverity::Error => "error",
-            };
-            let span = l.span_id.as_deref().unwrap_or("");
-            let hay = format!(
-                "{} {} {} {} {}",
-                l.service, sev, l.trace_id, span, l.message
-            );
-            service_filter_matches(&state.filter_query, &hay)
-        })
         .enumerate()
-        .map(|(i, l)| {
+        .filter(|(_, l)| state.obs_log_matches_filters(l, apply_client_query))
+        .map(|(raw_idx, l)| {
             let level = match l.severity {
                 LogSeverity::Error => SemanticTone::Fail,
                 LogSeverity::Warn => SemanticTone::Warn,
                 LogSeverity::Info => SemanticTone::Info,
             };
+            let base = obs_log_anchor_key(l);
+            let occ = occ_counts.entry(base.clone()).or_insert(0);
+            let anchor = format!("{base}-{occ}");
+            *occ += 1;
             LogEntry {
-                line_no: u32::try_from(window.window_start_index as usize + i + 1).ok(),
+                line_no: u32::try_from(window.window_start_index as usize + raw_idx + 1).ok(),
                 timestamp: Some(l.timestamp_ms.to_string()),
                 level,
                 signal: None,
                 text: format!("[{}] {}", l.service, l.message),
                 trace_id: Some(l.trace_id.clone()),
-                anchor_key: Some(obs_log_anchor_key(l)),
+                anchor_key: Some(anchor),
                 action: None,
             }
         })
         .collect()
 }
 
-fn build_obs_logs_viewer(state: &ConsoleState) -> LogViewer {
-    let (entries, window) = state
+fn build_obs_logs_viewer(state: &ConsoleState, skin: ConsoleSkin) -> LogViewer {
+    let (all_entries, window, raw_len) = state
         .client
         .view()
         .map(|v| {
             let w = v.observe.log_window.clone();
-            (build_observe_log_entries(state, &v.observe.logs, &w), w)
+            (
+                build_observe_log_entries(state, &v.observe.logs, &w),
+                w,
+                v.observe.logs.len(),
+            )
         })
         .unwrap_or_default();
 
-    let count = entries.len();
-    let start_num = window.window_start_index as usize + 1;
-    let end_num = window.window_start_index as usize + count;
-    let title = if count == 0 {
-        if window.search_active {
+    let filtered_count = all_entries.len();
+    let client_subset = filtered_count < raw_len;
+    let (entries, wf_page, local_wf_pages, page_start, page_end) = if skin == ConsoleSkin::Wireframe
+    {
+        let local_pages = filtered_count.div_ceil(WF_OBS_LOGS_PAGE_SIZE).max(1);
+        let page = (state.subview_page as usize).min(local_pages - 1);
+        state
+            .rendered_obs_log_page
+            .set(u32::try_from(page).unwrap_or(0));
+        let start = page * WF_OBS_LOGS_PAGE_SIZE;
+        let end = (start + WF_OBS_LOGS_PAGE_SIZE).min(filtered_count);
+        (
+            all_entries[start..end].to_vec(),
+            page,
+            local_pages,
+            start,
+            end,
+        )
+    } else {
+        (all_entries, 0, 1, 0, filtered_count)
+    };
+
+    let client_filter_active = state.log_severity_filter.is_some()
+        || state.obs_service_filter.is_some()
+        || state.obs_log_apply_client_query(&window);
+    let title = if filtered_count == 0 {
+        if window.search_active || client_filter_active {
             "Distributed OpenTelemetry Logs (0 matching)".to_owned()
         } else {
             "Distributed OpenTelemetry Logs".to_owned()
         }
-    } else if let Some(total) = window.total_matched {
-        format!("Distributed OpenTelemetry Logs ({start_num}–{end_num} of {total})")
-    } else if window.cached_total as usize > count || window.window_start_index > 0 {
-        format!(
-            "Distributed OpenTelemetry Logs ({start_num}–{end_num} · {} cached)",
-            window.cached_total
-        )
+    } else if client_subset {
+        let win_start = window.window_start_index as usize + 1;
+        let win_end = window.window_start_index as usize + raw_len;
+        if skin == ConsoleSkin::Wireframe && local_wf_pages > 1 {
+            format!(
+                "Distributed OpenTelemetry Logs ({}–{} of {filtered_count} matched in window {win_start}–{win_end})",
+                page_start + 1,
+                page_end
+            )
+        } else {
+            format!(
+                "Distributed OpenTelemetry Logs ({filtered_count} matched in window {win_start}–{win_end})"
+            )
+        }
     } else {
-        format!("Distributed OpenTelemetry Logs ({count} entries)")
+        let start_num = window.window_start_index as usize + page_start + 1;
+        let end_num = window.window_start_index as usize + page_end;
+        if let Some(total) = window.total_matched {
+            format!("Distributed OpenTelemetry Logs ({start_num}–{end_num} of {total})")
+        } else if window.cached_total as usize > entries.len() || window.window_start_index > 0 {
+            format!(
+                "Distributed OpenTelemetry Logs ({start_num}–{end_num} · {} cached)",
+                window.cached_total
+            )
+        } else if skin == ConsoleSkin::Wireframe && local_wf_pages > 1 {
+            format!(
+                "Distributed OpenTelemetry Logs ({start_num}–{end_num} of {filtered_count} entries)"
+            )
+        } else {
+            format!("Distributed OpenTelemetry Logs ({filtered_count} entries)")
+        }
     };
 
     let mut controls = Vec::new();
-    if window.window_start_index > 0 || window.pending_live_count > 0 {
+    if window.window_start_index > 0
+        || window.pending_live_count > 0
+        || (skin == ConsoleSkin::Wireframe && wf_page > 0)
+    {
         let label = if window.pending_live_count > 0 {
             format!("↑ Latest (+{})", window.pending_live_count)
         } else {
@@ -3674,45 +3719,78 @@ fn build_obs_logs_viewer(state: &ConsoleState) -> LogViewer {
         ));
     }
 
+    let has_local_wf_paging = skin == ConsoleSkin::Wireframe && local_wf_pages > 1;
+    let newer_enabled = (skin == ConsoleSkin::Wireframe && wf_page > 0) || window.has_newer;
+    let older_enabled =
+        (skin == ConsoleSkin::Wireframe && (wf_page + 1) < local_wf_pages) || window.has_older;
     let pagination = if window.has_newer
         || window.has_older
         || window.loading_newer
         || window.loading_older
         || window.window_start_index > 0
+        || has_local_wf_paging
     {
-        let current_page = (window.window_start_index / 200) + 1;
-        let total_items = window
-            .total_matched
-            .and_then(|t| u32::try_from(t).ok())
-            .or((window.cached_total > 0).then_some(window.cached_total));
-        let estimated_pages = total_items.map_or(current_page, |t| t.div_ceil(200).max(1));
-        let total_pages = estimated_pages
-            .max(current_page + u32::from(window.has_older))
-            .max(1);
+        let (current_page, total_pages, total_items) = if skin == ConsoleSkin::Wireframe {
+            let page_sz = u32::try_from(WF_OBS_LOGS_PAGE_SIZE).unwrap_or(32);
+            let page_offset = if client_subset {
+                0
+            } else {
+                window.window_start_index.div_ceil(page_sz)
+            };
+            let cur = page_offset + u32::try_from(wf_page).unwrap_or(0) + 1;
+            let total_items = if client_subset {
+                u32::try_from(filtered_count).ok()
+            } else {
+                window
+                    .total_matched
+                    .and_then(|t| u32::try_from(t).ok())
+                    .or((window.cached_total > 0).then_some(window.cached_total))
+                    .or_else(|| u32::try_from(filtered_count).ok())
+            };
+            let est_pages = total_items.map_or(cur, |t| t.div_ceil(page_sz).max(1));
+            let local_end = page_offset + u32::try_from(local_wf_pages).unwrap_or(1);
+            let tot = est_pages
+                .max(local_end + u32::from(window.has_older))
+                .max(1);
+            (cur, tot, total_items)
+        } else {
+            let current_page = (window.window_start_index / 200) + 1;
+            let total_items = window
+                .total_matched
+                .and_then(|t| u32::try_from(t).ok())
+                .or((window.cached_total > 0).then_some(window.cached_total));
+            let estimated_pages = total_items.map_or(current_page, |t| t.div_ceil(200).max(1));
+            let total_pages = estimated_pages
+                .max(current_page + u32::from(window.has_older))
+                .max(1);
+            (current_page, total_pages, total_items)
+        };
+        let newer_loading = wf_page == 0 && window.loading_newer;
+        let older_loading = (wf_page + 1) >= local_wf_pages && window.loading_older;
         Some(Pagination {
             current_page,
             total_pages,
             total_items,
             prev: ActionControl::new(
                 "obs-logs-newer",
-                if window.loading_newer {
+                if newer_loading {
                     "Loading…"
                 } else {
                     "↑ Newer"
                 },
                 "obs-logs-newer",
             )
-            .disabled(!window.has_newer || window.loading_newer),
+            .disabled(!newer_enabled || newer_loading),
             next: ActionControl::new(
                 "obs-logs-older",
-                if window.loading_older {
+                if older_loading {
                     "Loading…"
                 } else {
                     "↓ Load Older"
                 },
                 "obs-logs-older",
             )
-            .disabled(!window.has_older || window.loading_older),
+            .disabled(!older_enabled || older_loading),
         })
     } else {
         None
@@ -4617,7 +4695,7 @@ mod tests {
     use super::*;
     use mu_console_protocol::{
         encode, CiJobSummary, DataEvent, FabricNode, ProblemCategory, RepoId, RepoScore,
-        SloProblem, ViewModel,
+        SloProblem, UiCommand, ViewModel,
     };
 
     #[test]
@@ -6136,5 +6214,198 @@ mod tests {
         assert_eq!(pg.next.control_id, "obs-logs-older");
         assert!(!pg.next.disabled);
         assert_eq!(pg.total_items, Some(3_450));
+    }
+
+    #[test]
+    fn obs_logs_anchor_uniqueness_prefilter_line_numbers_and_no_stale_flash() {
+        let mut st = ConsoleState::new();
+        st.init_from_env("#/observability/logs", "", None);
+
+        let dup = OtelLogEntry {
+            timestamp_ms: 1_794_000_000_700,
+            severity: LogSeverity::Info,
+            service: "muregist".into(),
+            trace_id: "tr-dup-1".into(),
+            span_id: Some("sp-dup".into()),
+            message: "identical burst line".into(),
+        };
+        let target_row = OtelLogEntry {
+            timestamp_ms: 1_794_000_000_699,
+            severity: LogSeverity::Error,
+            service: "mu-ci-controller".into(),
+            trace_id: "tr-err-1".into(),
+            span_id: Some("sp-err".into()),
+            message: "old-query-stale-row".into(),
+        };
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec!["system:dashboard.read".into(), "obs:logs.read".into()],
+                ..AuthState::default()
+            },
+            observe: mu_console_protocol::ObserveView {
+                logs: vec![dup.clone(), dup.clone(), dup, target_row],
+                log_window: mu_console_protocol::ObsLogWindowMeta {
+                    window_start_index: 200,
+                    cached_total: 800,
+                    search_active: true,
+                    ..mu_console_protocol::ObsLogWindowMeta::default()
+                },
+                ..mu_console_protocol::ObserveView::default()
+            },
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(vm)).expect("encode vm"));
+
+        let get_viewer = |state: &ConsoleState, skin: ConsoleSkin| -> LogViewer {
+            let scene = build_console_scene_for_skin(skin, state, SceneViewport::DESKTOP);
+            let sec = scene
+                .sections
+                .iter()
+                .find(|s| s.id == "sec-observe")
+                .expect("sec-observe");
+            let SceneComponent::LogViewer(viewer) = &sec.components[0] else {
+                panic!("expected LogViewer");
+            };
+            viewer.clone()
+        };
+
+        // Identical same-ms lines produce distinct per-occurrence anchor_keys (`-0`, `-1`, `-2`).
+        let all = get_viewer(&st, ConsoleSkin::Html);
+        assert_eq!(all.entries.len(), 4);
+        let keys: HashSet<&str> = all
+            .entries
+            .iter()
+            .filter_map(|e| e.anchor_key.as_deref())
+            .collect();
+        assert_eq!(keys.len(), 4);
+        assert_ne!(all.entries[0].anchor_key, all.entries[1].anchor_key);
+        assert_ne!(all.entries[1].anchor_key, all.entries[2].anchor_key);
+
+        // Client filter keeps true window line_no (200 + raw_idx 3 + 1 = 204) and accurate title.
+        st.log_severity_filter = Some(LogSeverity::Error);
+        let err_only = get_viewer(&st, ConsoleSkin::Html);
+        assert_eq!(err_only.entries.len(), 1);
+        assert_eq!(err_only.entries[0].line_no, Some(204));
+        assert!(err_only.title.contains("1 matched in window 201–204"));
+        st.log_severity_filter = None;
+
+        // Enter (`submit_filter_now`) while `window.search_active == true` keeps client query active
+        // until the worker replies, avoiding stale-row flashes.
+        st.set_filter_query("nonexistent-query", 1_000);
+        let cmd = st.submit_filter_now();
+        assert!(matches!(cmd, Some(UiCommand::Subscribe(_))));
+        assert_eq!(st.pending_filter_at_ms, None);
+        assert!(st.awaiting_obs_search_reply);
+        let in_flight = get_viewer(&st, ConsoleSkin::Html);
+        assert!(in_flight.entries.is_empty());
+        assert!(in_flight.title.contains("0 matching"));
+    }
+
+    #[test]
+    fn obs_logs_wireframe_subpaging_steps_32_line_pages_without_affecting_html() {
+        let mut st = ConsoleState::new();
+        st.init_from_env("#/observability/logs", "", None);
+        st.skin = ConsoleSkin::Wireframe;
+
+        let logs: Vec<OtelLogEntry> = (0..500_u64)
+            .map(|i| OtelLogEntry {
+                timestamp_ms: 1_794_000_500_000 - i,
+                severity: LogSeverity::Info,
+                service: "muregist".into(),
+                trace_id: format!("tr-wf-{i:03}"),
+                span_id: None,
+                message: format!("line-{i:03}"),
+            })
+            .collect();
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec!["system:dashboard.read".into(), "obs:logs.read".into()],
+                ..AuthState::default()
+            },
+            observe: mu_console_protocol::ObserveView {
+                logs,
+                log_window: mu_console_protocol::ObsLogWindowMeta {
+                    window_start_index: 0,
+                    cached_total: 1_200,
+                    has_older: true,
+                    has_newer: false,
+                    ..mu_console_protocol::ObsLogWindowMeta::default()
+                },
+                ..mu_console_protocol::ObserveView::default()
+            },
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(vm)).expect("encode vm"));
+
+        // HtmlCoreSkin renders the full 500-entry scrollable window.
+        let html_scene =
+            build_console_scene_for_skin(ConsoleSkin::Html, &st, SceneViewport::DESKTOP);
+        let SceneComponent::LogViewer(html_viewer) = &html_scene
+            .sections
+            .iter()
+            .find(|s| s.id == "sec-observe")
+            .expect("sec-observe")
+            .components[0]
+        else {
+            panic!("expected LogViewer");
+        };
+        assert_eq!(html_viewer.entries.len(), 500);
+
+        // WireframeSkin slices into 32-line sub-pages (16 total across 500 lines).
+        let wf_viewer = |state: &ConsoleState| -> LogViewer {
+            let sc =
+                build_console_scene_for_skin(ConsoleSkin::Wireframe, state, SceneViewport::DESKTOP);
+            let SceneComponent::LogViewer(v) = &sc
+                .sections
+                .iter()
+                .find(|s| s.id == "sec-observe")
+                .expect("sec-observe")
+                .components[0]
+            else {
+                panic!("expected LogViewer");
+            };
+            v.clone()
+        };
+
+        let p0 = wf_viewer(&st);
+        assert_eq!(p0.entries.len(), WF_OBS_LOGS_PAGE_SIZE);
+        assert_eq!(p0.entries[0].line_no, Some(1));
+        assert_eq!(p0.entries[31].line_no, Some(32));
+        let pg0 = p0.pagination.as_ref().expect("pagination");
+        assert!(pg0.prev.disabled);
+        assert!(!pg0.next.disabled);
+
+        // Local sub-page step emits no worker command until the 500-line boundary.
+        assert!(st.activate_target("obs-logs-older").is_empty());
+        assert_eq!(st.subview_page, 1);
+        let p1 = wf_viewer(&st);
+        assert_eq!(p1.entries[0].line_no, Some(33));
+        assert_eq!(p1.entries[31].line_no, Some(64));
+        let pg1 = p1.pagination.as_ref().expect("pagination");
+        assert!(!pg1.prev.disabled);
+        assert!(!pg1.next.disabled);
+
+        for _ in 0..14 {
+            assert!(st.activate_target("obs-logs-older").is_empty());
+        }
+        assert_eq!(st.subview_page, 15);
+        let p15 = wf_viewer(&st);
+        assert_eq!(p15.entries.len(), 20);
+        assert_eq!(p15.entries[0].line_no, Some(481));
+        assert_eq!(p15.entries[19].line_no, Some(500));
+        assert_eq!(
+            st.activate_target("obs-logs-older"),
+            vec![UiCommand::LoadOlderObsLogs]
+        );
+
+        assert_eq!(
+            st.activate_target("obs-logs-latest"),
+            vec![UiCommand::JumpToLatestObsLogs]
+        );
+        assert_eq!(st.subview_page, 0);
     }
 }
