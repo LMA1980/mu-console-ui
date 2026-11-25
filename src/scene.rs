@@ -290,7 +290,7 @@ pub fn build_console_scene_for_skin(
         SubView::Dashboard(DashboardSubView::Overview) => {
             build_dashboard_sections(state, &auth, &mut scene);
         }
-        SubView::Ci(ci) => build_ci_sections(state, &auth, ci, is_public_anon_ci, &mut scene),
+        SubView::Ci(ci) => build_ci_sections(skin, state, &auth, ci, is_public_anon_ci, &mut scene),
         SubView::Cd(cd) => build_cd_sections(state, &auth, cd, &mut scene),
         SubView::AbDeploy(ab) => build_ab_sections(state, &auth, ab, &mut scene),
         SubView::Repository(repo) => build_repo_sections(state, &auth, repo, &mut scene),
@@ -1817,7 +1817,10 @@ fn subsystem_permitted_detail(
     }
 }
 
+const WF_SCORECARDS_PAGE_SIZE: usize = 8;
+
 fn build_ci_sections(
+    skin: ConsoleSkin,
     state: &ConsoleState,
     auth: &AuthState,
     subview: CiSubView,
@@ -1830,18 +1833,32 @@ fn build_ci_sections(
     }
     match subview {
         CiSubView::QueueLogs => unreachable!(),
-        CiSubView::Scorecards => build_ci_scorecards(state, scene),
+        CiSubView::Scorecards => build_ci_scorecards(skin, state, scene),
         CiSubView::Trainway => build_ci_trainway(state, auth, scene),
         CiSubView::WorkerNodes => build_ci_worker_nodes(state, scene),
         CiSubView::SandboxProfiles => build_ci_sandboxes(state, scene),
     }
 }
 
-fn build_ci_scorecards(state: &ConsoleState, scene: &mut ConsoleScene) {
+fn build_ci_scorecards(skin: ConsoleSkin, state: &ConsoleState, scene: &mut ConsoleScene) {
     let ordered = state.ordered_carousel_repos();
     let jobs = state.visible_ci_jobs();
+    let active_repo = state.route.repo.as_ref().or_else(|| {
+        state
+            .client
+            .view()
+            .and_then(|v| v.selection.as_ref().map(|s| &s.repo))
+    });
+    let (start, limit) = match skin {
+        ConsoleSkin::Html => (0_usize, ordered.len()),
+        ConsoleSkin::Wireframe => {
+            let total_pages = ordered.len().div_ceil(WF_SCORECARDS_PAGE_SIZE).max(1);
+            let page = (state.carousel_page as usize).min(total_pages - 1);
+            (page * WF_SCORECARDS_PAGE_SIZE, WF_SCORECARDS_PAGE_SIZE)
+        }
+    };
     let mut sec = SceneSection::new("sec-ci-scorecards", "CI Scorecards Carousel");
-    for (idx, r) in ordered.iter().take(8).enumerate() {
+    for (idx, r) in ordered.iter().enumerate().skip(start).take(limit) {
         let tone = match r.status {
             RepoStatus::Passing => SemanticTone::Pass,
             RepoStatus::Running => SemanticTone::Info,
@@ -1852,6 +1869,7 @@ fn build_ci_scorecards(state: &ConsoleState, scene: &mut ConsoleScene) {
             .iter()
             .filter(|j| j.repo == r.id && !j.queue_state.eq_ignore_ascii_case("failed"))
             .count();
+        let is_selected = active_repo == Some(&r.id);
         sec = sec.with_component(SceneComponent::SparklineCard(SparklineCard {
             id: format!("ci-scorecard:{idx}"),
             title: format!("{}/{}", r.id.owner, r.id.repo),
@@ -1864,11 +1882,14 @@ fn build_ci_scorecards(state: &ConsoleState, scene: &mut ConsoleScene) {
             tone,
             samples: vec![60.0, 75.0, 82.0, f64::from(r.score)],
             range_label: Some(r.default_branch.clone()),
-            action: Some(ActionControl::new(
-                format!("repo-select:{idx}"),
-                "Select",
-                format!("repo-select:{idx}"),
-            )),
+            action: Some(
+                ActionControl::new(
+                    format!("repo-select:{idx}"),
+                    "Select",
+                    format!("repo-select:{idx}"),
+                )
+                .with_pressed(is_selected),
+            ),
         }));
     }
     if ordered.is_empty() && !state.filter_query.trim().is_empty() {
@@ -6407,5 +6428,111 @@ mod tests {
             vec![UiCommand::JumpToLatestObsLogs]
         );
         assert_eq!(st.subview_page, 0);
+    }
+
+    #[test]
+    fn ci_scorecards_render_full_catalog_in_html_and_align_repo_select_with_ordered_carousel() {
+        use mu_console_protocol::{RepoId, RepoScore};
+
+        let mut st = ConsoleState::new();
+        st.init_from_env("#/ci/scorecards", "", None);
+        st.skin = ConsoleSkin::Html;
+
+        let mut repos: Vec<RepoScore> = (0..12_usize)
+            .map(|i| {
+                let mut r = RepoScore::new(RepoId::new("LMA1980", &format!("repo-{i:02}")));
+                r.status = RepoStatus::Passing;
+                r.score = 95;
+                r
+            })
+            .collect();
+        // Place a failing repository late alphabetically so ordered_carousel_repos() promotes it
+        // ahead of filtered_repos()[0].
+        repos[10].status = RepoStatus::Failing;
+        repos[10].score = 40;
+
+        let vm = ViewModel {
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec![
+                    "system:dashboard.read".into(),
+                    "ci:queue.read".into(),
+                    "ci:jobs.read".into(),
+                    "ci:repos.public.read".into(),
+                ],
+                ..AuthState::default()
+            },
+            repos,
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(vm)).expect("encode vm"));
+
+        // HtmlCoreSkin renders all 12 scorecards; WireframeSkin slices 8 per carousel page.
+        let html_scene =
+            build_console_scene_for_skin(ConsoleSkin::Html, &st, SceneViewport::DESKTOP);
+        let html_sec = html_scene
+            .sections
+            .iter()
+            .find(|s| s.id == "sec-ci-scorecards")
+            .expect("sec-ci-scorecards");
+        assert_eq!(html_sec.components.len(), 12);
+
+        st.skin = ConsoleSkin::Wireframe;
+        let wf_p0 =
+            build_console_scene_for_skin(ConsoleSkin::Wireframe, &st, SceneViewport::DESKTOP);
+        assert_eq!(
+            wf_p0
+                .sections
+                .iter()
+                .find(|s| s.id == "sec-ci-scorecards")
+                .expect("sec-ci-scorecards")
+                .components
+                .len(),
+            8
+        );
+        st.carousel_page = 1;
+        let wf_p1 =
+            build_console_scene_for_skin(ConsoleSkin::Wireframe, &st, SceneViewport::DESKTOP);
+        assert_eq!(
+            wf_p1
+                .sections
+                .iter()
+                .find(|s| s.id == "sec-ci-scorecards")
+                .expect("sec-ci-scorecards")
+                .components
+                .len(),
+            4
+        );
+
+        // Activating repo-select:0 selects ordered_carousel_repos()[0] (the failing repo-10).
+        let ordered_first = st.ordered_carousel_repos()[0].id.clone();
+        assert_eq!(ordered_first, RepoId::new("LMA1980", "repo-10"));
+        let cmds = st.activate_target("repo-select:0");
+        assert_eq!(
+            cmds,
+            vec![UiCommand::SelectRepo {
+                repo: RepoId::new("LMA1980", "repo-10"),
+                submodule: None,
+            }]
+        );
+        assert_eq!(st.route.repo, Some(RepoId::new("LMA1980", "repo-10")));
+        assert_eq!(st.outer_index, 10);
+
+        let selected_scene =
+            build_console_scene_for_skin(ConsoleSkin::Html, &st, SceneViewport::DESKTOP);
+        let selected_sec = selected_scene
+            .sections
+            .iter()
+            .find(|s| s.id == "sec-ci-scorecards")
+            .expect("sec-ci-scorecards");
+        let SceneComponent::SparklineCard(first_card) = &selected_sec.components[0] else {
+            panic!("expected SparklineCard");
+        };
+        assert_eq!(first_card.title, "LMA1980/repo-10");
+        assert_eq!(
+            first_card.action.as_ref().and_then(|a| a.pressed),
+            Some(true)
+        );
     }
 }

@@ -2056,8 +2056,12 @@ impl ConsoleState {
         }
         if let Some(repo_idx_str) = id.strip_prefix("repo-select:") {
             if let Ok(idx) = repo_idx_str.parse::<usize>() {
-                if let Some(r) = self.filtered_repos().get(idx).cloned() {
-                    self.outer_index = idx;
+                if let Some(r) = self.ordered_carousel_repos().get(idx).cloned() {
+                    self.outer_index = self
+                        .filtered_repos()
+                        .iter()
+                        .position(|cand| cand.id == r.id)
+                        .unwrap_or(0);
                     self.inner_index = 0;
                     self.route.repo = Some(r.id.clone());
                     self.route.submodule = None;
