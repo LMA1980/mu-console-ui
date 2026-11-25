@@ -1327,3 +1327,79 @@ fn u26_dashboard_split_and_profile_session_roles_wireframe_zero_overflow() {
         assert_svg_zero_overflow(&svg, vw, vh, &format!("u26_session_roles_err_{vw}x{vh}"));
     }
 }
+
+#[test]
+fn u27_obs_logs_wireframe_500_line_subpaging_zero_overflow_and_unique_dom_anchors() {
+    use mu_console_protocol::{LogSeverity, ObsLogWindowMeta, OtelLogEntry};
+    use std::collections::HashSet;
+
+    let mut st = state_for_scenario(
+        Scenario::StageFailure,
+        SubView::Observability(ObservabilitySubView::Logs),
+        CrtFont::Hurmit,
+    );
+    let mut vm = st.client.view().cloned().expect("view");
+    vm.auth = full_active_auth("LMA1980");
+    vm.observe.logs = (0..500_u64)
+        .map(|i| {
+            let is_dup = i < 4;
+            OtelLogEntry {
+                timestamp_ms: if is_dup {
+                    1_794_000_500_000
+                } else {
+                    1_794_000_500_000 - i
+                },
+                severity: LogSeverity::Info,
+                service: "muregist".into(),
+                trace_id: if is_dup {
+                    "tr-dup-burst".into()
+                } else {
+                    format!("tr-u27-{i:03}")
+                },
+                span_id: Some("sp-u27".into()),
+                message: if is_dup {
+                    "duplicate burst entry".into()
+                } else {
+                    format!("obs-log-line-{i:03}")
+                },
+            }
+        })
+        .collect();
+    vm.observe.log_window = ObsLogWindowMeta {
+        window_start_index: 0,
+        cached_total: 1_200,
+        has_older: true,
+        has_newer: false,
+        ..ObsLogWindowMeta::default()
+    };
+    let snap = Engine::encode_event(&DataEvent::Snapshot(vm)).expect("encode");
+    st.on_worker_frame(&snap);
+    st.set_skin(ConsoleSkin::Wireframe);
+
+    // HtmlCoreSkin emits unique `data-log-key` for every `<li>`, including same-ms duplicates.
+    let html = render_console_with_skin(ConsoleSkin::Html, &st, Viewport::new(1512.0, 860.0));
+    let keys: Vec<&str> = html
+        .match_indices("data-log-key=\"")
+        .filter_map(|(idx, pat)| {
+            let rest = &html[idx + pat.len()..];
+            rest.find('"').map(|end| &rest[..end])
+        })
+        .collect();
+    assert_eq!(keys.len(), 500);
+    let unique_keys: HashSet<&str> = keys.iter().copied().collect();
+    assert_eq!(unique_keys.len(), 500);
+
+    // WireframeSkin 32-line sub-paging produces zero SVG overflow across all 6 viewports on page 0, 1, and 15.
+    for target_page in [0_u32, 1, 15] {
+        st.subview_page = target_page;
+        for &(vw, vh) in &VIEWPORTS {
+            let svg = render_console_with_skin(ConsoleSkin::Wireframe, &st, Viewport::new(vw, vh));
+            assert_svg_zero_overflow(
+                &svg,
+                vw,
+                vh,
+                &format!("u27_obs_logs_wf_p{target_page}_{vw}x{vh}"),
+            );
+        }
+    }
+}

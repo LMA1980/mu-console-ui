@@ -43,7 +43,7 @@ thread_local! {
     static LAST_SHELL_AUTH: RefCell<Option<(AuthStatus, bool, bool)>> = const { RefCell::new(None) };
     static POINTER_DOWN_AT_MS: RefCell<Option<u64>> = const { RefCell::new(None) };
     static DEFERRED_REPAINT: Cell<bool> = const { Cell::new(false) };
-    static LAST_OBS_SCROLL_TRIGGER_MS: Cell<u64> = const { Cell::new(0) };
+    static LAST_OBS_SCROLL_TRIGGER: Cell<(u64, u32, usize, i8)> = const { Cell::new((0, 0, 0, 0)) };
 }
 
 fn now_ms() -> u64 {
@@ -100,16 +100,21 @@ fn sync_browser_state(st: &mut ConsoleState) {
 
     let desired_hash = format_hash(&st.route);
     let current_hash = win.location().hash().unwrap_or_default();
+    let replace_only = st.replace_hash_only.replace(false);
     if st.route_sync_dirty || current_hash != desired_hash {
-        let replaced = win
+        let updated = win
             .history()
             .ok()
             .and_then(|h| {
-                h.replace_state_with_url(&JsValue::NULL, "", Some(&desired_hash))
-                    .ok()
+                if replace_only {
+                    h.replace_state_with_url(&JsValue::NULL, "", Some(&desired_hash))
+                } else {
+                    h.push_state_with_url(&JsValue::NULL, "", Some(&desired_hash))
+                }
+                .ok()
             })
             .is_some();
-        if !replaced {
+        if !updated {
             let _ = win.location().set_hash(&desired_hash);
         }
         st.route_sync_dirty = false;
@@ -278,9 +283,20 @@ fn obs_log_lines_element(doc: &web_sys::Document) -> Option<Element> {
         .flatten()
 }
 
-fn capture_obs_log_anchor(doc: &web_sys::Document) -> Option<(i32, Option<(String, f64)>)> {
+fn capture_obs_log_anchor(
+    doc: &web_sys::Document,
+    st: &ConsoleState,
+) -> Option<(i32, Option<(String, f64)>)> {
     let el = obs_log_lines_element(doc)?;
     let prev_scroll = el.scroll_top();
+    if prev_scroll <= 2
+        && st
+            .client
+            .view()
+            .is_some_and(|v| v.observe.log_window.window_start_index == 0)
+    {
+        return Some((0, None));
+    }
     let container_top = el.get_bounding_client_rect().top();
     let mut child = el.first_element_child();
     let mut anchor = None;
@@ -372,7 +388,7 @@ fn repaint(st: &ConsoleState) {
             }
         });
         if content_changed {
-            let obs_anchor = capture_obs_log_anchor(&doc);
+            let obs_anchor = capture_obs_log_anchor(&doc, st);
             let reset_scroll = st.reset_obs_log_scroll.replace(false);
             dash.set_inner_html(&rendered);
             restore_obs_log_anchor(&doc, reset_scroll, obs_anchor);
@@ -468,16 +484,22 @@ fn repaint(st: &ConsoleState) {
             let is_filter_focused = doc
                 .active_element()
                 .is_some_and(|el| el.id() == "muconsole-filter");
-            if !is_filter_focused && input.value() != st.filter_query {
+            if (st.force_filter_input_sync.replace(false) || !is_filter_focused)
+                && input.value() != st.filter_query
+            {
                 input.set_value(&st.filter_query);
             }
         }
     } else if let Some(body) = doc.body() {
+        let obs_anchor = capture_obs_log_anchor(&doc, st);
+        let reset_scroll = st.reset_obs_log_scroll.replace(false);
+        st.force_filter_input_sync.set(false);
         LAST_RENDER.with(|last| *last.borrow_mut() = rendered_key);
         let roles_key = strip_lease_timer_values(&st.format_header_roles_html());
         LAST_HEADER_ROLES_KEY.with(|last| *last.borrow_mut() = roles_key);
         let html = render_html_shell(&rendered, st);
         body.set_inner_html(&html);
+        restore_obs_log_anchor(&doc, reset_scroll, obs_anchor);
         if st.lazy_dyslexic_loaded {
             ensure_dyslexic_stylesheet(&doc);
         }
@@ -1377,11 +1399,11 @@ pub fn start() {
         on_resize.forget();
     }
 
-    // Window hashchange listener.
+    // Window hashchange + popstate listeners for URL hashes and Back/Forward history.
     {
         let state_for_hash = Rc::clone(&state);
         let worker_for_hash = worker.clone();
-        let on_hashchange = Closure::<dyn FnMut()>::new(move || {
+        let on_route_change = Closure::<dyn FnMut()>::new(move || {
             let Some(win) = web_sys::window() else {
                 return;
             };
@@ -1394,9 +1416,13 @@ pub fn start() {
                 repaint(&st);
             }
         });
+        let _ = window.add_event_listener_with_callback(
+            "hashchange",
+            on_route_change.as_ref().unchecked_ref(),
+        );
         let _ = window
-            .add_event_listener_with_callback("hashchange", on_hashchange.as_ref().unchecked_ref());
-        on_hashchange.forget();
+            .add_event_listener_with_callback("popstate", on_route_change.as_ref().unchecked_ref());
+        on_route_change.forget();
     }
 
     // Document DOM interactions.
@@ -1533,14 +1559,20 @@ pub fn start() {
                             repaint(&st);
                             return;
                         }
+                    } else if target_id == "muconsole-filter" {
+                        st.filter_focused = true;
                     }
                 }
 
                 if target_is_input && key != "Escape" {
                     if key == "Enter" && target_id == "muconsole-filter" {
+                        ev.prevent_default();
                         let mut st = state_for_key.borrow_mut();
-                        st.pending_filter_at_ms = None;
-                        send(&worker_for_key, &UiCommand::Subscribe(st.route.clone()));
+                        if let Some(cmd) = st.submit_filter_now() {
+                            send(&worker_for_key, &cmd);
+                        }
+                        sync_browser_state(&mut st);
+                        repaint(&st);
                     }
                     return;
                 }
@@ -1687,33 +1719,63 @@ pub fn start() {
                     return;
                 }
                 let now = now_ms();
-                let ready =
-                    LAST_OBS_SCROLL_TRIGGER_MS.with(|slot| now.saturating_sub(slot.get()) >= 150);
-                if !ready {
+                let (prev_ms, prev_start, prev_len, prev_dir) =
+                    LAST_OBS_SCROLL_TRIGGER.with(Cell::get);
+                if now.saturating_sub(prev_ms) < 150 {
                     return;
                 }
-                let st = state_for_scroll.borrow();
-                let Some(window_meta) = st.client.view().map(|v| &v.observe.log_window) else {
+                let mut st = state_for_scroll.borrow_mut();
+                let Some((
+                    window_start_index,
+                    entries_len,
+                    has_older,
+                    loading_older,
+                    has_newer,
+                    loading_newer,
+                )) = st.client.view().map(|v| {
+                    (
+                        v.observe.log_window.window_start_index,
+                        v.observe.logs.len(),
+                        v.observe.log_window.has_older,
+                        v.observe.log_window.loading_older,
+                        v.observe.log_window.has_newer,
+                        v.observe.log_window.loading_newer,
+                    )
+                })
+                else {
                     return;
                 };
                 let scroll_top = target.scroll_top();
                 let client_height = target.client_height();
                 let scroll_height = target.scroll_height();
-                if scroll_height > client_height
+                let (dir, cmd) = if scroll_height > client_height
                     && scroll_top + client_height >= scroll_height.saturating_sub(160)
-                    && window_meta.has_older
-                    && !window_meta.loading_older
+                    && has_older
+                    && !loading_older
                 {
-                    LAST_OBS_SCROLL_TRIGGER_MS.with(|slot| slot.set(now));
-                    send(&worker_for_scroll, &UiCommand::LoadOlderObsLogs);
-                } else if scroll_top <= 160
-                    && window_meta.has_newer
-                    && !window_meta.loading_newer
-                    && window_meta.window_start_index > 0
+                    (1_i8, UiCommand::LoadOlderObsLogs)
+                } else if scroll_top <= 160 && has_newer && !loading_newer && window_start_index > 0
                 {
-                    LAST_OBS_SCROLL_TRIGGER_MS.with(|slot| slot.set(now));
-                    send(&worker_for_scroll, &UiCommand::LoadNewerObsLogs);
+                    (-1_i8, UiCommand::LoadNewerObsLogs)
+                } else {
+                    return;
+                };
+                if prev_dir == dir
+                    && prev_start == window_start_index
+                    && prev_len == entries_len
+                    && now.saturating_sub(prev_ms) < 600
+                {
+                    return;
                 }
+                LAST_OBS_SCROLL_TRIGGER.with(|slot| {
+                    slot.set((now, window_start_index, entries_len, dir));
+                });
+                let activity_cmds = st.on_explicit_user_activity(now);
+                if !activity_cmds.is_empty() {
+                    send_all(&worker_for_scroll, &activity_cmds);
+                    repaint_lease_timers(&st);
+                }
+                send(&worker_for_scroll, &cmd);
             });
             let _ = doc.add_event_listener_with_callback_and_bool(
                 "scroll",
