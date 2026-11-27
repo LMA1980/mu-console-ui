@@ -16,12 +16,12 @@ name = "mu-console-ui"
 path = "src/main.rs"
 
 [dependencies]
-mu-console-protocol = { version = "0.1.1", git = "https://github.com/LMA1980/mu-console-protocol.git", branch = "main" }
+mu-console-protocol = { version = "0.1.1", git = "https://github.com/LMA1980/mu-console-protocol.git", branch = "feat/preferred-repo-hint-36" }
 mu-console-theme = { version = "0.1.1", git = "https://github.com/LMA1980/mu-console-theme.git", branch = "main" }
 mu-console-layout = { version = "0.1.1", git = "https://github.com/LMA1980/mu-console-layout.git", branch = "main" }
 
 [dev-dependencies]
-mu-console-data = { version = "0.1.1", git = "https://github.com/LMA1980/mu-console-data.git", branch = "main" }
+mu-console-data = { version = "0.1.1", git = "https://github.com/LMA1980/mu-console-data.git", branch = "feat/preferred-repo-reconcile-70" }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 roxmltree = "0.20"
 

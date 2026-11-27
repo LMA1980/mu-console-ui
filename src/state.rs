@@ -7,7 +7,7 @@ use std::cell::Cell;
 use mu_console_layout::{scorecard_page_capacity, SafeArea, Viewport};
 use mu_console_protocol::{
     AbDeploySubView, Area, AuthState, AuthStatus, CiJobSummary, CiSubView, ConsoleSkin, CrtFont,
-    DialogModel, LogSeverity, MaintenanceMode, ObsLogWindowMeta, ObservabilitySubView,
+    DataSource, DialogModel, LogSeverity, MaintenanceMode, ObsLogWindowMeta, ObservabilitySubView,
     OtelLogEntry, PackageEcosystem, PasskeyEnrollmentGateModel, RepoId, RepoScore, RepoStatus,
     RiskConfirmAction, RiskConfirmDialogModel, Route, SessionRoleDescriptor,
     SessionRolesDialogModel, SubView, SubmoduleId, SubsystemId, UiCommand, UiError,
@@ -491,6 +491,15 @@ pub struct ConsoleState {
     obs_jump_to_latest_pending: bool,
     prev_obs_window_start: Option<u32>,
     prev_obs_search_active: bool,
+    saw_live_repos: bool,
+}
+
+/// Decision for synchronizing `REPO_STORAGE_KEY` in `localStorage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredRepoSync {
+    Set(String),
+    Remove,
+    Preserve,
 }
 
 impl Default for ConsoleState {
@@ -574,6 +583,7 @@ impl ConsoleState {
             obs_jump_to_latest_pending: false,
             prev_obs_window_start: None,
             prev_obs_search_active: false,
+            saw_live_repos: false,
         }
     }
 
@@ -639,31 +649,68 @@ impl ConsoleState {
         self.sync_rotary_from_route();
     }
 
-    /// Restore previously persisted repo selection (`owner/repo` or `owner/repo@submodule`).
-    pub fn restore_stored_repo(&mut self, stored_repo: Option<&str>) {
-        let Some(raw) = stored_repo.map(str::trim).filter(|s| !s.is_empty()) else {
-            return;
-        };
-        let (repo_part, sub_part) = match raw.split_once('@') {
-            Some((r, s)) if !s.is_empty() => (r, Some(SubmoduleId { path: s.to_owned() })),
-            _ => (raw, None),
-        };
-        if let Some((owner, repo)) = repo_part.split_once('/') {
-            if !owner.is_empty() && !repo.is_empty() {
-                self.route.repo = Some(RepoId::new(owner, repo));
-                self.route.submodule = sub_part;
-                self.sync_rotary_from_route();
+    /// Format confirmed live repository selection for `localStorage` persistence.
+    #[must_use]
+    pub fn stored_repo_value(&self) -> Option<String> {
+        let view = self.client.view()?;
+        if view.source != DataSource::Live {
+            return None;
+        }
+        if let Some(repo) = self.route.repo.as_ref() {
+            if let Some(entry) = view.repos.iter().find(|r| &r.id == repo) {
+                return Some(Self::format_selection_for_storage(
+                    repo,
+                    self.route.submodule.as_ref(),
+                    entry,
+                ));
             }
+        }
+        let sel = view.selection.as_ref()?;
+        let entry = view.repos.iter().find(|r| r.id == sel.repo)?;
+        Some(Self::format_selection_for_storage(
+            &sel.repo,
+            sel.submodule.as_ref(),
+            entry,
+        ))
+    }
+
+    /// Decide how `REPO_STORAGE_KEY` in `localStorage` should be synchronized without
+    /// discarding potential private-repository hints before an `Active` catalog resolves.
+    #[must_use]
+    pub fn stored_repo_sync(&self, existing_stored: Option<&str>) -> StoredRepoSync {
+        let Some(view) = self.client.view() else {
+            return StoredRepoSync::Preserve;
+        };
+        if view.source != DataSource::Live
+            || !view.auth.is_resolved()
+            || (!self.saw_live_repos && view.repos.is_empty() && view.selection.is_none())
+        {
+            return StoredRepoSync::Preserve;
+        }
+        if let Some(val) = self.stored_repo_value() {
+            if view.auth.status != AuthStatus::Active
+                && self.route.repo.is_none()
+                && existing_stored.is_some_and(|s| !s.trim().is_empty())
+            {
+                return StoredRepoSync::Preserve;
+            }
+            return StoredRepoSync::Set(val);
+        }
+        if view.auth.status == AuthStatus::Active {
+            StoredRepoSync::Remove
+        } else {
+            StoredRepoSync::Preserve
         }
     }
 
-    /// Format active repository selection for `localStorage` persistence.
-    #[must_use]
-    pub fn stored_repo_value(&self) -> Option<String> {
-        let repo = self.route.repo.as_ref()?;
-        match &self.route.submodule {
-            Some(sub) => Some(format!("{}/{}@{}", repo.owner, repo.repo, sub.path)),
-            None => Some(format!("{}/{}", repo.owner, repo.repo)),
+    fn format_selection_for_storage(
+        repo: &RepoId,
+        sub: Option<&SubmoduleId>,
+        entry: &RepoScore,
+    ) -> String {
+        match sub.filter(|s| entry.submodules.iter().any(|m| m.path == s.path)) {
+            Some(s) => format!("{}/{}@{}", repo.owner, repo.repo, s.path),
+            None => format!("{}/{}", repo.owner, repo.repo),
         }
     }
 
@@ -1133,10 +1180,12 @@ impl ConsoleState {
         {
             self.webauthn_error = None;
         }
+        let mut restored_stashed = false;
         if transitioned_to_active {
             if let Some(stashed) = self.stashed_deep_link.take() {
                 let parsed = parse_hash(&stashed);
                 self.route = parsed;
+                restored_stashed = true;
             }
             if redirect_if_lacking_access(&view.auth, &mut self.route) {
                 self.route_sync_dirty = true;
@@ -1144,6 +1193,46 @@ impl ConsoleState {
         } else if lost_timed && redirect_if_lacking_access(&view.auth, &mut self.route) {
             // Timed role 00:00 expiry redirect ONLY if remaining active roles lack access (#46/#53).
             self.route_sync_dirty = true;
+        }
+
+        if view.source == DataSource::Live && (!view.repos.is_empty() || view.selection.is_some()) {
+            self.saw_live_repos = true;
+        }
+        if view.source == DataSource::Live
+            && view.auth.is_resolved()
+            && !restored_stashed
+            && (self.saw_live_repos || !view.repos.is_empty() || view.selection.is_some())
+        {
+            let filtered = self.filtered_repos();
+            if let Some(route_repo) = self.route.repo.clone() {
+                if let Some(entry) = filtered.iter().find(|r| r.id == route_repo) {
+                    if let Some(sub) = &self.route.submodule {
+                        if !entry.submodules.iter().any(|s| s.path == sub.path) {
+                            self.route.submodule = None;
+                            self.route_sync_dirty = true;
+                        }
+                    }
+                } else {
+                    if let Some(sel) = view
+                        .selection
+                        .as_ref()
+                        .filter(|s| filtered.iter().any(|r| r.id == s.repo))
+                    {
+                        let sub = sel.submodule.as_ref().filter(|sub| {
+                            filtered
+                                .iter()
+                                .find(|r| r.id == sel.repo)
+                                .is_some_and(|r| r.submodules.iter().any(|m| m.path == sub.path))
+                        });
+                        self.route.repo = Some(sel.repo.clone());
+                        self.route.submodule = sub.cloned();
+                    } else {
+                        self.route.repo = None;
+                        self.route.submodule = None;
+                    }
+                    self.route_sync_dirty = true;
+                }
+            }
         }
 
         let obs_start = view.observe.log_window.window_start_index;
@@ -1312,7 +1401,7 @@ impl ConsoleState {
             .collect()
     }
 
-    /// Align rotary outer/inner indices with `self.route`.
+    /// Align rotary outer/inner indices with `self.route` (falling back to `view.selection`).
     pub fn sync_rotary_from_route(&mut self) {
         let repos = self.filtered_repos();
         if repos.is_empty() {
@@ -1320,7 +1409,19 @@ impl ConsoleState {
             self.inner_index = 0;
             return;
         }
-        if let Some(target) = &self.route.repo {
+        let target_repo = self.route.repo.as_ref().or_else(|| {
+            self.client
+                .view()
+                .and_then(|v| v.selection.as_ref().map(|s| &s.repo))
+        });
+        let target_sub = if self.route.repo.is_some() {
+            self.route.submodule.as_ref()
+        } else {
+            self.client
+                .view()
+                .and_then(|v| v.selection.as_ref().and_then(|s| s.submodule.as_ref()))
+        };
+        if let Some(target) = target_repo {
             if let Some(idx) = repos.iter().position(|r| &r.id == target) {
                 self.outer_index = idx;
             }
@@ -1330,7 +1431,7 @@ impl ConsoleState {
         let subs_len = repos
             .get(self.outer_index)
             .map_or(0, |r| r.submodules.len());
-        if let Some(sub) = &self.route.submodule {
+        if let Some(sub) = target_sub {
             if let Some(idx) = repos
                 .get(self.outer_index)
                 .and_then(|r| r.submodules.iter().position(|s| s.path == sub.path))
@@ -3628,6 +3729,119 @@ mod tests {
         assert_eq!(
             st.route.subview,
             SubView::Observability(ObservabilitySubView::Logs)
+        );
+    }
+
+    #[test]
+    fn stored_repo_sync_and_live_route_reconciliation() {
+        use mu_console_protocol::{
+            encode, DataEvent, RepoScore, RepoStatus, Selection, SubmoduleRef,
+        };
+
+        let mut st = ConsoleState::new();
+        st.init_from_env("#/dashboard/overview", "", None);
+        assert_eq!(st.route.repo, None);
+        assert_eq!(format_hash(&st.route), "#/dashboard/overview");
+        assert_eq!(
+            st.sign_in_href(),
+            "/oauth2/start?rd=%2F%23%2Fdashboard%2Foverview"
+        );
+        // Before live repos resolve, existing localStorage hint is preserved and never cleared.
+        assert_eq!(
+            st.stored_repo_sync(Some("LMA1980/private-repo")),
+            StoredRepoSync::Preserve
+        );
+        assert_eq!(st.stored_repo_value(), None);
+
+        let public_repo = RepoScore {
+            id: RepoId::new("LMA1980", "alpha-public"),
+            visibility: Visibility::Public,
+            status: RepoStatus::Passing,
+            submodules: vec![SubmoduleRef {
+                path: "code/ui".into(),
+                repo: RepoId::new("LMA1980", "alpha-ui"),
+                pinned_sha: "abc".into(),
+            }],
+            ..RepoScore::new(RepoId::new("LMA1980", "alpha-public"))
+        };
+        let anon_vm = ViewModel {
+            source: DataSource::Live,
+            auth: AuthState::anonymous(vec!["ci:repos.public.read".into()]),
+            repos: vec![public_repo.clone()],
+            selection: Some(Selection {
+                repo: RepoId::new("LMA1980", "alpha-public"),
+                submodule: None,
+            }),
+            ..ViewModel::default()
+        };
+        st.on_worker_frame(&encode(&DataEvent::Snapshot(anon_vm)).expect("encode anon"));
+        // Clean global URL stays clean and private hint in localStorage is preserved across Anonymous boot.
+        assert_eq!(st.route.repo, None);
+        assert_eq!(format_hash(&st.route), "#/dashboard/overview");
+        assert_eq!(
+            st.stored_repo_sync(Some("LMA1980/private-repo")),
+            StoredRepoSync::Preserve
+        );
+
+        // Explicit URL ?repo=LMA1980/retired is reconciled when Active Live catalog omits it.
+        let mut explicit = ConsoleState::new();
+        explicit.init_from_env("#/ci/scorecards?repo=LMA1980/retired", "", None);
+        let active_vm = ViewModel {
+            source: DataSource::Live,
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec![
+                    "ci:repos.public.read".into(),
+                    "ci:repos.private.read".into(),
+                ],
+                ..AuthState::default()
+            },
+            repos: vec![public_repo],
+            selection: Some(Selection {
+                repo: RepoId::new("LMA1980", "alpha-public"),
+                submodule: Some(SubmoduleId {
+                    path: "code/ui".into(),
+                }),
+            }),
+            ..ViewModel::default()
+        };
+        explicit.on_worker_frame(&encode(&DataEvent::Snapshot(active_vm)).expect("encode active"));
+        assert!(explicit.route_sync_dirty);
+        assert_eq!(
+            explicit.route.repo,
+            Some(RepoId::new("LMA1980", "alpha-public"))
+        );
+        assert_eq!(
+            explicit.route.submodule,
+            Some(SubmoduleId {
+                path: "code/ui".into(),
+            })
+        );
+        assert_eq!(
+            explicit.stored_repo_sync(Some("LMA1980/retired")),
+            StoredRepoSync::Set("LMA1980/alpha-public@code/ui".into())
+        );
+
+        // Active empty catalog removes stale REPO_STORAGE_KEY and clears route.repo.
+        let empty_active_vm = ViewModel {
+            source: DataSource::Live,
+            auth: AuthState {
+                status: AuthStatus::Active,
+                github_login: Some("ops".into()),
+                active_policies: vec!["ci:repos.public.read".into()],
+                ..AuthState::default()
+            },
+            repos: Vec::new(),
+            selection: None,
+            ..ViewModel::default()
+        };
+        explicit
+            .on_worker_frame(&encode(&DataEvent::Snapshot(empty_active_vm)).expect("encode empty"));
+        assert_eq!(explicit.route.repo, None);
+        assert_eq!(
+            explicit.stored_repo_sync(Some("LMA1980/alpha-public@code/ui")),
+            StoredRepoSync::Remove
         );
     }
 }

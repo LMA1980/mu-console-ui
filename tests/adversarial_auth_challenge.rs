@@ -57,6 +57,7 @@ fn initialized_state() -> ConsoleState {
     let cfg = WorkerConfig {
         api_base: "http://192.0.2.10:8080".into(),
         scenario: Some(Scenario::Submodules.name().to_owned()),
+        ..WorkerConfig::default()
     };
     let mut state = ConsoleState::new();
     for ef in eng.handle(UiCommand::Configure(cfg), 1_000) {

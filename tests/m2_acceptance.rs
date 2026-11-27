@@ -3336,3 +3336,146 @@ fn area_and_access_aware_filtering_across_all_8_areas() {
     assert!(pr_html.contains("Super Operator"));
     assert!(!pr_html.contains("Baseline Operator"));
 }
+
+#[test]
+fn stored_repo_non_url_hint_deep_link_precedence_and_repos_changed_sync() {
+    use mu_console_data::api::{FetchKind, StreamId};
+    use mu_console_data::engine::{Effect, Engine};
+    use mu_console_protocol::{RepoId, WorkerConfig};
+    use mu_console_ui::router::format_hash;
+    use mu_console_ui::state::StoredRepoSync;
+
+    let drain_posts = |effects: Vec<Effect>, state: &mut ConsoleState| {
+        for ef in effects {
+            if let Effect::Post(ev) = ef {
+                let bytes = Engine::encode_event(&ev).expect("encode DataEvent");
+                state.on_worker_frame(&bytes);
+            }
+        }
+    };
+
+    let anon_public_session = r#"{
+        "authenticated": false,
+        "anonymous_lockdown": false,
+        "active_policies": ["system:status.read", "system:dashboard.read", "ci:repos.public.read", "ci:queue.read"]
+    }"#;
+    let active_session = r#"{
+        "authenticated": true,
+        "github_login": "ops",
+        "invite_bound": true,
+        "passkey_count": 1,
+        "passkey_enrollment_required": false,
+        "baseline_role": "operator",
+        "bound_roles": ["operator"],
+        "active_policies": ["system:status.read", "system:dashboard.read", "ci:repos.public.read", "ci:repos.private.read", "ci:queue.read"]
+    }"#;
+    let public_repos = r#"[
+        {"owner":"LMA1980","repo":"alpha-public","visibility":"public","status":"passing","score":95,"coverage":90.0,"bench_delta":0.0},
+        {"owner":"LMA1980","repo":"beta-public","visibility":"public","status":"running","score":80,"coverage":82.0,"bench_delta":0.5}
+    ]"#;
+    let active_repos = r#"[
+        {"owner":"LMA1980","repo":"alpha-public","visibility":"public","status":"passing","score":95,"coverage":90.0,"bench_delta":0.0},
+        {"owner":"LMA1980","repo":"beta-public","visibility":"public","status":"running","score":80,"coverage":82.0,"bench_delta":0.5},
+        {"owner":"LMA1980","repo":"gamma-private","visibility":"private","status":"passing","score":99,"coverage":96.0,"bench_delta":1.0}
+    ]"#;
+    let pruned_repos = r#"[
+        {"owner":"LMA1980","repo":"beta-public","visibility":"public","status":"running","score":80,"coverage":82.0,"bench_delta":0.5}
+    ]"#;
+
+    // 1. Clean #/dashboard/overview + Sign In rd= URL when localStorage holds a retired repo,
+    //    and private repo hint preservation across Anonymous cold boot -> OAuth login.
+    let mut eng = Engine::new(1);
+    let mut st = ConsoleState::new();
+    st.init_from_env("#/dashboard/overview", "", None);
+    let cfg = WorkerConfig::from_query("", "https://console.example.org")
+        .with_preferred_repo(Some("LMA1980/gamma-private"));
+    drain_posts(eng.handle(UiCommand::Configure(cfg), 0), &mut st);
+    drain_posts(
+        eng.handle(UiCommand::Subscribe(st.route.clone()), 1),
+        &mut st,
+    );
+    drain_posts(
+        eng.on_fetch(&FetchKind::AuthSession, Ok(anon_public_session.into()), 5),
+        &mut st,
+    );
+    drain_posts(
+        eng.on_fetch(&FetchKind::Repos, Ok(public_repos.into()), 10),
+        &mut st,
+    );
+    drain_posts(eng.tick(200), &mut st);
+
+    assert_eq!(st.route.repo, None);
+    assert_eq!(format_hash(&st.route), "#/dashboard/overview");
+    assert_eq!(
+        st.sign_in_href(),
+        "/oauth2/start?rd=%2F%23%2Fdashboard%2Foverview"
+    );
+    assert_eq!(
+        st.stored_repo_sync(Some("LMA1980/gamma-private")),
+        StoredRepoSync::Preserve
+    );
+
+    // OAuth login activates private repo hint via refreshed /api/repos.
+    drain_posts(
+        eng.on_fetch(&FetchKind::AuthSession, Ok(active_session.into()), 300),
+        &mut st,
+    );
+    drain_posts(
+        eng.on_fetch(&FetchKind::Repos, Ok(active_repos.into()), 310),
+        &mut st,
+    );
+    drain_posts(eng.tick(500), &mut st);
+    assert_eq!(st.route.repo, None);
+    assert_eq!(format_hash(&st.route), "#/dashboard/overview");
+    assert_eq!(
+        st.stored_repo_sync(Some("LMA1980/gamma-private")),
+        StoredRepoSync::Set("LMA1980/gamma-private".into())
+    );
+
+    // 2. Explicit ?repo= deep link overrides stored hint and reconciles on repos_changed SSE.
+    let mut eng2 = Engine::new(2);
+    let mut st2 = ConsoleState::new();
+    st2.init_from_env("#/ci/scorecards?repo=LMA1980/alpha-public", "", None);
+    let cfg2 = WorkerConfig::from_query("", "https://console.example.org")
+        .with_preferred_repo(Some("LMA1980/gamma-private"));
+    drain_posts(eng2.handle(UiCommand::Configure(cfg2), 0), &mut st2);
+    drain_posts(
+        eng2.handle(UiCommand::Subscribe(st2.route.clone()), 1),
+        &mut st2,
+    );
+    drain_posts(
+        eng2.on_fetch(&FetchKind::AuthSession, Ok(active_session.into()), 5),
+        &mut st2,
+    );
+    drain_posts(
+        eng2.on_fetch(&FetchKind::Repos, Ok(active_repos.into()), 10),
+        &mut st2,
+    );
+    drain_posts(eng2.tick(200), &mut st2);
+    assert_eq!(st2.route.repo, Some(RepoId::new("LMA1980", "alpha-public")));
+
+    // Prune alpha-public via repos_changed SSE -> UI route & storage reconcile to beta-public.
+    let sse_fx = eng2.on_stream_chunk(StreamId::Ci, b"event: repos_changed\ndata: {}\n\n", 400);
+    assert!(sse_fx.iter().any(|e| matches!(
+        e,
+        mu_console_data::engine::Effect::Fetch {
+            kind: FetchKind::Repos,
+            ..
+        }
+    )));
+    drain_posts(
+        eng2.on_fetch(&FetchKind::Repos, Ok(pruned_repos.into()), 410),
+        &mut st2,
+    );
+    drain_posts(eng2.tick(600), &mut st2);
+    assert!(st2.route_sync_dirty);
+    assert_eq!(st2.route.repo, Some(RepoId::new("LMA1980", "beta-public")));
+    assert_eq!(
+        format_hash(&st2.route),
+        "#/ci/scorecards?repo=LMA1980/beta-public"
+    );
+    assert_eq!(
+        st2.stored_repo_sync(Some("LMA1980/alpha-public")),
+        StoredRepoSync::Set("LMA1980/beta-public".into())
+    );
+}

@@ -27,7 +27,7 @@ use crate::roles::resolve_lease_timer_text;
 use crate::router::{format_hash, has_explicit_route};
 use crate::state::{
     extract_invite_token, font_slug, is_action_root_boundary, is_passive_container_control_id,
-    skin_slug, ConsoleState, WebAuthnRequest, ACTION_ATTRS, FONT_STORAGE_KEY,
+    skin_slug, ConsoleState, StoredRepoSync, WebAuthnRequest, ACTION_ATTRS, FONT_STORAGE_KEY,
     PENDING_HASH_STORAGE_KEY, PENDING_INVITE_STORAGE_KEY, REPO_STORAGE_KEY, SKIN_STORAGE_KEY,
 };
 use crate::webauthn::{
@@ -123,10 +123,15 @@ fn sync_browser_state(st: &mut ConsoleState) {
     if let Ok(Some(storage)) = win.local_storage() {
         let _ = storage.set_item(FONT_STORAGE_KEY, font_slug(st.font));
         let _ = storage.set_item(SKIN_STORAGE_KEY, skin_slug(st.skin));
-        if let Some(repo_str) = st.stored_repo_value() {
-            let _ = storage.set_item(REPO_STORAGE_KEY, &repo_str);
-        } else {
-            let _ = storage.remove_item(REPO_STORAGE_KEY);
+        let existing_repo = storage.get_item(REPO_STORAGE_KEY).ok().flatten();
+        match st.stored_repo_sync(existing_repo.as_deref()) {
+            StoredRepoSync::Set(repo_str) => {
+                let _ = storage.set_item(REPO_STORAGE_KEY, &repo_str);
+            }
+            StoredRepoSync::Remove => {
+                let _ = storage.remove_item(REPO_STORAGE_KEY);
+            }
+            StoredRepoSync::Preserve => {}
         }
     }
 
@@ -1282,7 +1287,13 @@ pub fn start() {
         }
     }
 
-    let cfg = WorkerConfig::from_query(&clean_search, &location.origin().unwrap_or_default());
+    let stored_repo = window
+        .local_storage()
+        .ok()
+        .flatten()
+        .and_then(|s| s.get_item(REPO_STORAGE_KEY).ok().flatten());
+    let cfg = WorkerConfig::from_query(&clean_search, &location.origin().unwrap_or_default())
+        .with_preferred_repo(stored_repo.as_deref());
     let state = Rc::new(RefCell::new(ConsoleState::new()));
     {
         let stored_font = window
@@ -1295,11 +1306,6 @@ pub fn start() {
             .ok()
             .flatten()
             .and_then(|s| s.get_item(SKIN_STORAGE_KEY).ok().flatten());
-        let stored_repo = window
-            .local_storage()
-            .ok()
-            .flatten()
-            .and_then(|s| s.get_item(REPO_STORAGE_KEY).ok().flatten());
 
         let mut st = state.borrow_mut();
         st.set_viewport(window_viewport(&window), SafeArea::ZERO);
@@ -1311,7 +1317,6 @@ pub fn start() {
         if st.stashed_deep_link.is_none() {
             st.stashed_deep_link = stored_pending_hash;
         }
-        st.restore_stored_repo(stored_repo.as_deref());
         sync_browser_state(&mut st);
         repaint(&st);
     }
